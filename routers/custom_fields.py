@@ -20,7 +20,8 @@ from fastapi import APIRouter, Body, Depends, HTTPException, status
 
 import permissions
 from database import company_connection
-from routers.auth import get_current_schema, require_level
+from routers.auth import get_current_schema, get_current_user, require_level
+from services import changelog
 from services import custom_fields as cf
 
 router = APIRouter(prefix="/custom-fields", tags=["custom-fields"])
@@ -58,6 +59,7 @@ async def create_field(
     mapfields: str = Body("", embed=True, description="Comma-separated header aliases"),
     method: str = Body("", embed=True, description="What the field is for: import / selection / rule / ..."),
     schema: str = Depends(get_current_schema),
+    user: dict = Depends(get_current_user),
 ):
     """
     Add a custom field.
@@ -69,13 +71,22 @@ async def create_field(
     """
     async with company_connection(schema) as conn:
         try:
-            return await cf.create_custom_field(conn, type, displayname, mapfields, method)
+            result = await cf.create_custom_field(conn, type, displayname, mapfields, method)
         except cf.CustomFieldError as e:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+        # Creating a custom field writes a fieldmap row, so it belongs in the
+        # same history as an edit made from the Field Mapping page. Logging it
+        # in both places is what keeps a field's whole life on one screen.
+        await changelog.log_created(conn, row=result["fieldmap"], username=user["username"])
+    return result
 
 
 @router.delete("/{fieldname}", dependencies=[Depends(require_manager)])
-async def delete_field(fieldname: str, schema: str = Depends(get_current_schema)):
+async def delete_field(
+    fieldname: str,
+    schema: str = Depends(get_current_schema),
+    user: dict = Depends(get_current_user),
+):
     """
     Delete a custom field: drop the column and remove its fieldmap row.
 
@@ -83,10 +94,27 @@ async def delete_field(fieldname: str, schema: str = Depends(get_current_schema)
     goes with it, including on rows already staged — this cannot be undone.
     """
     async with company_connection(schema) as conn:
+        # Read the mapping before it is deleted. This is a hard delete of the
+        # fieldmap row, so afterwards there is nowhere left to learn what the
+        # field's aliases were — and those are exactly what someone recreating
+        # it by hand needs.
+        doomed = await conn.fetchrow(
+            "SELECT id, fieldname, mapfields FROM fieldmap WHERE fieldname = $1",
+            (fieldname or "").strip(),
+        )
         try:
             result = await cf.delete_custom_field(conn, fieldname)
         except cf.CustomFieldError as e:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+
+        if result.get("found"):
+            await changelog.log_deleted(
+                conn,
+                # An orphaned column with no fieldmap row still deletes, and
+                # still gets logged — under the name the caller gave.
+                row=dict(doomed) if doomed else {"fieldname": result["fieldname"]},
+                username=user["username"],
+            )
 
     if not result.get("found"):
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"No field named '{fieldname}'")

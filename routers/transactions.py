@@ -1,11 +1,18 @@
 """
 Transaction routes.
 
-GET    /transactions                — list all finalized transactions
-GET    /transactions/summary        — totals by head for a date range
-GET    /temp-trans                 — list unclassified raw rows
+GET    /transactions                  — list finalized transactions (paged)
+GET    /transactions/summary          — totals by head for a date range
+GET    /temp-trans                    — list raw staged rows (paged)
+DELETE /temp-trans                    — clear the whole staging table
+DELETE /temp-trans/{row_id}           — remove one staged row
 POST   /temp-trans/{row_id}/classify  — tag a raw row with a head
 POST   /temp-trans/{row_id}/finalize  — move a row into the ledger
+
+Both list endpoints are paged and searchable, and both return
+{columns, rows, total, page, limit}. They used to return every row in the table
+on every render, which was fine at a few hundred and is not at a few hundred
+thousand — one statement import is several hundred rows on its own.
 """
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 
@@ -31,6 +38,41 @@ _MASTER_LOOKUPS = {
     "beneficiary_id": ("beneficiary_master", "beneficiary"),
     "project_id": ("projects", "project"),
 }
+
+
+# Page size ceiling. Export is the route for "give me everything" — it streams
+# instead of building one JSON array in memory, which is the actual reason a
+# list endpoint should not be asked for 200,000 rows.
+MAX_PAGE_SIZE = 500
+
+
+def _search_filter(term: str, columns: list[dict], extra_exprs: tuple[str, ...],
+                   idx: int) -> tuple[str, list, int]:
+    """A WHERE fragment matching *term* against everything visible on the row.
+
+    Every data column plus the joined master names, so what the search matches
+    is what the table draws — searching for "SALARY" or a UTR finds the row
+    whether that text sits in the narration or in the beneficiary it was filed
+    against.
+
+    Non-text columns are cast rather than skipped, which is what makes a date
+    findable as "2026-08" and an amount as "1500". DPL restricted its search to
+    the id column to avoid "345" matching a narration ending in 345; that was
+    the right call for a lookup-by-id box and the wrong one here, where the
+    question is "where did this money go", not "show me row 345".
+
+    One bind parameter reused across every column, so the term is never
+    interpolated. Column names come from data_columns(), which reads the
+    catalog — they are never user input.
+
+    A leading-wildcard ILIKE cannot use an index; this is a sequential scan by
+    construction. Fine at statement scale, and the reason limit is capped.
+    """
+    targets = [f"t.{c['name']}::text" for c in columns] + list(extra_exprs)
+    if not targets:
+        return "", [], idx
+    ors = " OR ".join(f"{t} ILIKE ${idx}" for t in targets)
+    return f"({ors})", [f"%{term}%"], idx + 1
 
 
 async def _assert_live_master_ids(conn, values: dict) -> None:
@@ -65,6 +107,9 @@ async def list_transactions(
     head_id: int = None,
     date_from: str = None,
     date_to: str = None,
+    search: str = Query("", description="Match any column or master name"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     user: dict = Depends(get_current_user),
 ):
     """
@@ -79,6 +124,12 @@ async def list_transactions(
       head_id     — only transactions for this head
       date_from   — start date (YYYY-MM-DD)
       date_to     — end date (YYYY-MM-DD)
+      search      — free text, matched against every column on the row
+      page, limit — pagination; `total` in the response is the unpaged count
+
+    Returns {columns, rows, total, page, limit}. It returned a bare array until
+    it was paged; anything summing the response has to read `total` now, because
+    rows is one page and len(rows) is a page size, not a count.
     """
     filters = ["1=1"]
     params = []
@@ -103,9 +154,17 @@ async def list_transactions(
                     params.append(value)
                     idx += 1
 
+        # Same rule as staging: the ledger reports its own columns rather than
+        # asserting a fixed set, and they are the same set because the two
+        # tables are kept in step.
+        columns = await custom_fields.data_columns(conn)
+
         scope = await scoping.visible_project_ids(conn, user)
         if scoping.scope_is_empty(scope):
-            return []
+            # Still report the columns. An empty result is a row count of zero,
+            # not a table with no shape — the client draws its header from this.
+            return {"columns": columns, "rows": [], "total": 0,
+                    "page": page, "limit": limit}
         # include_unassigned=False: the "unfiled rows belong to everyone" rule
         # exists so a fresh import can be classified, which only concerns
         # staging. A row that reached the ledger with no project is filed data
@@ -117,13 +176,29 @@ async def list_transactions(
             filters.append(clause)
             params.extend(scope_params)
 
-        where = " AND ".join(filters)
+        term = (search or "").strip()
+        if term:
+            clause, sp, idx = _search_filter(
+                term, columns, ("p.name", "p.code", "h.name", "b.bank_name"), idx
+            )
+            if clause:
+                filters.append(clause)
+                params.extend(sp)
 
-        # Same rule as staging: the ledger reports its own columns rather than
-        # asserting a fixed set, and they are the same set because the two
-        # tables are kept in step.
-        columns = await custom_fields.data_columns(conn)
+        where = " AND ".join(filters)
         data_cols = ", ".join(f"t.{c['name']}" for c in columns)
+
+        # The joins are repeated in the count because the search reaches into
+        # them — counting over a bare temp_trans would over-report the moment
+        # someone searches a head name.
+        joins = """
+            FROM transactions t
+            LEFT JOIN projects p ON p.id = t.project_id
+            LEFT JOIN head_master h ON h.id = t.head_id
+            LEFT JOIN bank_master b ON b.id = t.bank_id
+        """
+
+        total = await conn.fetchval(f"SELECT count(*) {joins} WHERE {where}", *params)
 
         rows = await conn.fetch(
             f"""
@@ -135,16 +210,20 @@ async def list_transactions(
                    p.code AS project_code,
                    h.name AS head_name,
                    b.bank_name
-            FROM transactions t
-            LEFT JOIN projects p ON p.id = t.project_id
-            LEFT JOIN head_master h ON h.id = t.head_id
-            LEFT JOIN bank_master b ON b.id = t.bank_id
+            {joins}
             WHERE {where}
             ORDER BY {f't.{date_col} DESC,' if date_col else ''} t.id DESC
+            LIMIT ${idx} OFFSET ${idx + 1}
             """,
-            *params,
+            *params, limit, (page - 1) * limit,
         )
-    return [dict(r) for r in rows]
+    return {
+        "columns": columns,
+        "rows": [dict(r) for r in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+    }
 
 
 @router.get("/summary")
@@ -213,6 +292,9 @@ async def transaction_summary(
 async def list_temp_trans(
     batch_id: int = None,
     classified: bool = None,
+    search: str = Query("", description="Match any column or master name"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     user: dict = Depends(get_current_user),
 ):
     """
@@ -224,8 +306,14 @@ async def list_temp_trans(
     file it. Once it names a project, only that project's people keep seeing it.
 
     Params:
-      batch_id   — filter by import batch (which PDF upload)
-      classified — true = only classified rows, false = only unclassified
+      batch_id    — filter by import batch (which PDF upload)
+      classified  — true = only classified rows, false = only unclassified
+      search      — free text, matched against every column on the row
+      page, limit — pagination; `total` is the count matching the filters
+
+    `total` is the filtered count and `summary` is deliberately not: the Clear
+    button has to say how much it will delete, which is everything staged, not
+    what the current tab and search happen to show.
     """
     filters = ["1=1"]
     params = []
@@ -250,8 +338,6 @@ async def list_temp_trans(
             # Scoped to nothing, but unfiled rows are still everyone's to claim.
             filters.append("t.project_id IS NULL")
 
-        where = " AND ".join(filters)
-
         # The data columns are read from the live table, not written out here.
         # A custom field is a real column on temp_trans, and a fixed SELECT is
         # why one could be created, matched during parsing and stored, and still
@@ -260,9 +346,33 @@ async def list_temp_trans(
         columns = await custom_fields.data_columns(conn)
         data_cols = ", ".join(f"t.{c['name']}" for c in columns)
 
+        term = (search or "").strip()
+        if term:
+            clause, sp, idx = _search_filter(
+                term, columns,
+                ("p.name", "p.code", "h.name", "rh.name", "ih.name", "bn.name"), idx
+            )
+            if clause:
+                filters.append(clause)
+                params.extend(sp)
+
+        where = " AND ".join(filters)
+
         # The joins resolve each id to the name the user picked in the master
         # tables, so the staging screen can show "Site Materials" rather than
         # "head_id: 4" without the browser holding a copy of every master list.
+        # Repeated in the count query because the search reaches into them.
+        joins = """
+            FROM temp_trans t
+            LEFT JOIN projects            p  ON p.id  = t.project_id
+            LEFT JOIN head_master         h  ON h.id  = t.head_id
+            LEFT JOIN rera_head_master    rh ON rh.id = t.rera_head_id
+            LEFT JOIN idw_head_master     ih ON ih.id = t.idw_head_id
+            LEFT JOIN beneficiary_master  bn ON bn.id = t.beneficiary_id
+        """
+
+        total = await conn.fetchval(f"SELECT count(*) {joins} WHERE {where}", *params)
+
         rows = await conn.fetch(
             f"""
             SELECT t.id, t.batch_id, t.row_number, t.is_classified, t.created_at,
@@ -275,16 +385,12 @@ async def list_temp_trans(
                    rh.name AS rera_head_name,
                    ih.name AS idw_head_name,
                    bn.name AS beneficiary_name
-            FROM temp_trans t
-            LEFT JOIN projects            p  ON p.id  = t.project_id
-            LEFT JOIN head_master         h  ON h.id  = t.head_id
-            LEFT JOIN rera_head_master    rh ON rh.id = t.rera_head_id
-            LEFT JOIN idw_head_master     ih ON ih.id = t.idw_head_id
-            LEFT JOIN beneficiary_master  bn ON bn.id = t.beneficiary_id
+            {joins}
             WHERE {where}
             ORDER BY t.batch_id, t.row_number
+            LIMIT ${idx} OFFSET ${idx + 1}
             """,
-            *params,
+            *params, limit, (page - 1) * limit,
         )
 
         # Unfiltered totals, so the Clear button can state what it is about to
@@ -300,7 +406,14 @@ async def list_temp_trans(
             """
         ))
 
-    return {"columns": columns, "rows": [dict(r) for r in rows], "summary": summary}
+    return {
+        "columns": columns,
+        "rows": [dict(r) for r in rows],
+        "summary": summary,
+        "total": total,
+        "page": page,
+        "limit": limit,
+    }
 
 
 @router.delete("/temp-trans", dependencies=[Depends(require_manager)])
@@ -349,6 +462,61 @@ async def clear_temp_trans(schema: str = Depends(get_current_schema)):
         await conn.execute("DELETE FROM temp_trans")
 
     return {"status": "cleared", "rows_removed": rows, "batches_removed": batches}
+
+
+@router.delete("/temp-trans/{row_id}", dependencies=[Depends(require_manager)])
+async def delete_temp_row(row_id: int, user: dict = Depends(get_current_user)):
+    """
+    Remove one staged row.
+
+    The narrow version of Clear All, and the reason it exists: a parser will
+    occasionally turn a page header or a carried-forward balance line into a
+    transaction, and the only fix available was to clear the entire staging
+    table and re-import every statement in it.
+
+    Manager and above, matching Clear All and discard-batch. Deleting a staged
+    row destroys parsed work, and the three destructive operations on this data
+    should not sit at two different levels.
+
+    Two refusals, in this order:
+      * outside your scope — 404, the same answer as a row that does not exist,
+        so this cannot be used to probe which ids belong to other projects
+      * already posted — 409. transactions.temp_trans_id is ON DELETE RESTRICT,
+        so Postgres blocks it regardless; checking first names the transaction
+        that is holding on instead of surfacing a foreign-key error.
+
+    The batch is left alone even when this empties it. row_count records what
+    the file produced at import time, which is history and stays true; the
+    batches list already counts live rows separately.
+    """
+    async with company_connection(user["schema"]) as conn:
+        row = await conn.fetchrow(
+            "SELECT id, batch_id, row_number, project_id FROM temp_trans WHERE id = $1",
+            row_id,
+        )
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Staged row not found.")
+
+        scope = await scoping.visible_project_ids(conn, user)
+        # can_use_project passes a NULL project, which is the rule the list uses
+        # too: an unfiled row belongs to everyone, so a row nobody has
+        # classified yet is still removable.
+        if not scoping.can_use_project(scope, row["project_id"]):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Staged row not found.")
+
+        posted = await conn.fetchval(
+            "SELECT id FROM transactions WHERE temp_trans_id = $1", row_id
+        )
+        if posted:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Row {row_id} is already posted to the ledger as transaction "
+                f"{posted}. Reverse that transaction before removing the staged row.",
+            )
+
+        await conn.execute("DELETE FROM temp_trans WHERE id = $1", row_id)
+
+    return {"status": "deleted", "row_id": row_id, "batch_id": row["batch_id"]}
 
 
 @router.post("/temp-trans/{row_id}/classify")

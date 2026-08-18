@@ -39,14 +39,32 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# apiClient.js always builds an absolute baseURL (http://localhost:8000), so
-# every browser request is cross-origin even in development and CORS is not
-# optional. A regex rather than a fixed list because Vite falls back to 3001,
-# 3002... when 3000 is already taken, and a preflight from the fallback port
-# would otherwise fail with no obvious cause.
+# apiClient.js always builds an absolute baseURL, so every browser request is
+# cross-origin even in development and CORS is not optional.
+#
+# Every origin is allowed. This previously matched localhost only, which meant
+# the frontend worked from `npm run dev` and was blocked the moment it was
+# deployed anywhere — and the failure surfaces as "no data" in the browser
+# rather than as an error the server ever sees.
+#
+# "*" and allow_credentials=True look contradictory, because a literal
+# `Access-Control-Allow-Origin: *` is rejected by browsers on any credentialed
+# request. Starlette resolves it: with credentials enabled it echoes the
+# caller's own Origin back instead of "*" (cors.py — `if self.allow_all_origins
+# and self.allow_credentials: self.allow_explicit_origin(...)`), on both the
+# preflight and the real response. So this is spec-correct, not a wildcard the
+# browser has to forgive. It does mean the behaviour depends on that Starlette
+# version — pinning starlette below 1.x would silently send "*" again and every
+# credentialed request would start failing.
+#
+# What this gives up: any website a signed-in user visits can call this API
+# from their browser. The saving grace is that auth here is a Bearer token read
+# from localStorage, which is origin-scoped and never attached automatically —
+# so a third-party page cannot borrow a session the way it could with cookie
+# auth. Narrow this to the deployed frontend's origin when it has a fixed one.
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):\d+$",
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
