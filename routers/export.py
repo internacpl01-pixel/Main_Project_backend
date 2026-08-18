@@ -139,9 +139,16 @@ async def _fetch_ledger(user: dict, project_id, head_id, date_from, date_to):
                     "CASE WHEN t.credit_debit = 'DR' THEN t.amount END AS debit",
                     "CASE WHEN t.credit_debit = 'CR' THEN t.amount END AS credit",
                 ]
+                # Both headers are built from the amount column's own live
+                # label, so renaming that field in the fieldmap renames these
+                # too. They read "Debit"/"Credit" from a literal here, which
+                # made them the one pair of headers in the export that the
+                # fieldmap could not reach. DR and CR are the values stored in
+                # credit_debit, not names chosen here.
+                money = c["displayname"] or c["name"]
                 out_columns += [
-                    {"name": "debit", "displayname": "Debit", "type": "numeric"},
-                    {"name": "credit", "displayname": "Credit", "type": "numeric"},
+                    {"name": "debit", "displayname": f"{money} (DR)", "type": "numeric"},
+                    {"name": "credit", "displayname": f"{money} (CR)", "type": "numeric"},
                 ]
                 continue
             select_parts.append(f"t.{c['name']}")

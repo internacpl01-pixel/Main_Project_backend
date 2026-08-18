@@ -275,13 +275,6 @@ _STAGING_INTERNALS = frozenset({
 })
 
 
-# The two columns the withdrawal/deposits collapse produces. They have no
-# fieldmap row by construction -- they are not a column any bank prints, they
-# are what the importer makes of two that it does -- so there is nowhere else
-# for their labels to come from. Every other header comes from the fieldmap.
-_DERIVED_LABELS = {"amount": "Amount", "credit_debit": "DR/CR"}
-
-
 async def data_columns(conn, hide_redundant: bool = True) -> list[dict]:
     """The columns of temp_trans that hold statement data, in table order.
 
@@ -327,12 +320,24 @@ async def data_columns(conn, hide_redundant: bool = True) -> list[dict]:
     redundant = {"amount", "credit_debit"} if raw_amounts_shown else set()
 
     def label(name: str) -> str:
-        if name in display:
-            return display[name]
-        # No fieldmap row: either one of the two derived columns above, or a
-        # column added outside the app. Title-cased so it is at least readable
-        # rather than printing a raw identifier as a header.
-        return _DERIVED_LABELS.get(name) or name.replace("_", " ").title()
+        """DPL's rule verbatim: the fieldmap's word, else the column's own name.
+
+            # DPL services/data.py:125
+            {"name": c, "displayname": display_map.get(c, c), ...}
+
+        Nothing is invented in between. This used to consult a hardcoded
+        {"amount": "Amount", "credit_debit": "DR/CR"} table and otherwise
+        title-case the identifier, which meant two headers on the staging screen
+        were strings written in this file -- renaming them in the fieldmap
+        changed nothing, because the fieldmap was never asked.
+
+        A column with no fieldmap row now shows its raw name. That is the point:
+        a header reading `amount` is the screen telling you no field is mapped to
+        it, and the fix is to add one from the Field Mapping page, where you can
+        also change it later. A prettified label hid that and could not be
+        edited from anywhere.
+        """
+        return display.get(name, name)
 
     return [
         {
