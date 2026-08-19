@@ -17,6 +17,7 @@ This replaced routers/upload.py, which imported the same three formats into the
 same tables but parsed synchronously in the event loop, dropped failed rows
 silently, and recorded a blank uploaded_by.
 """
+import json
 import logging
 
 from fastapi import (APIRouter, Depends, File, Form, HTTPException, Query,
@@ -225,11 +226,15 @@ async def get_batch(batch_id: int, schema: str = Depends(get_current_schema)):
         if batch is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Batch not found.")
 
+        # temp_trans has no txn_date / description / balance columns — those
+        # values live in the company's field_* columns, whose names differ per
+        # company, and in raw_data. raw_data is what carries the row's content
+        # here; the fieldmap-shaped view of staging is GET /transactions/temp-trans.
         rows = await conn.fetch(
             """
-            SELECT id, row_number, txn_date, description, amount, credit_debit,
-                   balance, is_classified, project_id, beneficiary_id,
-                   head_id, rera_head_id, idw_head_id, row_hash
+            SELECT id, row_number, amount, credit_debit, is_classified,
+                   project_id, beneficiary_id, head_id, rera_head_id,
+                   idw_head_id, row_hash, raw_data
             FROM temp_trans
             WHERE batch_id = $1
             ORDER BY row_number
@@ -237,7 +242,16 @@ async def get_batch(batch_id: int, schema: str = Depends(get_current_schema)):
             batch_id,
         )
 
-    return {"batch": dict(batch), "rows": [dict(r) for r in rows]}
+    out_rows = []
+    for r in rows:
+        d = dict(r)
+        if isinstance(d.get("raw_data"), str):
+            d["raw_data"] = json.loads(d["raw_data"])
+        out_rows.append(d)
+    out_batch = dict(batch)
+    if isinstance(out_batch.get("parse_stats"), str):
+        out_batch["parse_stats"] = json.loads(out_batch["parse_stats"])
+    return {"batch": out_batch, "rows": out_rows}
 
 
 @router.delete("/batches/{batch_id}", dependencies=[Depends(require_manager)])

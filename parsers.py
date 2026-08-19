@@ -223,9 +223,12 @@ def _match_alias(header: str, alias_map: dict) -> tuple:
         if norm.startswith(alias) or alias.startswith(norm):
             return alias_map[alias], 2
 
-    # 3. Contains (one contains the other)
+    # 3. Contains (one contains the other). An alias under 3 characters is
+    # never matched by containment — "ac" (normalized A/c) sits inside
+    # "transaction type" — the same cutoff the document-field scan applies.
+    # Exact and prefix matches above still honour short aliases.
     for alias in sorted_aliases:
-        if norm in alias or alias in norm:
+        if norm in alias or (len(alias) >= 3 and alias in norm):
             return alias_map[alias], 1
 
     return None, 0
@@ -921,7 +924,13 @@ def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
                 if col_idx < len(row_cells):
                     cell_lower = row_cells[col_idx].lower()
                     for kw in _FOOTER_KEYWORDS:
-                        if kw == cell_lower or cell_lower.startswith(kw):
+                        # Whole-word match anywhere in the cell, so a bank's own
+                        # phrasing ("TRANSACTION TOTAL DR/CR", "STATEMENT
+                        # SUMMARY") is still the same footer row — while a word
+                        # that merely contains a keyword ("subtotal") is not.
+                        if (kw == cell_lower or cell_lower.startswith(kw)
+                                or re.search(rf"(?<![a-z0-9]){re.escape(kw)}(?![a-z0-9])",
+                                             cell_lower)):
                             is_footer = True
                             break
                 if is_footer:
@@ -1165,19 +1174,26 @@ _AMOUNT_LINE_RE = re.compile(
 )
 
 
-def _has_merged_rows(rows: list) -> bool:
+def _has_merged_rows(rows: list, cat_by_field: dict) -> bool:
     """
     Detect pdfplumber's 'merged row' failure: when row-separator lines aren't
     found, transactions collapse into one giant row whose cells hold many
-    newline-joined values. Signatures: a cell containing ≥2 date tokens, or
-    a cell whose content is ≥2 stacked amount-only lines.
+    newline-joined values. Signatures: a date-column cell containing ≥2 date
+    tokens, or a cell whose content is ≥2 stacked amount-only lines.
+
+    The date check is scoped to date-category columns (resolved through the
+    fieldmap, like every other column role): a merged row stacks its dates in
+    the date cell, whereas a wrapped description may legitimately name a date
+    range — "Int.Pd:16/02/2026 to 31/03/2026" — without the table having
+    collapsed.
     """
     for r in rows:
-        for v in r.values():
+        for fieldname, v in r.items():
             s = str(v)
             if "\n" not in s:
                 continue
-            if len(_DATE_TOKEN_RE.findall(s)) >= 2:
+            if (cat_by_field.get(fieldname) == "date"
+                    and len(_DATE_TOKEN_RE.findall(s)) >= 2):
                 return True
             amount_lines = sum(1 for ln in s.split("\n") if _AMOUNT_LINE_RE.match(ln))
             if amount_lines >= 2:
@@ -1311,7 +1327,7 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
 
     def _cand_score(cand):
         cand_rows = cand[1][0]
-        if _has_merged_rows(cand_rows):
+        if _has_merged_rows(cand_rows, cat_by_field):
             return (0, 0, 0)  # merged-row signature — only wins if nothing else does
         chain_len, complete_rows = _score_balance_chain(cand_rows, alias_map)
         # Primary: balance chain length (correctness), secondary: complete rows, tertiary: total rows
