@@ -26,11 +26,22 @@ from database import company_connection, raw_connection
 from db.migrate import ProvisionError, provision_company
 from routers.auth import require_level
 from services.accounts import AccountError, create_account
-from services.clone import CloneError, clone_into, clone_preview
+from routers.master import TABLE_LABELS
+from services.clone import FIELDS_PART, CloneError, clone_into, clone_preview
 
 router = APIRouter(prefix="/companies", tags=["companies"])
 
 require_super_admin = require_level(permissions.SUPER_ADMIN)
+
+# What each copyable thing is called on screen. The master tables take their
+# names from the Master Data router, so the checkbox and the page it refers to
+# cannot end up calling the same table two different things. Only the two that
+# have no home elsewhere are written out here.
+_PART_LABELS = {
+    FIELDS_PART: "Field structure and labels",
+    "projects": "Projects",
+    **TABLE_LABELS,
+}
 
 
 @router.get("/")
@@ -100,14 +111,20 @@ async def preview_clone(company_id: int, user: dict = Depends(require_super_admi
     """
     What copying this company would bring across, counted live.
 
-    The register screen shows these numbers next to the company the user picked,
-    so the sentence they agree to is measured rather than written down. Anything
-    absent from this response is not copied: no transactions, no imports, no
-    accounts.
+    `parts` is the list the register screen turns into checkboxes: one entry per
+    thing that can be copied, each with its label and how many of it this company
+    has. Sending the same keys back as copy_parts is what selects them.
+
+    Anything absent from this response is not copied: no transactions, no
+    imports, no accounts.
     """
     async with raw_connection() as conn:
         source = await _source_company(conn, company_id)
         counts = await clone_preview(conn, source["schema_name"])
+
+    counts["parts"] = [
+        {**p, "label": _PART_LABELS.get(p["key"], p["key"])} for p in counts["parts"]
+    ]
     return {"company": {"id": source["id"], "name": source["name"]}, **counts}
 
 
@@ -115,6 +132,10 @@ async def preview_clone(company_id: int, user: dict = Depends(require_super_admi
 async def register_company(
     name: str = Body(..., description="Company name, unique across the install"),
     copy_from_id: int = Body(None, description="Optional: id of a company to copy the setup of"),
+    copy_parts: list[str] = Body(
+        None,
+        description="Which parts to copy; omit for all. Keys come from the clone-preview response.",
+    ),
     admin_username: str = Body(None, description="Optional: username for the company's first admin"),
     admin_password: str = Body(None, description="Optional: password for that first admin"),
     user: dict = Depends(require_super_admin),
@@ -130,6 +151,12 @@ async def register_company(
     transactions, imports or accounts — see services/clone.py. The copy is a
     snapshot, not a link; changing the source afterwards does not change this
     company.
+
+    copy_parts narrows that to a chosen few. Omitting it copies everything;
+    sending an empty list copies nothing, which is a blank company by a longer
+    route. The distinction is deliberate — `copy_parts or None` would have read
+    an explicit "nothing" as "everything", which is the one mistake here that
+    silently does more than the user asked for.
 
     Pass admin_username and admin_password to seed the company's first
     company_admin in the same step. Skip them and the company starts empty —
@@ -159,8 +186,12 @@ async def register_company(
                         conn,
                         source_schema=source["schema_name"],
                         target_schema=company["schema_name"],
+                        parts=copy_parts,
                     )
                     copied["source_name"] = source["name"]
+                    copied["part_labels"] = [
+                        _PART_LABELS.get(p, p) for p in copied["parts"]
+                    ]
         except ProvisionError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
         except CloneError as e:

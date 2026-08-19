@@ -57,9 +57,41 @@ COPIED_TABLES = (
 # company it belongs to.
 _NOT_COPIED_COLUMNS = frozenset({"created_at", "updated_at"})
 
+# The columns and the fieldmap are one choice, not two. A fieldmap row whose
+# column does not exist is a field the importer cannot fill, and a column with
+# no fieldmap row is a header with no label — custom_fields.py creates and
+# deletes the pair together for exactly this reason, so a copy offers them
+# together too.
+FIELDS_PART = "fields"
+
+# Everything a copy can bring across, in the order it is applied. The keys are
+# table names rather than invented ones so that adding a table to COPIED_TABLES
+# adds a checkbox to the register screen with no other edit.
+CLONE_PARTS = (FIELDS_PART,) + COPIED_TABLES
+
 
 class CloneError(RuntimeError):
     """The clone could not be completed. Carries a message fit to show a user."""
+
+
+def resolve_parts(parts) -> tuple[str, ...]:
+    """Normalise a requested selection into canonical order.
+
+    None means everything — the default for a caller that does not care. An
+    empty list is a real answer meaning nothing, and is left as such: a copy
+    with nothing selected produces the same company a blank registration does,
+    which is odd but not wrong, and silently turning it into "everything" would
+    be far worse than letting it be empty.
+    """
+    if parts is None:
+        return CLONE_PARTS
+    wanted = set(parts)
+    unknown = sorted(wanted - set(CLONE_PARTS))
+    if unknown:
+        raise CloneError(
+            f"Cannot copy {', '.join(unknown)}. Choose from: {', '.join(CLONE_PARTS)}."
+        )
+    return tuple(p for p in CLONE_PARTS if p in wanted)
 
 
 def _ident(name: str) -> str:
@@ -269,27 +301,37 @@ async def _copy_fieldmap(conn, source_schema: str, target_schema: str) -> int:
     return await _copy_rows(conn, source_schema, target_schema, "fieldmap")
 
 
-async def clone_into(conn, *, source_schema: str, target_schema: str) -> dict:
+async def clone_into(
+    conn, *, source_schema: str, target_schema: str, parts=None
+) -> dict:
     """Shape and stock target_schema to match source_schema.
 
     Expects a schema provision_company has already built and registered. Does
     not open a transaction: the caller wraps this together with the
     provisioning, so a failure here leaves no half-built company behind.
 
+    parts selects what to bring across; None brings everything. The parts are
+    independent — master data does not depend on the field setup, so copying a
+    company's heads onto an otherwise default company is a legal answer.
+
     Returns what was copied, for the caller to report.
     """
     if source_schema == target_schema:
         raise CloneError("A company cannot be cloned onto itself.")
 
-    shape = {}
-    for table in SHAPED_TABLES:
-        shape[table] = await _sync_shape(conn, source_schema, target_schema, table)
+    chosen = resolve_parts(parts)
 
-    fields = await _copy_fieldmap(conn, source_schema, target_schema)
+    shape: dict[str, dict] = {}
+    fields = 0
+    if FIELDS_PART in chosen:
+        for table in SHAPED_TABLES:
+            shape[table] = await _sync_shape(conn, source_schema, target_schema, table)
+        fields = await _copy_fieldmap(conn, source_schema, target_schema)
 
     rows: dict[str, int] = {}
     for table in COPIED_TABLES:
-        rows[table] = await _copy_rows(conn, source_schema, target_schema, table)
+        if table in chosen:
+            rows[table] = await _copy_rows(conn, source_schema, target_schema, table)
 
     added = sum(len(s["added"]) for s in shape.values())
     dropped = sum(len(s["dropped"]) for s in shape.values())
@@ -301,6 +343,7 @@ async def clone_into(conn, *, source_schema: str, target_schema: str) -> dict:
     return {
         "source_schema": source_schema,
         "target_schema": target_schema,
+        "parts": list(chosen),
         "fields": fields,
         "columns_added": added,
         "columns_dropped": dropped,
@@ -333,6 +376,13 @@ async def clone_preview(conn, source_schema: str) -> dict:
             await conn.fetchval(f"SELECT count(*) FROM {_rel(source_schema, table)}") or 0
         )
 
+    # One entry per thing the user can tick, in the order it would be applied.
+    # The register screen builds its checkbox list from this rather than from a
+    # list of its own, so a table added to COPIED_TABLES appears there with no
+    # frontend edit — and a company with none of something shows a zero instead
+    # of the option quietly vanishing.
+    part_counts = {FIELDS_PART: int(fields or 0), **counts}
+
     return {
         "schema_name": source_schema,
         "fields": int(fields or 0),
@@ -340,4 +390,5 @@ async def clone_preview(conn, source_schema: str) -> dict:
         "projects": counts.get("projects", 0),
         "masters": sum(v for k, v in counts.items() if k != "projects"),
         "tables": counts,
+        "parts": [{"key": k, "count": part_counts.get(k, 0)} for k in CLONE_PARTS],
     }

@@ -84,6 +84,13 @@ _TABLES = {
 }
 
 
+# Table name -> human label, for code outside this router that has to name a
+# master table. The clone preview lists what a copy would bring across, and the
+# words it uses are these ones rather than a second set written somewhere else —
+# renaming 'RERA Head' above renames it there too.
+TABLE_LABELS = {cfg['table']: cfg['label'] for cfg in _TABLES.values()}
+
+
 def _get_config(master_type: str):
     cfg = _TABLES.get(master_type)
     if not cfg:

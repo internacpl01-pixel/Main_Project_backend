@@ -30,7 +30,9 @@ from services.clone import COPIED_TABLES, SHAPED_TABLES
 
 BLANK_PROBE = "ZZ Blank Probe"
 COPY_PROBE = "ZZ Copy Probe"
-PROBE_NAMES = (BLANK_PROBE, COPY_PROBE)
+PARTS_PROBE = "ZZ Parts Probe"
+NONE_PROBE = "ZZ Nothing Probe"
+PROBE_NAMES = (BLANK_PROBE, COPY_PROBE, PARTS_PROBE, NONE_PROBE)
 
 # Nothing is dropped unless it matches this AND belongs to a probe company.
 SCHEMA_RE = re.compile(r"^company_\d{3,}$")
@@ -263,8 +265,92 @@ async def main():
                     f"source={src_mig}, clone={new_mig}",
                 )
 
+            # --- partial copy ------------------------------------------------
+            # One part ticked. The parts have to be genuinely independent:
+            # taking master data without the field setup is a legal answer, and
+            # the shape must stay at the migration baseline when fields are not
+            # among them.
+            print("\n--- partial copy (head_master only) ---")
+            r = await client.post(
+                "/companies/",
+                json={
+                    "name": PARTS_PROBE,
+                    "copy_from_id": source["id"],
+                    "copy_parts": ["head_master"],
+                },
+            )
+            check("partial copy returns 201", r.status_code == 201, r.text[:300])
+            if r.status_code == 201:
+                partial = r.json()["company"]
+                pcopied = r.json()["copied"]
+                check(
+                    "reports only the part asked for",
+                    pcopied["parts"] == ["head_master"],
+                    pcopied["parts"],
+                )
+                check("reports 0 fields copied", pcopied["fields"] == 0, pcopied["fields"])
+                async with raw_connection() as conn:
+                    n = await conn.fetchval(
+                        f'SELECT count(*) FROM "{partial["schema_name"]}".fieldmap'
+                    )
+                    check("unticked fields left the 6 seeded rows", n == 6, f"got {n}")
+
+                    src_heads = await data_rows(conn, source_schema, "head_master")
+                    new_heads = await data_rows(conn, partial["schema_name"], "head_master")
+                    check(
+                        f"head_master came across ({len(src_heads)})",
+                        src_heads == new_heads,
+                        f"source={len(src_heads)}, clone={len(new_heads)}",
+                    )
+
+                    n = await conn.fetchval(
+                        f'SELECT count(*) FROM "{partial["schema_name"]}".projects'
+                    )
+                    check("unticked projects stayed empty", n == 0, f"got {n}")
+
+                    # Shape untouched: identical to a blank company, NOT to the
+                    # source. This is what proves _sync_shape was skipped.
+                    blank_cols = await columns(conn, blank["schema_name"], "temp_trans")
+                    part_cols = await columns(conn, partial["schema_name"], "temp_trans")
+                    src_cols = await columns(conn, source_schema, "temp_trans")
+                    check(
+                        "shape stayed at baseline, not the source's",
+                        part_cols == blank_cols and part_cols != src_cols,
+                        f"baseline={len(blank_cols)}, partial={len(part_cols)}, source={len(src_cols)}",
+                    )
+
+            # Empty list is an explicit "nothing", not a missing value. If this
+            # ever copies everything, `copy_parts or None` has crept back in.
+            print("\n--- empty selection ---")
+            r = await client.post(
+                "/companies/",
+                json={"name": NONE_PROBE, "copy_from_id": source["id"], "copy_parts": []},
+            )
+            check("empty selection returns 201", r.status_code == 201, r.text[:300])
+            if r.status_code == 201:
+                nothing = r.json()["company"]
+                check("reports nothing copied", r.json()["copied"]["parts"] == [])
+                async with raw_connection() as conn:
+                    n = await conn.fetchval(
+                        f'SELECT count(*) FROM "{nothing["schema_name"]}".fieldmap'
+                    )
+                    check("empty selection is a blank company", n == 6, f"got {n}")
+                    heads = await conn.fetchval(
+                        f'SELECT count(*) FROM "{nothing["schema_name"]}".head_master'
+                    )
+                    check("empty selection copied no master data", heads == 0, f"got {heads}")
+
             # --- refusals ----------------------------------------------------
             print("\n--- refusals ---")
+            r = await client.post(
+                "/companies/",
+                json={
+                    "name": "ZZ Never Created",
+                    "copy_from_id": source["id"],
+                    "copy_parts": ["transactions"],
+                },
+            )
+            check("unknown part is a 400", r.status_code == 400, r.text[:200])
             r = await client.post(
                 "/companies/", json={"name": "ZZ Never Created", "copy_from_id": 999999}
             )
