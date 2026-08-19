@@ -204,7 +204,21 @@ async def me(user: dict = Depends(get_current_user)):
     The frontend reads level and assignable_roles from here to decide which
     nav items and buttons to render. Every one of those decisions is enforced
     again server-side — this only spares the user buttons that would 403.
+
+    company_name is read from admin.companies rather than carried in the token,
+    for the same reason `level` is derived from the role above: a token minted
+    before a rename would otherwise keep showing the old name until it expired,
+    and JWT_EXPIRE_MINUTES is long enough for that to be the name people see all
+    day. One primary-key lookup, on a route the app calls once at load and again
+    after a company switch.
     """
+    company_name = None
+    if user["company_id"] is not None:
+        async with company_connection("admin") as conn:
+            company_name = await conn.fetchval(
+                "SELECT name FROM admin.companies WHERE id = $1", user["company_id"]
+            )
+
     return {
         "id": user["id"],
         "username": user["username"],
@@ -212,6 +226,9 @@ async def me(user: dict = Depends(get_current_user)):
         "role_label": permissions.label_of(user["role"]),
         "level": user["level"],
         "company_id": user["company_id"],
+        # None for a super admin who has not picked a company yet — they get the
+        # company switcher in that slot instead, so there is nothing to name.
+        "company_name": company_name,
         "schema": user["schema"],
         "assignable_roles": permissions.assignable_roles(user["level"]),
     }
