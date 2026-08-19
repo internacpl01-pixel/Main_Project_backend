@@ -12,7 +12,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 
 import permissions
 from database import company_connection
-from routers.auth import get_current_schema, get_current_user, require_level
+from routers.auth import get_company_user, get_current_schema, require_level
 from services import scoping
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -23,7 +23,7 @@ require_manager = require_level(permissions.MANAGER)
 
 
 @router.get("/")
-async def list_projects(user: dict = Depends(get_current_user)):
+async def list_projects(user: dict = Depends(get_company_user)):
     """
     List the projects this user may work on.
 
@@ -88,7 +88,7 @@ async def create_project(
 
 
 @router.get("/{project_id}")
-async def get_project(project_id: int, user: dict = Depends(get_current_user)):
+async def get_project(project_id: int, user: dict = Depends(get_company_user)):
     """
     Get one project by ID.
 

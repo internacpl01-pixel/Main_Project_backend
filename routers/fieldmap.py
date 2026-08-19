@@ -68,33 +68,27 @@ async def fieldmap_change_log(
     return result
 
 
-@router.post("/", status_code=201, dependencies=[Depends(require_manager)])
-async def create_fieldmap(
-    body: dict,
-    schema: str = Depends(get_current_schema),
-    user: dict = Depends(get_current_user),
-):
-    fieldname = body.get('fieldname')
-    displayname = body.get('displayname')
-    mapfields = body.get('mapfields', '')
-    data_type = body.get('data_type', 'text')
-    if data_type not in ('date', 'text', 'numeric'):
-        data_type = 'text'
-    # Free text: what the field is for (import / selection / rule / ...).
-    method = (body.get('method') or '').strip()
+# A field is a fieldmap row AND a real column, created together by
+# POST /custom-fields. There is deliberately no endpoint here that makes the row
+# on its own.
+#
+# There used to be. A mapping with no column behind it still competes for a
+# statement's headers, and one named Debit/Credit matched the Axis header
+# "Amount(INR) Debit/Credit" more specifically than the real amount column's
+# "Credit" alias. It took the column and had nowhere to put the value, so every
+# row lost its amount and the import failed with "No usable transaction rows
+# were found" — an error that says nothing about the mapping that caused it.
+#
+# fieldname is not patchable below for the same reason: renaming the row does
+# not rename the column, so a rename produces the same orphan a create did.
 
+
+async def _current_fieldname(schema: str, fieldmap_id: int) -> str | None:
+    """The name this mapping currently holds, for the rename guard below."""
     async with company_connection(schema) as conn:
-        try:
-            row = await conn.fetchrow(
-                f"""INSERT INTO fieldmap (fieldname, displayname, mapfields, data_type, method)
-                   VALUES ($1, $2, $3, $4, $5)
-                   RETURNING {_ROW_COLUMNS}""",
-                fieldname, displayname, mapfields, data_type, method,
-            )
-        except Exception as e:
-            raise HTTPException(400, f"Could not create mapping: {e}")
-        await changelog.log_created(conn, row=dict(row), username=user["username"])
-    return dict(row)
+        return await conn.fetchval(
+            "SELECT fieldname FROM fieldmap WHERE id = $1", fieldmap_id
+        )
 
 
 @router.patch("/{fieldmap_id}", dependencies=[Depends(require_manager)])
@@ -104,10 +98,27 @@ async def update_fieldmap(
     schema: str = Depends(get_current_schema),
     user: dict = Depends(get_current_user),
 ):
+    # fieldname is absent from this list on purpose — it is the name of a real
+    # column, and nothing here renames columns. Sending it unchanged is fine and
+    # ignored, which is what the edit form does; sending a different one is
+    # refused rather than quietly dropped, because a caller that asked to rename
+    # a field and got a 200 would believe it happened.
+    if 'fieldname' in body:
+        current = await _current_fieldname(schema, fieldmap_id)
+        if current is None:
+            raise HTTPException(404, "Mapping not found.")
+        if (body['fieldname'] or '').strip() != current:
+            raise HTTPException(
+                400,
+                f"'{current}' is the name of a real column and cannot be renamed "
+                f"here. Delete the field on the Custom Fields page and add it "
+                f"again under the new name, or change its Display Name instead.",
+            )
+
     sets = []
     params = []
     idx = 1
-    for key in ('fieldname', 'displayname', 'mapfields', 'data_type', 'method', 'is_active'):
+    for key in ('displayname', 'mapfields', 'data_type', 'method', 'is_active'):
         if key in body:
             sets.append(f"{key} = ${idx}")
             params.append(body[key])

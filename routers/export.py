@@ -22,7 +22,7 @@ from fastapi.responses import StreamingResponse
 from fpdf import FPDF
 
 from database import company_connection
-from routers.auth import get_current_schema, get_current_user
+from routers.auth import get_company_user, get_current_schema
 from services import custom_fields, scoping
 
 logger = logging.getLogger(__name__)
@@ -412,7 +412,7 @@ async def export_transactions(
     head_id: int = Query(None),
     date_from: date = Query(None, description="YYYY-MM-DD"),
     date_to: date = Query(None, description="YYYY-MM-DD"),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_company_user),
 ):
     """
     Download the ledger as CSV, Excel or PDF.

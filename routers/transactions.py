@@ -18,7 +18,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 
 import permissions
 from database import company_connection
-from routers.auth import get_current_schema, get_current_user, require_level
+from routers.auth import get_company_user, get_current_schema, require_level
 from services import custom_fields, scoping
 
 router = APIRouter(prefix="/transactions", tags=["transactions"])
@@ -110,7 +110,7 @@ async def list_transactions(
     search: str = Query("", description="Match any column or master name"),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_company_user),
 ):
     """
     List finalized transactions, optionally filtered.
@@ -230,7 +230,7 @@ async def list_transactions(
 async def transaction_summary(
     date_from: str = None,
     date_to: str = None,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_company_user),
 ):
     """
     Total amounts by head, for a date range.
@@ -295,7 +295,7 @@ async def list_temp_trans(
     search: str = Query("", description="Match any column or master name"),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_company_user),
 ):
     """
     List raw rows from the last import, before they're finalized.
@@ -465,7 +465,7 @@ async def clear_temp_trans(schema: str = Depends(get_current_schema)):
 
 
 @router.delete("/temp-trans/{row_id}", dependencies=[Depends(require_manager)])
-async def delete_temp_row(row_id: int, user: dict = Depends(get_current_user)):
+async def delete_temp_row(row_id: int, user: dict = Depends(get_company_user)):
     """
     Remove one staged row.
 
@@ -527,7 +527,7 @@ async def classify_row(
     idw_head_id: int = Body(None, description="idw_head_master.id"),
     project_id: int = Body(None, description="projects.id"),
     beneficiary_id: int = Body(None, description="beneficiary_master.id"),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_company_user),
 ):
     """
     Tag a raw row with a head (category) before finalizing.
@@ -627,7 +627,7 @@ async def classify_row(
 @router.post("/temp-trans/{row_id}/finalize")
 async def finalize_row(
     row_id: int,
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_company_user),
 ):
     """
     Move a classified row from temp_trans into the transactions ledger.

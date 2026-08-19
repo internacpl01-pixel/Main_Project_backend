@@ -23,7 +23,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 
 import permissions
 from database import company_connection, raw_connection
-from db.migrate import ProvisionError, provision_company
+from db.migrate import ProvisionError, normalize_company_code, provision_company
 from routers.auth import require_level
 from services.accounts import AccountError, create_account
 from routers.master import TABLE_LABELS
@@ -63,6 +63,7 @@ async def list_companies(
             f"""
             SELECT c.id,
                    c.name,
+                   c.code,
                    c.schema_name,
                    c.is_active,
                    c.created_at,
@@ -131,6 +132,7 @@ async def preview_clone(company_id: int, user: dict = Depends(require_super_admi
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def register_company(
     name: str = Body(..., description="Company name, unique across the install"),
+    code: str = Body(..., description="Three lowercase letters; prefixes every username here"),
     copy_from_id: int = Body(None, description="Optional: id of a company to copy the setup of"),
     copy_parts: list[str] = Body(
         None,
@@ -180,7 +182,9 @@ async def register_company(
         try:
             async with conn.transaction():
                 source = await _source_company(conn, copy_from_id) if copy_from_id else None
-                company = await provision_company(conn, name, created_by=user.get("id"))
+                company = await provision_company(
+                    conn, name, code, created_by=user.get("id")
+                )
                 if source:
                     copied = await clone_into(
                         conn,
@@ -234,20 +238,30 @@ async def register_company(
 async def update_company(
     company_id: int,
     name: str = Body(None, description="New company name"),
-    is_active: bool = Body(None, description="false hides the company and blocks switching into it"),
+    code: str = Body(None, description="Three letters; only settable while the company has none"),
+    is_active: bool = Body(None, description="false hides the company and blocks new sign-ins"),
     user: dict = Depends(require_super_admin),
 ):
     """
-    Rename a company or flip it active/inactive.
+    Rename a company, give a legacy company its code, or flip it active/inactive.
 
-    Deactivating is the soft delete: /auth/switch-company refuses an inactive
-    company and it drops off the default registry list, but the schema and every
-    row in it stay exactly where they are. There is deliberately no endpoint
-    that drops a company schema — that would destroy a tenant's whole ledger on
-    one mis-click.
+    Deactivating is the reversible one: the company drops off the default
+    registry list, but the schema and every row in it stay exactly where they
+    are. DELETE is the other one, and it refuses any company that holds data.
+
+    A code can be set once, on a company registered before codes existed. It
+    cannot be changed afterwards: every username in the company starts with it,
+    and changing it would leave every existing account failing the rule its own
+    company defines.
     """
     sets = []
     params = []
+
+    if code is not None:
+        try:
+            code = normalize_company_code(code)
+        except ProvisionError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
     if name is not None:
         name = name.strip()
@@ -259,6 +273,10 @@ async def update_company(
         sets.append(f"name = ${len(params) + 1}")
         params.append(name)
 
+    if code is not None:
+        sets.append(f"code = ${len(params) + 1}")
+        params.append(code)
+
     if is_active is not None:
         sets.append(f"is_active = ${len(params) + 1}")
         params.append(is_active)
@@ -266,31 +284,57 @@ async def update_company(
     if not sets:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Nothing to update. Send name, is_active, or both.",
+            detail="Nothing to update. Send name, code, is_active, or a combination.",
         )
 
     params.append(company_id)
 
     async with company_connection("admin") as conn:
-        clash = None
+        current = await conn.fetchrow(
+            "SELECT name, code FROM admin.companies WHERE id = $1", company_id
+        )
+        if current is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Company not found.")
+
         if name is not None:
             clash = await conn.fetchval(
                 "SELECT 1 FROM admin.companies WHERE lower(name) = lower($1) AND id <> $2",
                 name,
                 company_id,
             )
-        if clash:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"A company named '{name}' already exists.",
+            if clash:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"A company named '{name}' already exists.",
+                )
+
+        if code is not None:
+            if current["code"] and current["code"] != code:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"'{current['name']}' already has the code '{current['code']}', "
+                        f"and it cannot be changed — every username in the company "
+                        f"begins with it."
+                    ),
+                )
+            taken = await conn.fetchval(
+                "SELECT name FROM admin.companies WHERE code = $1 AND id <> $2",
+                code,
+                company_id,
             )
+            if taken:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Code '{code}' is already used by '{taken}'.",
+                )
 
         row = await conn.fetchrow(
             f"""
             UPDATE admin.companies
             SET {", ".join(sets)}
             WHERE id = ${len(params)}
-            RETURNING id, name, schema_name, is_active, created_at, created_by
+            RETURNING id, name, code, schema_name, is_active, created_at, created_by
             """,
             *params,
         )
@@ -299,3 +343,187 @@ async def update_company(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Company not found.")
 
     return dict(row)
+
+
+# Tables whose contents mean the company is in use. import_batches counts even
+# when every row in it was later deleted: a company that has taken a statement
+# has a history, and history is the thing DELETE must never quietly discard.
+_IN_USE_TABLES = ("transactions", "temp_trans", "import_batches")
+
+
+@router.get("/{company_id}/delete-check")
+async def check_delete(company_id: int, user: dict = Depends(require_super_admin)):
+    """
+    Whether this company can be deleted, and what is standing in the way.
+
+    The confirm dialog asks this before offering the button, so the refusal is
+    read before the decision rather than after it.
+    """
+    async with raw_connection() as conn:
+        company = await conn.fetchrow(
+            "SELECT id, name, schema_name FROM admin.companies WHERE id = $1", company_id
+        )
+        if company is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Company not found.")
+
+        counts = {}
+        for table in _IN_USE_TABLES:
+            counts[table] = int(
+                await conn.fetchval(
+                    f'SELECT count(*) FROM "{company["schema_name"]}"."{table}"'
+                ) or 0
+            )
+        users = int(
+            await conn.fetchval(
+                "SELECT count(*) FROM admin.users WHERE company_id = $1", company_id
+            ) or 0
+        )
+
+        # What the company has built up that is not a ledger. None of it blocks
+        # a delete — a company can hold a carefully built field setup and still
+        # be one somebody created by mistake — but it is the part that is easy
+        # to forget is there. clone_preview already counts exactly these, so the
+        # dialog warns with the same numbers the copy screen offers.
+        holds = await clone_preview(conn, company["schema_name"])
+
+    blocking = {k: v for k, v in counts.items() if v}
+    return {
+        "company": {"id": company["id"], "name": company["name"]},
+        "can_delete": not blocking,
+        "blocking": blocking,
+        "holds": {
+            "fields": holds["fields"],
+            "projects": holds["projects"],
+            "masters": holds["masters"],
+        },
+        "users": users,
+        "reason": (
+            None if not blocking else
+            "This company holds "
+            + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in blocking.items())
+            + ". Deactivate it instead — that hides it without destroying anything."
+        ),
+    }
+
+
+@router.delete("/{company_id}")
+async def delete_company(
+    company_id: int,
+    confirm_name: str = Body(..., embed=True, description="The company's exact name"),
+    user: dict = Depends(require_super_admin),
+):
+    """
+    Permanently remove a company that holds no data.
+
+    Drops the schema, its accounts and its migration records. There is no undo
+    and this app keeps no backups, so two things gate it:
+
+      * the company must hold no transactions, no staged rows and no import
+        batches. A company with a ledger is deactivated, never deleted — the
+        point of this endpoint is throwing away a mistake, not destroying a
+        tenant's books.
+      * the caller has to type the company's name back. An id in a URL is easy
+        to get wrong by one digit; a name is not.
+
+    One transaction, so a failure part-way leaves the company intact rather than
+    half-erased.
+    """
+    async with raw_connection() as conn:
+        async with conn.transaction():
+            company = await conn.fetchrow(
+                "SELECT id, name, code, schema_name FROM admin.companies WHERE id = $1",
+                company_id,
+            )
+            if company is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="Company not found."
+                )
+
+            if (confirm_name or "").strip() != company["name"]:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Type the company's name exactly to confirm. Expected "
+                        f"'{company['name']}'."
+                    ),
+                )
+
+            schema = company["schema_name"]
+            held = {}
+            for table in _IN_USE_TABLES:
+                n = int(await conn.fetchval(f'SELECT count(*) FROM "{schema}"."{table}"') or 0)
+                if n:
+                    held[table] = n
+            if held:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"'{company['name']}' holds "
+                        + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in held.items())
+                        + " and cannot be deleted. Deactivate it instead — that hides "
+                        "it without destroying anything."
+                    ),
+                )
+
+            # Schema first: project_members lives in it and references
+            # admin.users, so the accounts cannot go until it is gone.
+            await conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+            removed_users = await conn.fetchval(
+                "WITH gone AS (DELETE FROM admin.users WHERE company_id = $1 RETURNING 1) "
+                "SELECT count(*) FROM gone",
+                company_id,
+            )
+            await conn.execute(
+                "DELETE FROM admin.schema_migrations WHERE schema_name = $1", schema
+            )
+            await conn.execute("DELETE FROM admin.companies WHERE id = $1", company_id)
+
+    return {
+        "deleted": True,
+        "name": company["name"],
+        "code": company["code"],
+        "schema_name": schema,
+        "users_removed": int(removed_users or 0),
+    }
+
+
+@router.post("/{company_id}/admin", status_code=status.HTTP_201_CREATED)
+async def add_company_admin(
+    company_id: int,
+    username: str = Body(..., description="Must start with the company's code, e.g. dpl-ravi"),
+    password: str = Body(...),
+    user: dict = Depends(require_super_admin),
+):
+    """
+    Create a company_admin for a company.
+
+    This is the super admin's only way to put a person inside a company, and it
+    exists because they cannot go in themselves. Without it, a company whose
+    last admin was deleted would be unreachable by anyone.
+
+    The username has to carry the company's code, same as every other account
+    there — enforced in services/accounts.py, not here, so the rule is one rule.
+    """
+    async with raw_connection() as conn:
+        company = await conn.fetchrow(
+            "SELECT id, name, code, is_active FROM admin.companies WHERE id = $1", company_id
+        )
+        if company is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Company not found.")
+        if not company["is_active"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"'{company['name']}' is deactivated. Reactivate it first.",
+            )
+        try:
+            account = await create_account(
+                conn,
+                username=username,
+                password=password,
+                role="company_admin",
+                company_id=company_id,
+            )
+        except AccountError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return {"company": {"id": company["id"], "name": company["name"]}, "admin": account}

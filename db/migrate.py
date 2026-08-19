@@ -4,13 +4,17 @@ Database migration runner.
 Commands:
   init               Create admin schema + schema_migrations, apply admin files,
                      seed super-admin (from SUPER_ADMIN_USERNAME / _PASSWORD).
-  new-company "Name" Allocate next company_NNN schema, CREATE SCHEMA,
+  new-company "Name" CODE
+                     Allocate next company_NNN schema, CREATE SCHEMA,
                      apply all company migrations, register in admin.companies.
+                     CODE is three lowercase letters and prefixes every
+                     username in that company.
   upgrade            Apply any new migration files to admin and every company.
   status             Print applied migrations per schema.
 """
 import asyncio
 import hashlib
+import re
 import sys
 from pathlib import Path
 
@@ -94,7 +98,33 @@ class ProvisionError(Exception):
     """A company could not be created. Carries a message fit to show a user."""
 
 
-async def provision_company(conn, name: str, created_by: int | None = None) -> dict:
+# Exactly three lowercase letters, matching the CHECK in
+# admin/003_company_code.sql. Every username in the company is prefixed with it,
+# so it is short on purpose — 'dpl-ravi' stays readable in a way that
+# 'dpl-homes-gurgaon-ravi' does not.
+COMPANY_CODE_RE = re.compile(r"^[a-z]{3}$")
+
+
+def normalize_company_code(code: str) -> str:
+    """Fold a typed code to its stored form, or refuse it.
+
+    Lowercasing here is what makes the code case-insensitive everywhere else:
+    'DPL' and 'dpl' become the same three characters before they reach the
+    unique index, so nobody can register both.
+    """
+    code = (code or "").strip().lower()
+    if not COMPANY_CODE_RE.match(code):
+        raise ProvisionError(
+            "Company code must be exactly three letters (a-z), no digits or "
+            "punctuation. It is stored lowercase and matched case-insensitively, "
+            "and every username in the company begins with it."
+        )
+    return code
+
+
+async def provision_company(
+    conn, name: str, code: str, created_by: int | None = None
+) -> dict:
     """
     Create one company: allocate a schema name, CREATE SCHEMA, register it in
     admin.companies, and apply every company migration to it.
@@ -118,11 +148,17 @@ async def provision_company(conn, name: str, created_by: int | None = None) -> d
     if len(name) < 2:
         raise ProvisionError("Company name must be at least 2 characters.")
 
+    code = normalize_company_code(code)
+
     clash = await conn.fetchval(
         "SELECT 1 FROM admin.companies WHERE lower(name) = lower($1)", name
     )
     if clash:
         raise ProvisionError(f"A company named '{name}' already exists.")
+
+    taken = await conn.fetchval("SELECT name FROM admin.companies WHERE code = $1", code)
+    if taken:
+        raise ProvisionError(f"Code '{code}' is already used by '{taken}'.")
 
     files = sorted(COMPANY_DIR.glob("*.sql"))
     if not files:
@@ -134,11 +170,12 @@ async def provision_company(conn, name: str, created_by: int | None = None) -> d
         await conn.execute(f'CREATE SCHEMA "{schema}"')
         row = await conn.fetchrow(
             """
-            INSERT INTO admin.companies (name, schema_name, created_by)
-            VALUES ($1, $2, $3)
-            RETURNING id, name, schema_name, is_active, created_at, created_by
+            INSERT INTO admin.companies (name, code, schema_name, created_by)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, name, code, schema_name, is_active, created_at, created_by
             """,
             name,
+            code,
             schema,
             created_by,
         )
@@ -200,17 +237,17 @@ async def cmd_init():
         await conn.close()
 
 
-async def cmd_new_company(name: str):
-    """new-company 'Name': create schema + apply migrations + register company."""
-    if not name:
-        print('Usage: python -m db.migrate new-company "Company Name"')
+async def cmd_new_company(name: str, code: str):
+    """new-company 'Name' CODE: create schema + apply migrations + register."""
+    if not name or not code:
+        print('Usage: python -m db.migrate new-company "Company Name" abc')
         sys.exit(1)
 
-    print(f"=== new-company '{name}' ===")
+    print(f"=== new-company '{name}' [{code}] ===")
     conn = await asyncpg.connect(config.DATABASE_URL)
     try:
         try:
-            company = await provision_company(conn, name)
+            company = await provision_company(conn, name, code)
         except ProvisionError as e:
             print(f"  [ERROR] {e}")
             sys.exit(1)
@@ -277,7 +314,7 @@ def main():
     if len(sys.argv) < 2 or sys.argv[1] not in ("init", "new-company", "upgrade", "status"):
         print("Usage: python -m db.migrate <command> [args]")
         print("  init")
-        print('  new-company "Company Name"')
+        print('  new-company "Company Name" abc')
         print("  upgrade")
         print("  status")
         sys.exit(1)
@@ -286,10 +323,10 @@ def main():
     if cmd == "init":
         asyncio.run(cmd_init())
     elif cmd == "new-company":
-        if len(sys.argv) < 3:
-            print('Usage: python -m db.migrate new-company "Company Name"')
+        if len(sys.argv) < 4:
+            print('Usage: python -m db.migrate new-company "Company Name" abc')
             sys.exit(1)
-        asyncio.run(cmd_new_company(sys.argv[2]))
+        asyncio.run(cmd_new_company(sys.argv[2], sys.argv[3]))
     elif cmd == "upgrade":
         asyncio.run(cmd_upgrade())
     elif cmd == "status":

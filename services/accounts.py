@@ -35,6 +35,49 @@ def validate_username(username: str) -> str:
     return username
 
 
+async def company_code_of(conn, company_id: int) -> str | None:
+    """The three-letter code every username in this company must start with.
+
+    None for a company registered before codes existed. Callers treat that as
+    "no rule to apply" rather than as a failure — those companies' accounts were
+    named before there was a convention, and breaking their logins to enforce
+    one retroactively helps nobody.
+    """
+    return await conn.fetchval("SELECT code FROM admin.companies WHERE id = $1", company_id)
+
+
+async def enforce_code_prefix(conn, username: str, company_id: int) -> str:
+    """Require username to read `code-something`, when the company has a code.
+
+    The prefix is what makes a username say which company it belongs to. Login
+    resolves an account from the username alone, before any company is known, so
+    this is the only place that fact is visible at the moment it is needed.
+
+    Checked when an account is created or renamed, never at login: accounts that
+    predate their company's code keep working exactly as they are.
+    """
+    code = await company_code_of(conn, company_id)
+    if not code:
+        return username
+
+    prefix = f"{code}-"
+    if username.lower().startswith(prefix):
+        # Fold the prefix to its canonical lowercase form so 'DPL-ravi' and
+        # 'dpl-ravi' cannot both exist. The rest of the name is left as typed.
+        rest = username[len(prefix):]
+        if not rest.strip():
+            raise AccountError(
+                f"'{username}' is only the company prefix. Add a name after it, "
+                f"like {prefix}ravi."
+            )
+        return prefix + rest
+
+    raise AccountError(
+        f"Usernames in this company must start with '{prefix}'. "
+        f"Try '{prefix}{username.lower()}'."
+    )
+
+
 def validate_password(password: str) -> str:
     password = password or ""
     if not password:
@@ -92,6 +135,7 @@ async def create_account(conn, *, username: str, password: str, role: str, compa
     resolves a user from the username alone, before any company is known.
     """
     username = validate_username(username)
+    username = await enforce_code_prefix(conn, username, company_id)
     password = validate_password(password)
 
     taken = await conn.fetchval("SELECT 1 FROM admin.users WHERE lower(username) = lower($1)", username)
@@ -124,6 +168,9 @@ async def update_account(
 
     if username is not None:
         username = validate_username(username)
+        # Renaming has to obey the same rule as creating, or the prefix is a
+        # convention you can opt out of one edit after joining.
+        username = await enforce_code_prefix(conn, username, company_id)
         taken = await conn.fetchval(
             "SELECT 1 FROM admin.users WHERE lower(username) = lower($1) AND id <> $2",
             username,

@@ -24,7 +24,7 @@ from fastapi import (APIRouter, Depends, File, Form, HTTPException, Query,
 
 import permissions
 from database import company_connection
-from routers.auth import get_current_schema, require_level, get_current_user
+from routers.auth import get_company_user, get_current_schema, require_level
 from services.pdf_import import process_pdf_import
 from services.staging import DuplicateFileError
 from services.tabular_import import READERS, process_tabular_import
@@ -83,7 +83,7 @@ async def import_pdf(
     password: str = Form("", description="Password, if the PDF is protected"),
     save: bool = Form(False, description="false previews, true stages a batch"),
     bank_id: int = Form(None, description="bank_master.id this statement belongs to"),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_company_user),
 ):
     """
     Parse a PDF bank statement.
@@ -148,7 +148,7 @@ async def import_excel(
     file: UploadFile = File(...),
     save: bool = Form(False, description="false previews, true stages a batch"),
     bank_id: int = Form(None, description="bank_master.id this statement belongs to"),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_company_user),
 ):
     """Parse an Excel bank statement. Same two-step flow as /imports/pdf."""
     return await _import_tabular("excel", file, save, bank_id, user)
@@ -159,7 +159,7 @@ async def import_csv(
     file: UploadFile = File(...),
     save: bool = Form(False, description="false previews, true stages a batch"),
     bank_id: int = Form(None, description="bank_master.id this statement belongs to"),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_company_user),
 ):
     """
     Parse a CSV bank statement. Same two-step flow as /imports/pdf.

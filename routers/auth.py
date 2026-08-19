@@ -75,6 +75,52 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     }
 
 
+# A super admin administers companies; they do not work inside one. Everything
+# under a company schema — its ledger, master data, fieldmap, imports, its own
+# users — belongs to that company's people.
+#
+# This is enforced on the two dependencies below rather than route by route,
+# because every company-scoped router in the app reaches its data through one of
+# them. A new router cannot forget the rule: to read a company's tables it has to
+# ask which company, and asking is what applies the check.
+#
+# It reads as an exception to the level hierarchy, and it is. Levels answer "does
+# this person outrank that one"; super_admin outranks everybody. This answers a
+# different question — whose data is this — and the answer for a super admin is
+# "nobody's".
+_SUPER_ADMIN_SCOPE = (
+    "A super admin manages companies, not the data inside them. Create the "
+    "company's admin from the Companies page and sign in as a company user to "
+    "work in its ledger."
+)
+
+
+def _refuse_super_admin(user: dict):
+    if user.get("role") == "super_admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=_SUPER_ADMIN_SCOPE
+        )
+
+
+async def get_company_user(user: dict = Depends(get_current_user)) -> dict:
+    """
+    Dependency: the acting identity, for a route that works inside a company.
+
+    get_current_user is the raw identity and stays unguarded — /auth/me and the
+    whole companies router are legitimate super-admin ground. This is the one to
+    depend on anywhere `user["schema"]` will be handed to company_connection.
+
+    Reading the schema off the identity rather than through get_current_schema
+    is how a route slips past the rule: the guard is on the dependency, so a
+    route that never asks it never gets checked. Several already did that, and
+    a super admin reached the ledger query before failing on `relation
+    "fieldmap" does not exist` — the wrong error, from the wrong layer, about
+    the wrong thing.
+    """
+    _refuse_super_admin(user)
+    return user
+
+
 async def get_current_schema(user: dict = Depends(get_current_user)) -> str:
     """
     Dependency: the company schema_name this request acts on.
@@ -83,6 +129,7 @@ async def get_current_schema(user: dict = Depends(get_current_user)) -> str:
         async def my_route(schema=Depends(get_current_schema)):
             ...
     """
+    _refuse_super_admin(user)
     return user["schema"]
 
 
@@ -90,15 +137,16 @@ async def get_current_company_id(user: dict = Depends(get_current_user)) -> int:
     """
     Dependency: the admin.companies.id this request acts on.
 
-    Company users carry theirs from login. A super-admin has none until they
-    pick a company, which is why this 400s instead of silently acting on
-    nothing — user management has to know whose users it is listing.
+    Company users carry theirs from login. A super admin has none and cannot
+    acquire one — see above — so this refuses them by role rather than reporting
+    a missing company, which would read as something they could go and fix.
     """
+    _refuse_super_admin(user)
     company_id = user.get("company_id")
     if company_id is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No company selected. Switch to a company first.",
+            detail="This account is not attached to a company.",
         )
     return company_id
 
@@ -213,11 +261,15 @@ async def me(user: dict = Depends(get_current_user)):
     after a company switch.
     """
     company_name = None
+    company_code = None
     if user["company_id"] is not None:
         async with company_connection("admin") as conn:
-            company_name = await conn.fetchval(
-                "SELECT name FROM admin.companies WHERE id = $1", user["company_id"]
+            row = await conn.fetchrow(
+                "SELECT name, code FROM admin.companies WHERE id = $1", user["company_id"]
             )
+        if row is not None:
+            company_name = row["name"]
+            company_code = row["code"]
 
     return {
         "id": user["id"],
@@ -226,75 +278,24 @@ async def me(user: dict = Depends(get_current_user)):
         "role_label": permissions.label_of(user["role"]),
         "level": user["level"],
         "company_id": user["company_id"],
-        # None for a super admin who has not picked a company yet — they get the
-        # company switcher in that slot instead, so there is nothing to name.
+        # Both None for a super admin, who belongs to no company.
         "company_name": company_name,
+        # The username prefix for this company. The Users page needs it to show
+        # what a new account will be called, and to explain the rule when a name
+        # is refused. Null on a company registered before codes existed.
+        "company_code": company_code,
         "schema": user["schema"],
         "assignable_roles": permissions.assignable_roles(user["level"]),
     }
 
 
-@router.post("/switch-company")
-async def switch_company(
-    schema_name: str = Body(..., embed=True, description="company_NNN"),
-    credentials: str = Depends(oauth2_scheme),
-):
-    """
-    Super-admin only: switch into a specific company's schema and get a new JWT.
-
-    Regular company users can't call this — their JWT is bound to their company.
-    Super-admins use it to act on behalf of any company.
-    """
-    # Decode current token to verify super_admin role.
-    try:
-        payload = jwt.decode(
-            credentials,
-            config.JWT_SECRET,
-            algorithms=[config.JWT_ALGORITHM],
-        )
-    except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token.",
-        )
-
-    if payload.get("role") != "super_admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only super_admin can switch companies.",
-        )
-
-    # Verify the schema exists.
-    async with company_connection("admin") as conn:
-        company = await conn.fetchrow(
-            "SELECT id, name FROM admin.companies WHERE schema_name = $1 AND is_active = true",
-            schema_name,
-        )
-    if company is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Company schema '{schema_name}' not found.",
-        )
-
-    # Issue a new token bound to the chosen company's schema. company_id rides
-    # along so user management knows whose users the super-admin is managing.
-    new_payload = {
-        "sub": payload["sub"],
-        "uid": payload.get("uid"),
-        "role": payload["role"],
-        "company_id": company["id"],
-        "schema": schema_name,
-        "exp": datetime.now(timezone.utc).timestamp() + config.JWT_EXPIRE_MINUTES * 60,
-    }
-    new_token = jwt.encode(new_payload, config.JWT_SECRET, algorithm=config.JWT_ALGORITHM)
-
-    return {
-        "access_token": new_token,
-        "token_type": "bearer",
-        "schema": schema_name,
-        "company_id": company["id"],
-        "company_name": company["name"],
-    }
+# POST /auth/switch-company is gone.
+#
+# It minted a token binding a super admin to a company schema, which is exactly
+# the access the rule above withdraws. Leaving it would have been a way to get a
+# token the dependencies then refuse to honour — a door to a room with no floor.
+# A super admin who needs work done inside a company creates that company's
+# admin from the Companies page.
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
