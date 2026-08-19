@@ -22,7 +22,7 @@ from fastapi.responses import StreamingResponse
 from fpdf import FPDF
 
 from database import company_connection
-from routers.auth import get_company_user, get_current_schema
+from routers.auth import get_company_user
 from services import custom_fields, scoping
 
 logger = logging.getLogger(__name__)
@@ -164,7 +164,6 @@ async def _fetch_ledger(user: dict, project_id, head_id, date_from, date_to):
             f"""
             SELECT {", ".join(select_parts)}
             FROM transactions t
-            LEFT JOIN temp_trans        ti  ON ti.id  = t.temp_trans_id
             LEFT JOIN bank_master        bm  ON bm.id  = t.bank_id
             LEFT JOIN projects           p   ON p.id   = t.project_id
             LEFT JOIN head_master        h   ON h.id   = t.head_id

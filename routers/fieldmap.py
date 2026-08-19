@@ -11,7 +11,7 @@ Every write here is recorded by services.changelog. company_connection wraps the
 whole handler in one transaction, so a log row cannot survive a write that
 failed, and a write cannot land unlogged.
 """
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 import permissions
 from database import company_connection

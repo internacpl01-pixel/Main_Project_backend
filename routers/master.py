@@ -5,7 +5,7 @@ rera_head_master, and idw_head_master tables.
 All tables share the same shape, so a single generic CRUD router handles
 all five. The `master_type` path param selects the table.
 """
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 import permissions
 from database import company_connection

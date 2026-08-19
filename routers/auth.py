@@ -12,7 +12,7 @@ compare against is defined once in permissions.py.
 """
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Body, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 

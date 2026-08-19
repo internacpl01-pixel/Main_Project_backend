@@ -22,7 +22,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, status
 
 import permissions
 from database import company_connection
-from routers.auth import get_current_company_id, get_current_user, require_level
+from routers.auth import get_current_company_id, require_level
 from services import accounts
 
 router = APIRouter(prefix="/users", tags=["users"])
