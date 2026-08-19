@@ -1,14 +1,20 @@
 """
 Company registry routes — super-admin only.
 
-GET    /companies         — every registered company (the registry table)
-POST   /companies         — register a new company, optionally with its first admin
-PATCH  /companies/{id}    — rename, activate, or deactivate
+GET    /companies                    — every registered company (the registry table)
+GET    /companies/{id}/clone-preview — what copying that company would bring across
+POST   /companies                    — register a new company, blank or copied
+PATCH  /companies/{id}               — rename, activate, or deactivate
 
 Registering a company is not just an INSERT: it allocates a schema name, runs
 CREATE SCHEMA, and applies every company migration to it. That work lives in
 db.migrate.provision_company, shared with the `new-company` CLI command so the
 two paths cannot drift.
+
+Copying is the same endpoint with copy_from_id set, not a second one — the user
+presses one button and gets one company either way, and whether it starts blank
+or shaped like an existing company is a property of that request. The copying
+itself lives in services/clone.py.
 
 Restricted to super_admin throughout. A company user's token is bound to their
 own schema and there is nothing here for them to act on.
@@ -20,6 +26,7 @@ from database import company_connection, raw_connection
 from db.migrate import ProvisionError, provision_company
 from routers.auth import require_level
 from services.accounts import AccountError, create_account
+from services.clone import CloneError, clone_into, clone_preview
 
 router = APIRouter(prefix="/companies", tags=["companies"])
 
@@ -60,18 +67,69 @@ async def list_companies(
     return [dict(r) for r in rows]
 
 
+async def _source_company(conn, company_id: int) -> dict:
+    """The company a clone would copy from, or a 4xx explaining why it cannot.
+
+    Inactive companies are refused. Deactivated normally means retired, and a
+    retired company is exactly the one whose heads and beneficiaries have gone
+    stale — copying from it is a quiet way to start a new company with bad
+    reference data.
+    """
+    row = await conn.fetchrow(
+        "SELECT id, name, schema_name, is_active FROM admin.companies WHERE id = $1",
+        company_id,
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No company with id {company_id} to copy from.",
+        )
+    if not row["is_active"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"'{row['name']}' is deactivated and cannot be copied from. "
+                f"Reactivate it first if its setup is still the one you want."
+            ),
+        )
+    return dict(row)
+
+
+@router.get("/{company_id}/clone-preview")
+async def preview_clone(company_id: int, user: dict = Depends(require_super_admin)):
+    """
+    What copying this company would bring across, counted live.
+
+    The register screen shows these numbers next to the company the user picked,
+    so the sentence they agree to is measured rather than written down. Anything
+    absent from this response is not copied: no transactions, no imports, no
+    accounts.
+    """
+    async with raw_connection() as conn:
+        source = await _source_company(conn, company_id)
+        counts = await clone_preview(conn, source["schema_name"])
+    return {"company": {"id": source["id"], "name": source["name"]}, **counts}
+
+
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def register_company(
     name: str = Body(..., description="Company name, unique across the install"),
+    copy_from_id: int = Body(None, description="Optional: id of a company to copy the setup of"),
     admin_username: str = Body(None, description="Optional: username for the company's first admin"),
     admin_password: str = Body(None, description="Optional: password for that first admin"),
     user: dict = Depends(require_super_admin),
 ):
     """
-    Register a new company.
+    Register a new company, blank or shaped like an existing one.
 
     Creates schema company_NNN, applies every company migration to it, and
     records the registration against the super-admin who made it.
+
+    copy_from_id makes it a copy: the new company gets the source's columns,
+    fieldmap, projects and master data. It does NOT get the source's
+    transactions, imports or accounts — see services/clone.py. The copy is a
+    snapshot, not a link; changing the source afterwards does not change this
+    company.
 
     Pass admin_username and admin_password to seed the company's first
     company_admin in the same step. Skip them and the company starts empty —
@@ -85,10 +143,31 @@ async def register_company(
         )
 
     async with raw_connection() as conn:
+        # Provisioning and copying share one transaction. Postgres DDL is
+        # transactional, so a copy that fails halfway takes the schema and the
+        # admin.companies row down with it — the alternative is a registered
+        # company with half a fieldmap, which looks fine on the registry page
+        # and is wrong everywhere else. provision_company opens its own
+        # transaction, which nests here as a savepoint.
+        copied = None
         try:
-            company = await provision_company(conn, name, created_by=user.get("id"))
+            async with conn.transaction():
+                source = await _source_company(conn, copy_from_id) if copy_from_id else None
+                company = await provision_company(conn, name, created_by=user.get("id"))
+                if source:
+                    copied = await clone_into(
+                        conn,
+                        source_schema=source["schema_name"],
+                        target_schema=company["schema_name"],
+                    )
+                    copied["source_name"] = source["name"]
         except ProvisionError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        except CloneError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Could not copy '{name}': {e}",
+            )
 
         first_admin = None
         if seed_admin:
@@ -101,9 +180,11 @@ async def register_company(
                     company_id=company["id"],
                 )
             except AccountError as e:
-                # The schema is already built and committed at this point.
-                # Report the company as created and say the admin was not, rather
-                # than pretending the whole call failed.
+                # The schema is already built and committed at this point, copy
+                # included — the transaction above closed before this ran, on
+                # purpose. Report the company as created and say the admin was
+                # not, rather than pretending the whole call failed and leaving
+                # the user to wonder whether the company exists.
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=(
@@ -113,7 +194,9 @@ async def register_company(
                     ),
                 )
 
-    return {"company": company, "admin": first_admin}
+    # copied is None for a blank company, and a count of what came across for a
+    # copy. The UI reports it; nothing depends on it.
+    return {"company": company, "admin": first_admin, "copied": copied}
 
 
 @router.patch("/{company_id}")
