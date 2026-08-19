@@ -81,6 +81,39 @@ async def create_field(
     return result
 
 
+@router.delete("/by-id/{fieldmap_id}", dependencies=[Depends(require_manager)])
+async def delete_field_by_id(
+    fieldmap_id: int,
+    schema: str = Depends(get_current_schema),
+    user: dict = Depends(get_current_user),
+):
+    """
+    Delete a field by its fieldmap id: drop the column and remove the mapping.
+
+    This is what the Custom Fields page calls. The by-name route below still
+    exists for an orphaned column that has no fieldmap row to have an id, but a
+    name cannot address every row — see delete_field_by_id in the service for
+    the 'Debit/Credit' case, which no amount of URL encoding reaches.
+    """
+    async with company_connection(schema) as conn:
+        doomed = await conn.fetchrow(
+            "SELECT id, fieldname, mapfields FROM fieldmap WHERE id = $1", fieldmap_id
+        )
+        try:
+            result = await cf.delete_field_by_id(conn, fieldmap_id)
+        except cf.CustomFieldError as e:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+
+        if result.get("found") and doomed:
+            await changelog.log_deleted(
+                conn, row=dict(doomed), username=user["username"]
+            )
+
+    if not result.get("found"):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"No field with id {fieldmap_id}")
+    return result
+
+
 @router.delete("/{fieldname}", dependencies=[Depends(require_manager)])
 async def delete_field(
     fieldname: str,

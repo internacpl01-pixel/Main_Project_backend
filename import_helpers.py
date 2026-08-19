@@ -189,13 +189,32 @@ def normalize_parsed_rows(rows: list, fieldmap_rows: list) -> tuple[list, dict]:
 
         if withdrawal is None and deposits is None:
             skipped_no_amount += 1
-            continue
         if txn_date is None:
             skipped_no_date += 1
+
+        # A row missing an amount or a date is still staged. DPL's rule, from
+        # append_rows_to_master:
+        #
+        #     if any(v is not None for v in row_vals):
+        #
+        # keep the row when it carries any value at all, and let the person
+        # reviewing it decide. This used to `continue` on either condition,
+        # which is where "No usable transaction rows were found" came from: a
+        # fieldmap whose amount column was claimed by the wrong field left every
+        # row amountless, so every row was dropped and the import reported
+        # nothing usable — with no way to see the rows it had actually read.
+        #
+        # The counts above are kept as statistics. They are worth surfacing;
+        # they were never worth discarding data over.
+        if not any(v is not None for v in (txn_date, withdrawal, deposits,
+                                           raw.get(f_desc), raw.get(f_bal))) \
+                and not any(v not in (None, "") for v in (raw or {}).values()):
             continue
 
         amount = withdrawal if withdrawal is not None else deposits
-        credit_debit = "DR" if withdrawal is not None else "CR"
+        # No amount means no direction to report. Guessing "CR" here would post
+        # a blank line as a credit.
+        credit_debit = None if amount is None else ("DR" if withdrawal is not None else "CR")
 
         description = (raw.get(f_desc) or "").strip() or None
 

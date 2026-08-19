@@ -200,6 +200,47 @@ async def create_custom_field(conn, field_type: str, displayname: str = "",
     return {"column": col_name, "type": sql_type, "fieldmap": dict(row)}
 
 
+async def delete_field_by_id(conn, fieldmap_id: int) -> dict:
+    """Delete a fieldmap row by its id, dropping its column if it has one.
+
+    By id rather than by name because a fieldname is not guaranteed to be a
+    legal column name. A mapping created before that was enforced can be called
+    'Debit/Credit', and such a row cannot be deleted by name at all: the slash
+    is a path separator, so DELETE /custom-fields/Debit%2FCredit is decoded back
+    to two segments and matches no route — a 404 that reads as "no such field"
+    when the field is right there on the screen. Encoding it harder does not
+    help; the id sidesteps the question.
+
+    Those rows are also the ones most worth removing. A mapping with no column
+    behind it still competes for a statement's headers, and 'Debit/Credit'
+    outmatched the real amount column's 'Credit' alias, took the column and had
+    nowhere to put the value.
+    """
+    row = await conn.fetchrow(
+        "SELECT id, fieldname, mapfields FROM fieldmap WHERE id = $1", fieldmap_id
+    )
+    if row is None:
+        return {"found": False}
+
+    name = (row["fieldname"] or "").strip()
+    if SAFE_COLUMN_RE.match(name):
+        # An ordinary field. Go through the by-name path so the column and the
+        # mapping are removed by the same code that has always removed them.
+        return await delete_custom_field(conn, name)
+
+    # No column can carry this name — Postgres would have rejected it — so
+    # there is nothing to drop and the mapping goes on its own.
+    await conn.execute("DELETE FROM fieldmap WHERE id = $1", fieldmap_id)
+    logger.info("[custom_fields] deleted mapping %r (id=%s, no column possible)", name, fieldmap_id)
+    return {
+        "found": True,
+        "fieldname": name,
+        "column_dropped": False,
+        "mapping_removed": True,
+        "message": f"Mapping '{name}' deleted",
+    }
+
+
 async def delete_custom_field(conn, fieldname: str) -> dict:
     """Drop the column AND its fieldmap row.
 
