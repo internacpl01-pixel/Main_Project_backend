@@ -8,9 +8,20 @@ from __future__ import annotations
 import io
 import re
 import logging
+import threading
 import time
 
 logger = logging.getLogger(__name__)
+
+# An optional per-thread callback, invoked once per page as the parser walks the
+# document. Nothing here decides anything with it — it exists so a caller can
+# report how far along a long parse is, which is otherwise unknowable from
+# outside: a 65-page statement is one opaque function call for over two minutes.
+#
+# Thread-local because parsing runs in an executor and two uploads can be in
+# flight at once; a module-level callback would have them reporting into each
+# other's progress. A caller that sets nothing pays one attribute lookup a page.
+_progress = threading.local()
 
 try:
     from pypdf import PdfReader, PdfWriter
@@ -66,6 +77,36 @@ def decrypt_pdf(file_bytes: bytes, password: str) -> bytes:
         raise RuntimeError(f"Failed to decrypt PDF: {e}")
 
 
+def _iter_pages(pdf):
+    """Yield each page, releasing its parsed objects as soon as it is done with.
+
+    pdfplumber caches every char, line, rect and curve it parses onto the Page
+    object, and `pdf.pages` holds all of those Page objects for as long as the
+    document is open — so nothing is freed until the whole file has been walked
+    and peak memory grows with the page count. A long statement can exhaust a
+    small container before it finishes; the page count where that happens is
+    the only reason a file is "too big", and it is a much lower number than it
+    needs to be.
+
+    Flushing per page keeps the ceiling at roughly one page instead of the
+    whole document. Purely a memory measure: the same pages are visited in the
+    same order, and every extraction below reads its page before the flush, so
+    what the parser sees is unchanged.
+
+    A generator rather than a call at the end of each loop body because those
+    loops `continue` on pages they skip, and a page skipped is exactly the page
+    whose cache would otherwise never be released.
+    """
+    for page in pdf.pages:
+        try:
+            yield page
+        finally:
+            page.flush_cache()
+            report = getattr(_progress, "hook", None)
+            if report is not None:
+                report()
+
+
 def _extract_pages_text(file_bytes: bytes) -> list:
     """Extract text per page. Returns a list of page-text strings."""
     if not PDFPLUMBER_AVAILABLE:
@@ -73,7 +114,7 @@ def _extract_pages_text(file_bytes: bytes) -> list:
     pages_text = []
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for page in pdf.pages:
+            for page in _iter_pages(pdf):
                 txt = page.extract_text()
                 if txt:
                     pages_text.append(txt)
@@ -249,7 +290,7 @@ def _extract_tables_from_pdf(file_bytes: bytes, table_settings: dict = None) -> 
     tables = []
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for page in pdf.pages:
+            for page in _iter_pages(pdf):
                 page_tables = page.extract_tables(table_settings)
                 if page_tables:
                     tables.extend(page_tables)
@@ -377,7 +418,7 @@ def _extract_word_column_tables(file_bytes: bytes, alias_map: dict) -> list:
 
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for page in pdf.pages:
+            for page in _iter_pages(pdf):
                 words = page.extract_words() or []
                 if not words:
                     continue

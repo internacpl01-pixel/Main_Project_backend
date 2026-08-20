@@ -28,7 +28,7 @@ from import_helpers import compute_fill_rates, normalize_parsed_rows
 from parsers import (_assemble_rows, _build_alias_map, _detect_header_row,
                      _extract_document_level_fields)
 from services.fieldmap import get_field_mappings, live_col_types
-from services.staging import stage_batch
+from services.staging import assert_bank_exists, stage_batch
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +111,10 @@ async def process_tabular_import(
         )
     alias_map = _build_alias_map(fieldmap_rows)
     col_types = live_col_types(fieldmap_rows)
+
+    # Checked before the file is read, for the same reason as the PDF path.
+    if save:
+        await assert_bank_exists(schema, bank_id)
 
     reader, _ = READERS[kind]
     try:

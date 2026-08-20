@@ -26,5 +26,34 @@ JWT_SECRET = _require("JWT_SECRET")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))
 
+# --- Imports ---
+# How long one PDF may be parsed before the request gives up.
+#
+# Measured cost is seconds per page, and it varies with how the statement is
+# drawn: a 4-page AU statement parses in ~4s, a 65-page KVB one in ~145s,
+# because the latter carries about 1,200 ruled lines per page. So this cannot
+# be a number that assumes "a PDF is small".
+#
+# It is also the wrong lever on a host that imposes its OWN request deadline.
+# A platform that cuts the connection at, say, 100s means any value above that
+# can never be reported: the timeout fires into a socket nobody is holding, and
+# the user sees a dead connection instead of this module's explanation. Setting
+# it BELOW the platform's limit restores the explanation but refuses files that
+# would have parsed correctly given the time.
+#
+# Neither choice makes a 145s parse work over a 100s request budget — only
+# moving the parse off the request does. Until then this is deliberately
+# generous, and deployments behind a shorter deadline should lower it via the
+# environment so at least the failure is legible.
+PARSE_TIMEOUT_SECONDS = float(os.getenv("PARSE_TIMEOUT_SECONDS", "240"))
+
+# Refuse a PDF longer than this many pages before parsing it. 0 disables the
+# check, which is the default: page count alone does not make a file bad, and a
+# limit invented here would refuse statements that import perfectly well.
+# It exists for constrained hosts, where a file that cannot finish in the time
+# available is better refused in one second, by name, than after three minutes
+# of work nobody can deliver.
+MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "0"))
+
 # --- App ---
 APP_ENV = os.getenv("APP_ENV", "development")

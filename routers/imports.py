@@ -26,7 +26,8 @@ from fastapi import (APIRouter, Depends, File, Form, HTTPException, Query,
 import permissions
 from database import company_connection
 from routers.auth import get_company_user, get_current_schema, require_level
-from services.pdf_import import process_pdf_import
+from services import jobs
+from services.pdf_import import process_pdf_import, start_pdf_job
 from services.staging import DuplicateFileError
 from services.tabular_import import READERS, process_tabular_import
 
@@ -63,6 +64,19 @@ async def _read_upload(file: UploadFile, allowed: tuple[str, ...]) -> bytes:
     return file_bytes
 
 
+def _clean_bank_id(bank_id: int | None) -> int | None:
+    """Read 0 (and anything below it) as "no bank chosen".
+
+    bank_master ids come from a serial, so nothing at or under zero can ever
+    name a row — the only thing such a value can do is fail. Both callers
+    already mean "unset" by it: the React client skips a falsy id before it
+    builds the form, and Swagger's generated form posts 0 for an integer field
+    the user never touched, which made the optional bank field impossible to
+    omit from /docs.
+    """
+    return bank_id if bank_id and bank_id > 0 else None
+
+
 def _to_http(exc: Exception) -> HTTPException:
     """Map a service-layer failure onto a status code.
 
@@ -84,6 +98,11 @@ async def import_pdf(
     password: str = Form("", description="Password, if the PDF is protected"),
     save: bool = Form(False, description="false previews, true stages a batch"),
     bank_id: int = Form(None, description="bank_master.id this statement belongs to"),
+    pages: str = Form("", description='Pages to read: "30", "31-65", or blank for all'),
+    background: bool = Form(
+        False,
+        description="true returns a job id immediately; poll GET /imports/jobs/{id}",
+    ),
     user: dict = Depends(get_company_user),
 ):
     """
@@ -96,20 +115,36 @@ async def import_pdf(
 
     save=true stages the rows into temp_trans under a new batch. They are not
     in the ledger yet — classify and finalize move them there.
+
+    pages reads part of the file: "30" is the first thirty pages, "31-65" a
+    range. A range always carries page 1 with it, because that is where a bank
+    prints the column header and later pages carry none — the response says so
+    in `header_page_added`.
+
+    background=true answers straight away with a job id and does the work
+    behind it. That is the mode to use for anything long: a big statement
+    parses for minutes, which is longer than most hosts will hold a request
+    open, and it is the only way to show progress while it runs.
     """
     file_bytes = await _read_upload(file, (".pdf",))
-    logger.info("[Import] PDF %s save=%s schema=%s", file.filename, save, user["schema"])
+    logger.info("[Import] PDF %s save=%s pages=%r background=%s schema=%s",
+                file.filename, save, pages, background, user["schema"])
+
+    call = dict(
+        schema=user["schema"],
+        file_bytes=file_bytes,
+        filename=file.filename,
+        username=user["username"],
+        bank_id=_clean_bank_id(bank_id),
+        password=password,
+        save=save,
+        pages_spec=pages,
+    )
 
     try:
-        return await process_pdf_import(
-            schema=user["schema"],
-            file_bytes=file_bytes,
-            filename=file.filename,
-            username=user["username"],
-            bank_id=bank_id,
-            password=password,
-            save=save,
-        )
+        if background:
+            return await start_pdf_job(**call)
+        return await process_pdf_import(**call)
     except (DuplicateFileError, RuntimeError) as e:
         raise _to_http(e)
     except Exception as e:
@@ -117,6 +152,25 @@ async def import_pdf(
         raise HTTPException(
             status.HTTP_500_INTERNAL_SERVER_ERROR, f"Failed to parse PDF: {e}"
         )
+
+
+@router.get("/jobs/{job_id}")
+async def get_import_job(job_id: str, user: dict = Depends(get_company_user)):
+    """How far along a background import is, and its result once it is done.
+
+    Poll this after POST /imports/pdf with background=true. While it runs the
+    interesting fields are `percent` and `message`; on `state: "done"` the
+    `result` field holds exactly what a direct upload would have returned, and
+    on `state: "failed"` the `error` field holds the message it would have
+    raised.
+    """
+    job = jobs.get(job_id)
+    # A job belonging to another company reads as missing rather than
+    # forbidden — the same rule the rest of the app follows, so this cannot be
+    # used to find out which job ids exist elsewhere.
+    if job is None or job.pop("_schema", None) != user["schema"]:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Import job not found.")
+    return job
 
 
 async def _import_tabular(kind: str, file: UploadFile, save: bool, bank_id, user: dict):
@@ -132,7 +186,7 @@ async def _import_tabular(kind: str, file: UploadFile, save: bool, bank_id, user
             filename=file.filename,
             username=user["username"],
             kind=kind,
-            bank_id=bank_id,
+            bank_id=_clean_bank_id(bank_id),
             save=save,
         )
     except (DuplicateFileError, RuntimeError) as e:
