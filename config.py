@@ -41,11 +41,24 @@ JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))
 # it BELOW the platform's limit restores the explanation but refuses files that
 # would have parsed correctly given the time.
 #
-# Neither choice makes a 145s parse work over a 100s request budget — only
-# moving the parse off the request does. Until then this is deliberately
-# generous, and deployments behind a shorter deadline should lower it via the
-# environment so at least the failure is legible.
+# Imports now run as background jobs, so this no longer has to fit inside a
+# request at all — it is only here to stop a file that will never finish from
+# occupying a worker thread forever.
+#
+# It is a FLOOR, not the whole answer: see PARSE_SECONDS_PER_PAGE. A flat
+# deadline gives a 4-page statement and a 65-page one the same budget, which
+# means it is either too tight for the long file or pointlessly slack for the
+# short one. This is the short-file end of that.
 PARSE_TIMEOUT_SECONDS = float(os.getenv("PARSE_TIMEOUT_SECONDS", "240"))
+
+# The deadline grows by this much per page, and the larger of the two wins.
+#
+# Measured cost is about 2.2 s/page on a densely ruled statement, so 8 gives
+# roughly a 3.5x margin for a slower machine or a busy one — a 65-page file
+# gets ~520 s instead of a flat 240 s, while a 4-page file still fails fast.
+# Raise it if a legitimate statement is being cut off; the only thing a bigger
+# number costs is how long a hopeless parse is allowed to run.
+PARSE_SECONDS_PER_PAGE = float(os.getenv("PARSE_SECONDS_PER_PAGE", "8"))
 
 # Refuse a PDF longer than this many pages before parsing it. 0 disables the
 # check, which is the default: page count alone does not make a file bad, and a

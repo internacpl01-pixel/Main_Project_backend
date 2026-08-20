@@ -31,7 +31,24 @@ logger = logging.getLogger(__name__)
 # Both read from the environment — see config.py for why a fixed number is the
 # wrong answer for either of them.
 PARSE_TIMEOUT_SECONDS = config.PARSE_TIMEOUT_SECONDS
+PARSE_SECONDS_PER_PAGE = config.PARSE_SECONDS_PER_PAGE
 MAX_PDF_PAGES = config.MAX_PDF_PAGES
+
+
+def parse_deadline(pages: int | None) -> float:
+    """How long this particular file is allowed to take.
+
+    Scaled by page count because that is what the cost is made of — one flat
+    number has to be either too mean for a long statement or meaningless for a
+    short one, and picking the wrong end of that is what cut a 65-page file off
+    at 240s while it was parsing perfectly well.
+
+    Unknown page count (an encrypted file the slicer could not open) falls back
+    to the floor; the parser is about to report the real problem anyway.
+    """
+    if not pages:
+        return PARSE_TIMEOUT_SECONDS
+    return max(PARSE_TIMEOUT_SECONDS, pages * PARSE_SECONDS_PER_PAGE)
 
 # How many times the parser walks the document. It competes several extraction
 # strategies against each other and each one re-reads every page, so a page is
@@ -239,6 +256,7 @@ async def process_pdf_import(
             f"the same period — those parse in a fraction of the time."
         )
 
+    deadline = parse_deadline(pages)
     if job_id:
         jobs.set_state(job_id, jobs.PARSING,
                        f"Reading {pages or '?'} pages")
@@ -252,20 +270,20 @@ async def process_pdf_import(
                 None, _parse_with_progress, job_id, source_bytes, password,
                 fieldmap_rows, col_types
             ),
-            timeout=PARSE_TIMEOUT_SECONDS,
+            timeout=deadline,
         )
     except asyncio.TimeoutError:
-        logger.error("[PDF] parser timed out after %ss (pages=%s)",
-                     PARSE_TIMEOUT_SECONDS, pages)
+        logger.error("[PDF] parser timed out after %ss (pages=%s)", deadline, pages)
         # Naming the page count is the difference between "something went wrong"
         # and a number the user can act on — a scan and a very long statement
         # both time out, and they need opposite remedies.
         size = f"This statement has {pages} pages. " if pages else ""
         raise RuntimeError(
-            f"PDF parsing timed out after {PARSE_TIMEOUT_SECONDS:.0f}s. {size}"
-            "If it is a long statement, split it into shorter date ranges or "
-            "import the bank's Excel/CSV export instead. If it is a scan, it has "
-            "no text layer and cannot be read — ask the bank for the e-statement."
+            f"PDF parsing timed out after {deadline:.0f}s. {size}"
+            "Read part of it with the page selector — the first 30 pages, then "
+            "31 onwards — or import the bank's Excel/CSV export instead. If it "
+            "is a scan it has no text layer and cannot be read at all; ask the "
+            "bank for the e-statement."
         )
     t_parse = (time.perf_counter() - t0) * 1000
 
