@@ -34,7 +34,9 @@ require_manager = require_level(permissions.MANAGER)
 _MASTER_LOOKUPS = {
     "head_id": ("head_master", "head"),
     "rera_head_id": ("rera_head_master", "RERA head"),
-    "idw_head_id": ("idw_head_master", "IDW head"),
+    # The label is what an error message calls it; the table and the column keep
+    # their original names.
+    "idw_head_id": ("idw_head_master", "TCP head"),
     "beneficiary_id": ("beneficiary_master", "beneficiary"),
     "project_id": ("projects", "project"),
 }

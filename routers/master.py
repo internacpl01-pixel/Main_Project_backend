@@ -87,8 +87,12 @@ _TABLES = {
         'order_by': 'name',
         'label_field': 'name',
     },
+    # 'idw_head' / idw_head_master keep their original names. Only the label
+    # changed, and a rename of the key would have to reach the master_type in
+    # every URL, the column on two tables, and the fieldmap rows already
+    # pointing at them — a lot of moving parts to change a word on screen.
     'idw_head': {
-        'label': 'IDW Head',
+        'label': 'TCP Head',
         'table': 'idw_head_master',
         'fields': ['name'],
         'labels': {'name': 'Name'},

@@ -45,7 +45,9 @@ _MASTER_LABELS = [
     ("p.name", "project_name", "Project"),
     ("h.name", "head_name", "Head"),
     ("rh.name", "rera_head_name", "RERA Head"),
-    ("ih.name", "idw_head_name", "IDW Head"),
+    # Header only. The output name stays idw_head_name so an export already
+    # feeding somebody's spreadsheet keeps the column key it has always had.
+    ("ih.name", "idw_head_name", "TCP Head"),
     ("ben.name", "beneficiary_name", "Beneficiary"),
 ]
 
