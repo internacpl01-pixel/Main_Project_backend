@@ -27,7 +27,8 @@ import permissions
 from database import company_connection
 from routers.auth import get_company_user, get_current_schema, require_level
 from services import jobs
-from services.pdf_import import process_pdf_import, start_pdf_job
+from services.pdf_import import (PDF_BATCH_PAGES, process_pdf_import,
+                                 start_pdf_job)
 from services.staging import DuplicateFileError
 from services.tabular_import import READERS, process_tabular_import
 
@@ -99,6 +100,11 @@ async def import_pdf(
     save: bool = Form(False, description="false previews, true stages a batch"),
     bank_id: int = Form(None, description="bank_master.id this statement belongs to"),
     pages: str = Form("", description='Pages to read: "30", "31-65", or blank for all'),
+    batch_pages: int = Form(
+        None,
+        description="Read the file in stretches of this many pages (0 = one pass). "
+                    "Omit for the server default.",
+    ),
     background: bool = Form(
         False,
         description="true returns a job id immediately; poll GET /imports/jobs/{id}",
@@ -139,6 +145,8 @@ async def import_pdf(
         password=password,
         save=save,
         pages_spec=pages,
+        # None means "the server decides"; 0 is a real choice meaning one pass.
+        batch_pages=PDF_BATCH_PAGES if batch_pages is None else batch_pages,
     )
 
     try:
