@@ -85,6 +85,20 @@ def create(*, schema: str, username: str, filename: str, total_units: int,
             "units_done": 0,
             "total_units": max(1, total_units),
             "total_pages": total_pages,
+            # A batched import is several parses, not one long one, and a single
+            # bar crawling across all of them says less than a bar per batch: the
+            # user cannot tell a stretch that is nearly done from one that has
+            # barely started. So progress is reported per step and restarts at
+            # zero for each — see start_step. The whole-file figures above are
+            # kept alongside it for anyone who wants the total.
+            "step_done": 0,
+            "step_units": 1,
+            "step_index": 0,
+            "step_total": 1,
+            "step_label": "",
+            # One line per finished batch, so the screen can keep saying what is
+            # already done while the bar starts over on the next one.
+            "steps_done": [],
             "message": "Queued",
             "result": None,
             "error": None,
@@ -114,6 +128,46 @@ def set_state(job_id: str, state: str, message: str | None = None) -> None:
             job["message"] = message
 
 
+def start_step(job_id: str, *, index: int, total: int, label: str,
+               units: int, message: str) -> None:
+    """Begin one parse of a batched import, and reset the bar to zero.
+
+    index is 1-based over the batches; 0 marks the one-page probe that runs
+    first, which is work the user can see happening but is not a batch and must
+    not be numbered as one.
+    """
+    with _lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            return
+        job.update(state=PARSING, step_done=0, step_units=max(1, units),
+                   step_index=index, step_total=total, step_label=label,
+                   message=message)
+
+
+def complete_step(job_id: str, *, rows: int) -> None:
+    """One batch is finished. Records the line the screen keeps showing.
+
+    Only real batches are recorded — the probe is not one, and reporting it as
+    "batch 0" would make a four-batch import look like five.
+    """
+    with _lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            return
+        if job["step_index"] < 1:
+            return
+        job["steps_done"].append({
+            "index": job["step_index"],
+            "total": job["step_total"],
+            "label": job["step_label"],
+            "rows": rows,
+        })
+        # Held at full until the next step starts, so the bar reads 100% at the
+        # moment the batch completes instead of jumping straight back to zero.
+        job["step_done"] = job["step_units"]
+
+
 def tick(job_id: str) -> None:
     """One page finished. Called from the parsing thread, hundreds of times."""
     with _lock:
@@ -121,6 +175,7 @@ def tick(job_id: str) -> None:
         if job is None:
             return
         job["units_done"] += 1
+        job["step_done"] += 1
 
 
 def finish(job_id: str, result: dict) -> None:
@@ -129,7 +184,8 @@ def finish(job_id: str, result: dict) -> None:
         if job is None:
             return
         job.update(state=DONE, result=result, message="Finished",
-                   units_done=job["total_units"], finished_at=time.time(),
+                   units_done=job["total_units"],
+                   step_done=job["step_units"], finished_at=time.time(),
                    task=None)
 
 
@@ -154,17 +210,29 @@ def get(job_id: str) -> dict | None:
         if job is None:
             return None
         done, total = job["units_done"], job["total_units"]
+        step_done, step_units = job["step_done"], job["step_units"]
         if job["state"] == DONE:
-            percent = 100
+            percent = overall = 100
         else:
             # Capped below 100 while work is outstanding: the unit total is an
             # expectation, and a parse that reports more ticks than expected
-            # must not show a finished bar over an unfinished import.
-            percent = min(99, int(done * 100 / total)) if total else 0
+            # must not show a finished bar over an unfinished import. The one
+            # place 100 is allowed early is a step the parse has actually
+            # returned from, which complete_step sets deliberately.
+            cap = 100 if step_done >= step_units else 99
+            percent = min(cap, int(step_done * 100 / step_units))
+            overall = min(99, int(done * 100 / total)) if total else 0
         return {
             "job_id": job["id"],
             "state": job["state"],
+            # The bar: this batch's own progress, restarting at zero for each.
             "percent": percent,
+            # The whole file, for anyone who wants it — the UI shows the batch.
+            "overall_percent": overall,
+            "batch_index": job["step_index"],
+            "batch_total": job["step_total"],
+            "batch_label": job["step_label"],
+            "batches_done": list(job["steps_done"]),
             "pages_done": done,
             "total_units": total,
             "total_pages": job["total_pages"],

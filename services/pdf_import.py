@@ -371,6 +371,12 @@ async def process_pdf_import(
     cats = fields_by_category(fieldmap_rows)
     if batched:
         one_bytes, _ = slice_pdf(source_bytes, [1])
+        if job_id:
+            # Index 0: real work the user can watch, but not a batch. Numbering
+            # it as one would make a four-batch import report five.
+            jobs.start_step(job_id, index=0, total=len(batches),
+                            label="page 1", units=PARSER_PASSES,
+                            message="Reading page 1 for its column header")
         page_one = (await _parse(one_bytes, "page 1", 1)).get("rows", [])
         page_one_keys = {_row_key(r, cats) for r in page_one}
         page_one_count = len(page_one)
@@ -392,10 +398,13 @@ async def process_pdf_import(
             label = "the statement"
 
         if job_id:
-            jobs.set_state(
-                job_id, jobs.PARSING,
-                f"Reading {label}" + (f" ({i} of {len(batches)})" if batched else ""),
-            )
+            # Each batch owns the bar for its own duration and starts it at
+            # zero. How far through the file we are is still reported, but a
+            # figure that only moves a few percent per minute is not what tells
+            # someone their import is alive.
+            jobs.start_step(job_id, index=i, total=len(batches), label=label,
+                            units=len(in_batch) * PARSER_PASSES,
+                            message=f"Reading {label}")
 
         res = await _parse(doc, label, len(in_batch))
         rows = res.get("rows", [])
@@ -412,6 +421,10 @@ async def process_pdf_import(
                     label, before - len(rows), page_one_count,
                 )
         parsed_rows.extend(rows)
+        if job_id:
+            # Counted after page 1's rows have come off, so the number shown is
+            # what this batch actually contributed to the import.
+            jobs.complete_step(job_id, rows=len(rows))
 
         # The first batch describes the document: it is the one that saw the
         # header block, and its column mapping is the one the rest inherit.
