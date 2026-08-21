@@ -46,6 +46,81 @@ _MASTER_LOOKUPS = {
 MAX_PAGE_SIZE = 500
 
 
+# Enough words for any real query, and a bound on how much work one search box
+# can ask a sequential scan to do.
+MAX_SEARCH_TERMS = 8
+
+
+def _search_terms(term: str) -> list[str]:
+    """Split what was typed into the words every row has to match.
+
+    A search box people type two words into is expected to find rows carrying
+    both, wherever each one sits — "salary 5000" means the salary row for 5000,
+    not a narration containing the literal string "salary 5000". So whitespace
+    separates words and they are AND-ed.
+
+    That would take phrase search away, so a quoted run is kept whole:
+    "cash deposit" stays one term and matches only where those two words appear
+    together.
+    """
+    out: list[str] = []
+    buf: list[str] = []
+    quote = ""
+    for ch in term:
+        if quote:
+            if ch == quote:
+                quote = ""
+            else:
+                buf.append(ch)
+        elif ch in "\"'":
+            quote = ch
+        elif ch.isspace():
+            if buf:
+                out.append("".join(buf))
+                buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        out.append("".join(buf))
+    return out[:MAX_SEARCH_TERMS]
+
+
+def _like_patterns(token: str) -> list[str]:
+    """The ILIKE patterns one term should be tried against.
+
+    Wildcards are escaped: a term containing % or _ searches for that character
+    instead of silently matching everything, which is what "50%" used to do.
+
+    A term with digit grouping gets a second pattern with the grouping removed.
+    The table prints 1,50,000.00 and the column holds 150000.00, so a number
+    copied off the screen finds nothing otherwise — the one place where what is
+    searched is not what is displayed. Only added when the term actually has
+    separators, so an ordinary word still costs one comparison.
+    """
+    esc = token.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+    patterns = [f"%{esc}%"]
+    bare = esc.replace(",", "")
+    if bare and bare != esc:
+        patterns.append(f"%{bare}%")
+    return patterns
+
+
+def highlight_terms(term: str) -> list[str]:
+    """The strings the browser should mark up, in the same order it should try.
+
+    Returned to the client rather than re-derived there: what matched is decided
+    here, and a second implementation in JavaScript would drift from it the
+    first time either side changed.
+    """
+    out: list[str] = []
+    for token in _search_terms(term):
+        out.append(token)
+        bare = token.replace(",", "")
+        if bare and bare != token:
+            out.append(bare)
+    return out
+
+
 def _search_filter(term: str, columns: list[dict], extra_exprs: tuple[str, ...],
                    idx: int) -> tuple[str, list, int]:
     """A WHERE fragment matching *term* against everything visible on the row.
@@ -53,7 +128,8 @@ def _search_filter(term: str, columns: list[dict], extra_exprs: tuple[str, ...],
     Every data column plus the joined master names, so what the search matches
     is what the table draws — searching for "SALARY" or a UTR finds the row
     whether that text sits in the narration or in the beneficiary it was filed
-    against.
+    against. It is matched against the whole table, not the page on screen: the
+    browser holds fifty rows and the answer is usually not among them.
 
     Non-text columns are cast rather than skipped, which is what makes a date
     findable as "2026-08" and an amount as "1500". DPL restricted its search to
@@ -61,18 +137,33 @@ def _search_filter(term: str, columns: list[dict], extra_exprs: tuple[str, ...],
     the right call for a lookup-by-id box and the wrong one here, where the
     question is "where did this money go", not "show me row 345".
 
-    One bind parameter reused across every column, so the term is never
-    interpolated. Column names come from data_columns(), which reads the
-    catalog — they are never user input.
+    The columns are concatenated once per row and each term tested against that
+    one string, rather than each term against each column. Same rows come back,
+    a dozen fewer comparisons per row per term, and the SQL stays readable as
+    the column set grows.
+
+    Terms are bind parameters, never interpolated. Column names come from
+    data_columns(), which reads the catalog — they are never user input.
 
     A leading-wildcard ILIKE cannot use an index; this is a sequential scan by
     construction. Fine at statement scale, and the reason limit is capped.
     """
     targets = [f"t.{c['name']}::text" for c in columns] + list(extra_exprs)
-    if not targets:
+    tokens = _search_terms(term)
+    if not targets or not tokens:
         return "", [], idx
-    ors = " OR ".join(f"{t} ILIKE ${idx}" for t in targets)
-    return f"({ors})", [f"%{term}%"], idx + 1
+
+    row_text = "concat_ws(' ', " + ", ".join(targets) + ")"
+    clauses: list[str] = []
+    params: list = []
+    for token in tokens:
+        ors = []
+        for pattern in _like_patterns(token):
+            ors.append(f"{row_text} ILIKE ${idx}")
+            params.append(pattern)
+            idx += 1
+        clauses.append("(" + " OR ".join(ors) + ")")
+    return "(" + " AND ".join(clauses) + ")", params, idx
 
 
 async def _assert_live_master_ids(conn, values: dict) -> None:
@@ -107,7 +198,12 @@ async def list_transactions(
     head_id: int = None,
     date_from: str = None,
     date_to: str = None,
-    search: str = Query("", description="Match any column or master name"),
+    search: str = Query(
+        "",
+        description='Free text over every column and master name, across the '
+                    'whole table. Words are AND-ed; "quote a phrase" to keep '
+                    'it together.',
+    ),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     user: dict = Depends(get_company_user),
@@ -292,7 +388,12 @@ async def transaction_summary(
 async def list_temp_trans(
     batch_id: int = None,
     classified: bool = None,
-    search: str = Query("", description="Match any column or master name"),
+    search: str = Query(
+        "",
+        description='Free text over every column and master name, across the '
+                    'whole table. Words are AND-ed; "quote a phrase" to keep '
+                    'it together.',
+    ),
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     user: dict = Depends(get_company_user),
@@ -308,7 +409,11 @@ async def list_temp_trans(
     Params:
       batch_id    — filter by import batch (which PDF upload)
       classified  — true = only classified rows, false = only unclassified
-      search      — free text, matched against every column on the row
+      search      — free text over every column and every joined master name,
+                    matched against the whole table rather than the page being
+                    shown. Words are AND-ed and a quoted run stays a phrase;
+                    `search_terms` comes back so the browser marks up exactly
+                    what was matched.
       page, limit — pagination; `total` is the count matching the filters
 
     `total` is the filtered count and `summary` is deliberately not: the Clear
@@ -410,6 +515,10 @@ async def list_temp_trans(
         "columns": columns,
         "rows": [dict(r) for r in rows],
         "summary": summary,
+        # What the browser should mark up in the cells it draws. Sent rather
+        # than left for the client to work out, so highlighting and matching can
+        # never disagree about what the query meant.
+        "search_terms": highlight_terms(term),
         "total": total,
         "page": page,
         "limit": limit,
