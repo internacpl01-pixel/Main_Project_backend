@@ -1,9 +1,9 @@
 """
 Authentication routes.
 
-POST /auth/login       —  form-based login → JWT token
-POST /auth/switch-company — super-admin switches to a company
-GET  /auth/me           —  validates the current JWT
+POST /auth/login           —  form-based login → JWT token
+POST /auth/change-password —  the signed-in account changes its own password
+GET  /auth/me              —  validates the current JWT
 
 Also home to the dependencies every other router leans on:
 get_current_user, get_current_schema, get_current_company_id and require_level.
@@ -12,13 +12,14 @@ compare against is defined once in permissions.py.
 """
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 
 import config
 import permissions
 from database import company_connection
+from services import accounts
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -211,9 +212,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
         )
 
     # Verify the password against the bcrypt hash in the database.
-    import bcrypt as _bcrypt
-
-    if not _bcrypt.checkpw(password.encode("utf-8"), row["password_hash"].encode("utf-8")):
+    if not accounts.verify_password(password, row["password_hash"]):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Wrong username or password.",
@@ -296,6 +295,74 @@ async def me(user: dict = Depends(get_current_user)):
 # token the dependencies then refuse to honour — a door to a room with no floor.
 # A super admin who needs work done inside a company creates that company's
 # admin from the Companies page.
+
+
+@router.post("/change-password")
+async def change_password(
+    current_password: str = Body(..., embed=True),
+    new_password: str = Body(..., embed=True),
+    user: dict = Depends(get_current_user),
+):
+    """
+    Change the signed-in account's own password.
+
+    Depends on get_current_user, not get_company_user: a super admin belongs to
+    no company and this is the only route they have to their own row. The Users
+    page edits accounts by company_id and admin.users holds theirs with
+    company_id NULL, so nothing there can ever find it.
+
+    Self-service for everyone, not a super-admin special case. The account being
+    changed is the one in the token, so there is no id to pass and no way to
+    aim this at somebody else — which is also why it does not need a permission
+    level. A staff member changing their own password is not an escalation.
+
+    The current password is required. A signed-in session is not proof of
+    identity on its own: a machine left open, or a token lifted from one, would
+    otherwise be enough to lock the real owner out of their own account.
+    """
+    async with company_connection("admin") as conn:
+        row = await conn.fetchrow(
+            "SELECT id, password_hash FROM admin.users WHERE id = $1 AND is_active = true",
+            user["id"],
+        )
+
+        if row is None:
+            # The token is valid but the account behind it is gone or disabled.
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="This account is no longer active. Sign in again.",
+            )
+
+        if not accounts.verify_password(current_password, row["password_hash"]):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Current password is wrong.",
+            )
+
+        if current_password == new_password:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The new password is the same as the current one.",
+            )
+
+        try:
+            # Same rule as creating an account, from the same function — a
+            # password floor that only applies on the way in is not a floor.
+            changed = await accounts.set_own_password(conn, user["id"], new_password)
+        except accounts.AccountError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+            )
+
+    return {
+        "status": "changed",
+        "username": changed,
+        # Tokens are stateless and there is no blacklist — see logout below — so
+        # anything already issued keeps working until it expires. Said plainly
+        # rather than left implied, because "I changed my password" usually
+        # means "and the other session is locked out now", and it is not.
+        "other_sessions_valid_until_expiry": True,
+    }
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)

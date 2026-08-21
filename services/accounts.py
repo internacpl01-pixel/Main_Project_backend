@@ -26,6 +26,20 @@ def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
 
 
+def verify_password(password: str, password_hash: str) -> bool:
+    """Does this password match the stored hash?
+
+    bcrypt refuses a password over 72 bytes rather than truncating it, and a
+    stored hash can be malformed if it was ever written by hand — both raise,
+    and neither is a reason to return a 500 to someone typing in a login box.
+    Either way the answer to "is this the right password" is no.
+    """
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+    except (ValueError, TypeError):
+        return False
+
+
 def validate_username(username: str) -> str:
     username = (username or "").strip()
     if not username:
@@ -200,6 +214,32 @@ async def update_account(
         *params,
     )
     return dict(row) if row else None
+
+
+async def set_own_password(conn, user_id: int, password: str) -> str | None:
+    """Replace one account's password, keyed by id alone. Returns the username.
+
+    Every other write in this module takes a company_id, because admin.users is
+    one cross-company table and a missing scope is the difference between
+    editing your own staff and editing someone else's. This one does not, and
+    deliberately: it is only ever called with the id out of the caller's own
+    token, so the identity IS the scope, and there is nothing wider to leak into.
+
+    It also has to be that way for a super admin. Their row has company_id NULL,
+    so `AND company_id = $n` can never match it — update_account would report
+    "no such account" for the one account that is definitely signed in.
+    """
+    password = validate_password(password)
+    return await conn.fetchval(
+        """
+        UPDATE admin.users
+        SET password_hash = $1
+        WHERE id = $2 AND is_active = true
+        RETURNING username
+        """,
+        hash_password(password),
+        user_id,
+    )
 
 
 async def set_account_role(conn, user_id: int, company_id: int, role: str) -> dict | None:
