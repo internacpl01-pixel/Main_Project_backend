@@ -37,14 +37,31 @@ _TABLES = {
         'order_by': 'bank_name',
         'label_field': 'bank_name',
     },
+    # head1/2/3 are free text, not references to the three head tables they are
+    # named after — see company/009_beneficiary_fields.sql. They record how this
+    # payee is usually booked; the ledger's own classification still comes from
+    # head_master / rera_head_master / idw_head_master and is unaffected.
     'beneficiary': {
         'label': 'Beneficiary',
         'table': 'beneficiary_master',
-        'fields': ['name', 'category', 'pan', 'gstin'],
-        'labels': {'name': 'Name', 'category': 'Category', 'pan': 'PAN', 'gstin': 'GSTIN'},
+        'fields': ['name', 'account_number', 'ifsc_code', 'bank_name',
+                   'head1', 'head2', 'head3'],
+        'labels': {
+            'name': 'Name',
+            'account_number': 'Account Number',
+            'ifsc_code': 'IFSC Code',
+            'bank_name': 'Bank Name',
+            'head1': 'Head 1',
+            'head2': 'Head 2',
+            'head3': 'Head 3',
+        },
+        # Nothing unique: the same account can legitimately be recorded twice,
+        # and the name never was unique either.
         'unique': [],
         'required': ['name'],
-        'columns': ['id', 'name', 'category', 'pan', 'gstin', 'is_active', 'created_at', 'updated_at'],
+        'columns': ['id', 'name', 'account_number', 'ifsc_code', 'bank_name',
+                    'head1', 'head2', 'head3',
+                    'is_active', 'created_at', 'updated_at'],
         'order_by': 'name',
         'label_field': 'name',
     },
