@@ -834,6 +834,127 @@ def _score_balance_chain(rows: list, alias_map: dict) -> tuple:
     return chain_len, complete_rows
 
 
+def _graft_missing_columns(winner_rows: list, winner_headers: dict,
+                           candidates: list, best_label: str,
+                           alias_map: dict) -> None:
+    """
+    Copy whole columns the winning strategy never mapped from a losing one.
+
+    The strategies are scored on the balance chain — the money columns — and
+    the chain says nothing about the rest of a row. A candidate can win with
+    perfect money and still be missing a column another strategy read cleanly:
+    measured on a real 65-page statement, "words" beat "lines" by 7 chain
+    links and arrived without the Branch and Cheque No columns that "lines"
+    was carrying on every row. Re-scoring would be the wrong fix — trading
+    verified money for a text column is never a good exchange — so the winner
+    keeps its rows and merely inherits the columns it never saw.
+
+    A value moves only when everything about it is conservative:
+
+      * the column: alias-matched by the donor (it is in the donor's
+        headers_detected), absent from the winner's, and not one of the four
+        identity roles below — grafting a column the identity depends on
+        would be circular;
+      * the row: matched by transaction identity — date, withdrawal,
+        deposits, balance, resolved through the fieldmap like every other
+        role — normalized so '1,234.00' meets '1234.00'; a key that repeats
+        on either side is never used;
+      * the cell: only written where the winner holds nothing.
+
+    Values are copied verbatim. The key normalizes its own components to
+    line rows up across strategies, but what lands in the row is the donor's
+    raw cell — a branch code like '0042' stays '0042' and is typed later by
+    the live column type, exactly like a cell the winner read itself.
+
+    Mutates winner_rows and winner_headers in place; a grafted column is
+    recorded in headers_detected so the result reports where it came from.
+    """
+    role_of = _category_map_from_aliases(alias_map)
+    key_field = {}
+    role_fields = set()
+    for fn, cat in role_of.items():
+        if cat in ("date", "withdrawal", "deposits", "balance"):
+            role_fields.add(fn)
+            key_field.setdefault(cat, fn)
+    if "balance" not in key_field:
+        return  # no balance role mapped — row identity would be guesswork
+
+    def _amt(raw) -> object:
+        # '1,234.00', '1234.0' and '1234.00' are the same amount; parse when
+        # possible so formatting differences between strategies cannot split
+        # a key, fall back to the cleaned string when it is not a number.
+        cleaned = _clean_amount(str(raw)) if raw is not None else ""
+        try:
+            return round(float(cleaned), 2) if cleaned else ""
+        except (ValueError, TypeError):
+            return cleaned
+
+    def _key(row) -> tuple | None:
+        bal = _get_balance_val(row, key_field["balance"])
+        if bal is None:
+            return None  # unkeyable — identity rests on the balance
+        return (
+            _parse_date(str(row.get(key_field.get("date"), "") or "")),
+            _amt(row.get(key_field.get("withdrawal"), "")),
+            _amt(row.get(key_field.get("deposits"), "")),
+            round(bal, 2),
+        )
+
+    def _index(rows) -> dict:
+        seen, dropped = {}, set()
+        for r in rows:
+            k = _key(r)
+            if k is None:
+                continue
+            if k in seen:
+                dropped.add(k)
+            else:
+                seen[k] = r
+        for k in dropped:
+            del seen[k]  # ambiguous identity — never guess between twins
+        return seen
+
+    winner_by_key = _index(winner_rows)
+
+    for label, (donor_rows, donor_headers, _unmapped) in candidates:
+        if label == best_label:
+            continue
+        # Columns this donor alias-matched that the winner has no idea exist.
+        # Checked against winner_headers as it grows, so once a column is
+        # grafted the first donor to carry it owns it — deterministic by the
+        # same candidate order the selection itself uses.
+        extra = [fn for fn in donor_headers
+                 if fn not in winner_headers and fn not in role_fields]
+        if not extra:
+            continue
+
+        donor_by_key = _index(donor_rows)
+        grafted_fields, grafted_rows = set(), 0
+        for k, wrow in winner_by_key.items():
+            drow = donor_by_key.get(k)
+            if drow is None:
+                continue
+            hit = False
+            for fn in extra:
+                val = drow.get(fn)
+                if val is None or not str(val).strip():
+                    continue
+                if not wrow.get(fn):
+                    wrow[fn] = val
+                    grafted_fields.add(fn)
+                    hit = True
+            if hit:
+                grafted_rows += 1
+
+        if grafted_rows:
+            for fn in grafted_fields:
+                winner_headers.setdefault(fn, donor_headers.get(fn, fn))
+            logger.info(
+                f"[Parser] grafted {sorted(grafted_fields)} from "
+                f"strategy={label} onto {grafted_rows}/{len(winner_rows)} rows"
+            )
+
+
 def _assemble_rows(table_rows: list, header_idx: int, col_mapping: dict,
                     live_col_types: dict = None, current_row=None,
                     cat_by_field: dict = None) -> tuple:
@@ -1350,7 +1471,10 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
     # separators aren't detectable (rows merge or cells vanish), text-lines
     # can lose header/amount cells, word-columns handles those but depends on
     # a matchable header line. Comparing assembled output is layout-agnostic.
-    # Best = most rows, then most populated cells (catches dropped columns).
+    # Best = longest balance chain, then most complete rows, then most rows
+    # (_cand_score below). The chain audits only the money, so columns that
+    # only a losing strategy managed to read are grafted onto the winner
+    # afterwards — see _graft_missing_columns.
     candidates = []
     # Tie-break order: "lines" first (pdfplumber's ruled cells group wrapped
     # description fragments perfectly), then "words" (geometric grouping —
@@ -1393,6 +1517,15 @@ def parse_pdf(file_bytes: bytes, password: str = "", fieldmap_rows: list = None,
     if len(repaired) != len(rows) and _score_balance_chain(repaired, alias_map) >= _score_balance_chain(rows, alias_map):
         logger.info(f"[Parser] repair: merged {len(rows) - len(repaired)} over-split rows ({len(rows)} → {len(repaired)})")
         rows = repaired
+
+    # A winner chosen on the balance chain can still be missing whole columns
+    # a losing strategy read cleanly — the chain never looks past the money.
+    # Inherit those columns row-by-row before anything downstream sees the
+    # rows; the doc-field pass later only fills what is still empty, so a
+    # grafted cell also stops a page-header value being stamped over it.
+    if candidates and rows:
+        _graft_missing_columns(rows, headers_detected, candidates, best_label,
+                               alias_map)
 
     t2 = time.perf_counter()
 

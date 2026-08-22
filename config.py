@@ -63,22 +63,18 @@ PARSE_SECONDS_PER_PAGE = float(os.getenv("PARSE_SECONDS_PER_PAGE", "8"))
 # Read a PDF in stretches of this many pages, stitching the rows back into one
 # import. 0 reads the whole file in one parse.
 #
-# This is an accuracy setting, not a performance one — it costs about 10% extra
-# because page 1 is re-read for its header with every stretch.
+# It costs about 10% extra, because page 1 is re-read for its header with
+# every stretch. What it buys today is memory and feedback: only one stretch
+# of pages is open at a time, so peak RSS is set by the batch rather than the
+# file — which matters on a 512 MB host — and the progress bar restarts per
+# batch instead of crawling once across the whole document.
 #
-# The parser competes extraction strategies over the WHOLE document and keeps
-# one winner. So a stretch of pages that the winning strategy handles badly does
-# not spoil only those pages: it decides the strategy for everything. Measured on
-# a 65-page KVB statement, pages 41-60 defeat column detection, and read in one
-# pass that cost the Branch and Cheque No columns on all 928 rows — the empty
-# Branch then back-filled from the page-1 header, so every row claimed the
-# account's home branch instead of the code printed against it.
-#
-# Reading in stretches confines that to the stretch containing those pages: 630
-# of 928 rows keep their real branch code instead of none of them. It contains
-# the damage rather than curing it — the underlying strategy choice is still
-# wrong for those pages, and a smaller batch size does not help, because the
-# problem is those particular pages and not the length of the document.
+# Historical note: this began as an ACCURACY setting. The parser competes
+# extraction strategies over the whole document and keeps one winner, and on
+# a 65-page KVB statement the winner arrived without the Branch and Cheque No
+# columns — batching contained that damage to one stretch. The real cure is
+# parsers._graft_missing_columns, which hands the winner the columns a losing
+# strategy read cleanly, so accuracy no longer depends on this being on.
 PDF_BATCH_PAGES = int(os.getenv("PDF_BATCH_PAGES", "20"))
 
 # Refuse a PDF longer than this many pages before parsing it. 0 disables the

@@ -174,22 +174,17 @@ def plan_batches(pages: list[int], batch_size: int) -> list[list[int]]:
     """Split the pages to read into batches, each carrying page 1 for its header.
 
     Batching is not a speed measure — it re-reads page 1 once per batch, so it
-    is slightly MORE work than one pass. It is an accuracy measure, and what it
-    buys is containment.
+    is slightly MORE work than one pass. What it buys is memory and feedback:
+    one stretch of pages open at a time caps peak RSS at the batch rather than
+    the file, and the progress bar gets a fresh run per batch instead of one
+    crawl across the whole document.
 
-    The parser competes its extraction strategies across the whole document and
-    keeps a single winner, so a run of pages the winner handles badly sets the
-    strategy for every other page too. On a 65-page KVB statement pages 41-60 do
-    exactly that: read in one pass, the Branch and Cheque No columns are lost on
-    all 928 rows, and the empty Branch is then back-filled from the page-1 header
-    so every row claims the account's home branch rather than its own code.
-
-    Batched, only the stretch holding those pages is affected — 630 of 928 rows
-    keep the branch actually printed against them instead of none of them.
-
-    Two things this is NOT: a cure (the strategy choice is still wrong for those
-    pages), and length-sensitive (batches of 10 fail on the same pages as batches
-    of 20 — it is those pages, not the size of the document).
+    It began as an accuracy measure — the parser keeps one winning strategy
+    per document, and a winner that arrived without a column used to cost that
+    column on every page; batching confined the loss to one stretch. That job
+    now belongs to parsers._graft_missing_columns, which gives the winner the
+    columns a losing strategy read cleanly, so accuracy holds with or without
+    batching.
 
     A caveat worth knowing: a transaction whose text wraps across a batch
     boundary is assembled from one side of the split only. On the statement this
