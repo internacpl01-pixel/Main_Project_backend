@@ -20,10 +20,42 @@ from datetime import date as _date
 from decimal import Decimal, InvalidOperation
 
 from parsers import (_build_alias_map, _category_map_from_aliases,
-                     _category_of)
+                     _category_of, _normalize_for_matching)
 from services.custom_fields import table_structure
 
 logger = logging.getLogger(__name__)
+
+
+# Some banks print one Amount column and a DR/CR marker instead of separate
+# Debit and Credit columns (Axis does). These two vocabularies recognise that
+# pair from the fieldmap — by displayname or alias, normalized exactly the way
+# alias matching normalizes, so 'Amount(INR)' and 'amount inr' both land.
+#
+# They live HERE and not in parsers._CATEGORY_VOCABULARY on purpose. That
+# vocabulary decides semantic roles inside the parser (chain scoring, doc-field
+# gating) and is byte-shared with DPL; these two categories exist only for this
+# module's split below, and matching them here — and only for fieldmap rows the
+# parser left uncategorised — means no existing column can lose its real role
+# to them.
+_AMOUNT_TERMS = {"amount", "amountinr", "amount inr", "transaction amount",
+                 "txn amount", "amt"}
+_DRCR_TERMS = {"drcr", "dr cr", "debitcredit", "debit credit",
+               "crdr", "cr dr", "creditdebit", "credit debit"}
+
+
+def _marker_direction(val) -> str | None:
+    """'DR'/'CR' from a direction-marker cell, or None when it says neither.
+
+    Letters only, so 'Dr.', ' CR ' and 'debit' all resolve; anything else —
+    blank, a number, some third word — is None and the row is left exactly as
+    the two-column path would have left it.
+    """
+    letters = re.sub(r"[^A-Za-z]", "", str(val or "")).upper()
+    if letters in ("DR", "D", "DEBIT", "WITHDRAWAL"):
+        return "DR"
+    if letters in ("CR", "C", "CREDIT", "DEPOSIT"):
+        return "CR"
+    return None
 
 
 def fields_by_category(fieldmap_rows: list) -> dict:
@@ -53,6 +85,22 @@ def fields_by_category(fieldmap_rows: list) -> dict:
         # later that happens to carry an overlapping alias.
         if cat and cat not in by_cat:
             by_cat[cat] = fieldname
+
+    # Second pass, only over rows the parser's own vocabulary left without a
+    # role: a single-Amount column and a DR/CR marker column, recognised so
+    # normalize_parsed_rows can split them into withdrawal/deposits. Scoped to
+    # uncategorised rows so no column can ever lose its real role to this.
+    for row in (fieldmap_rows or []):
+        fieldname = row.get("fieldname") or ""
+        if not fieldname or _category_of(fieldname, cat_by_field):
+            continue
+        terms = {_normalize_for_matching(row.get("displayname") or "")}
+        terms.update(_normalize_for_matching(a)
+                     for a in (row.get("mapfields") or "").split(","))
+        if "amount" not in by_cat and terms & _AMOUNT_TERMS:
+            by_cat["amount"] = fieldname
+        elif "drcr" not in by_cat and terms & _DRCR_TERMS:
+            by_cat["drcr"] = fieldname
     return by_cat
 
 
@@ -163,16 +211,44 @@ def normalize_parsed_rows(rows: list, fieldmap_rows: list) -> tuple[list, dict]:
     f_out = by_cat.get("withdrawal", "withdrawal")
     f_in = by_cat.get("deposits", "deposits")
     f_bal = by_cat.get("balance", "balance")
+    # Set only when the fieldmap maps a single-Amount column and a DR/CR
+    # marker column — the statement shape where debit and credit share one
+    # printed column and a flag says which one each row is.
+    f_amt = by_cat.get("amount")
+    f_dir = by_cat.get("drcr")
 
     normalized = []
     skipped_no_amount = 0
     skipped_no_date = 0
     ambiguous = 0
+    split_rows = 0
 
     for raw in rows:
         txn_date = _parse_date_to_date(raw.get(f_date))
         withdrawal = _to_amount(raw.get(f_out))
         deposits = _to_amount(raw.get(f_in))
+
+        # The single-amount split. Fires per row, and only as a fallback: a
+        # row that already carries a value in a real debit or credit column is
+        # left entirely alone, so statements with two amount columns cannot be
+        # touched by this even in a fieldmap that also maps Amount and DR/CR.
+        if withdrawal is None and deposits is None and f_amt and f_dir:
+            amt = _to_amount(raw.get(f_amt))
+            direction = _marker_direction(raw.get(f_dir))
+            if amt is not None and amt != 0 and direction:
+                if direction == "DR":
+                    withdrawal = amt
+                else:
+                    deposits = amt
+                # Mirror the value under the mapped debit/credit fieldname so
+                # the staging table's own columns fill, exactly as if the bank
+                # had printed two columns. Written next to the original
+                # Amount and marker values, never over anything — raw_data
+                # keeps all of them.
+                target = f_out if direction == "DR" else f_in
+                if target not in raw or raw.get(target) in (None, ""):
+                    raw[target] = raw.get(f_amt)
+                split_rows += 1
 
         # Zero is not an amount -- statements print 0.00 in the unused column.
         if withdrawal is not None and withdrawal == 0:
@@ -236,6 +312,9 @@ def normalize_parsed_rows(rows: list, fieldmap_rows: list) -> tuple[list, dict]:
         "skipped_no_amount": skipped_no_amount,
         "skipped_no_date": skipped_no_date,
         "ambiguous_both_columns": ambiguous,
+        # Rows whose amount arrived as one column plus a DR/CR marker and was
+        # routed into debit or credit accordingly. Zero on two-column banks.
+        "amount_split_by_drcr": split_rows,
         # Which fieldmap row filled each role for this import. Without it, a
         # miscategorised column looks identical to a bank that omitted it.
         "resolved_fields": {
