@@ -65,8 +65,11 @@ _TABLES = {
         'order_by': 'name',
         'label_field': 'name',
     },
+    # Same treatment as 'idw_head' below: the label is the only thing that
+    # changed. The key stays 'head' and the table stays head_master, so every
+    # URL, fieldmap row and head_id column already recorded keeps working.
     'head': {
-        'label': 'Head',
+        'label': 'Internal Head',
         'table': 'head_master',
         'fields': ['name', 'category'],
         'labels': {'name': 'Name', 'category': 'Category'},
