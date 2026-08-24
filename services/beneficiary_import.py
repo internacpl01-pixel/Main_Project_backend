@@ -134,6 +134,98 @@ def find_header(grid: list[list[str]]) -> tuple[int, dict[int, str], list[str]]:
     return index, mapping, unmapped
 
 
+def _flatten_tables(tables) -> list[list[str]]:
+    """Turn pdfplumber's list-of-tables into one grid of trimmed strings."""
+    grid: list[list[str]] = []
+    for table in tables or []:
+        for row in table or []:
+            cells = ["" if c is None else str(c).strip() for c in row]
+            if any(cells):
+                grid.append(cells)
+    return grid
+
+
+def read_pdf_grid(file_bytes: bytes) -> list[list[str]]:
+    """Read a beneficiary list out of a PDF, by competing three readings of it.
+
+    The same three strategies the statement parser uses -- ruled lines, word
+    positions, text lines -- because a PDF stores characters at coordinates and
+    which one recovers the table depends on how the document was drawn.
+
+    What differs is how the winner is picked. The statement parser scores on the
+    running balance adding up, which is the strongest check available there and
+    is unavailable here: a beneficiary list has no arithmetic in it. So this
+    scores on what it does know -- how many of ITS columns the reading's header
+    row accounts for, then how many rows carry a name.
+
+    That is a weaker check than a balance chain, and it is the reason a PDF is
+    the last resort for this import rather than the expected input: a column
+    read into the wrong place produces a wrong IFSC on a payee, and unlike a
+    statement there is no later arithmetic that would expose it. The preview
+    exists to be read carefully when the source was a PDF.
+    """
+    # Imported here rather than at module scope: this is the only path that
+    # needs pdfplumber, and the rest of this module is deliberately import-free.
+    from parsers import (_extract_tables_from_pdf, _extract_word_column_tables,
+                         _normalize_for_matching, check_pdf_protected)
+
+    if check_pdf_protected(file_bytes):
+        raise RuntimeError(
+            "This PDF is password-protected. Unlock it and upload it again, or "
+            "export the list as Excel or CSV."
+        )
+
+    # The word-position strategy locates the header by matching phrases against
+    # aliases, and it normalises them its own way — 'A/C No.' folds to 'ac no'
+    # there and 'a c no' here. Built with its function so the lookup matches;
+    # the mapping that actually decides columns is still find_header below, on
+    # the text it returns.
+    alias_map = {
+        _normalize_for_matching(alias): column
+        for column, aliases in _ALIASES.items()
+        for alias in aliases
+    }
+
+    candidates: list[tuple[str, list[list[str]]]] = []
+    for label, tables in (
+        ("lines", _extract_tables_from_pdf(file_bytes, None)),
+        ("words", _extract_word_column_tables(file_bytes, alias_map)),
+        ("text", _extract_tables_from_pdf(file_bytes, {"horizontal_strategy": "text"})),
+    ):
+        grid = _flatten_tables(tables)
+        if grid:
+            candidates.append((label, grid))
+
+    best: tuple[tuple[int, int], str, list[list[str]]] | None = None
+    for label, grid in candidates:
+        try:
+            header_index, mapping, _ = find_header(grid)
+        except RuntimeError:
+            # This reading produced no recognisable header. Another may.
+            continue
+        name_at = next((p for p, c in mapping.items() if c == "name"), None)
+        named = 0 if name_at is None else sum(
+            1 for row in grid[header_index + 1:]
+            if name_at < len(row) and row[name_at].strip()
+        )
+        score = (len(mapping), named)
+        logger.info("[beneficiary import] pdf strategy=%s columns=%d named_rows=%d",
+                    label, len(mapping), named)
+        if best is None or score > best[0]:
+            best = (score, label, grid)
+
+    if best is None:
+        raise RuntimeError(
+            "No beneficiary table could be read from this PDF. If it is a scan "
+            "it has no text in it at all and cannot be read; otherwise export "
+            "the list as Excel or CSV, which is read exactly rather than "
+            "reconstructed."
+        )
+
+    logger.info("[beneficiary import] pdf selected strategy=%s", best[1])
+    return best[2]
+
+
 def read_records(grid: list[list[str]]) -> tuple[list[dict], dict, list[str]]:
     """Turn the grid into one dict per data row, keyed by column name.
 
@@ -147,8 +239,19 @@ def read_records(grid: list[list[str]]) -> tuple[list[dict], dict, list[str]]:
         record = {"_row": offset}
         for position, column in mapping.items():
             record[column] = (row[position] if position < len(row) else "").strip()
-        if any(record.get(c) for c in COLUMNS):
-            records.append(record)
+
+        if not any(record.get(c) for c in COLUMNS):
+            continue
+
+        # A repeated header row. PDFs reprint their header on every page and
+        # some exported sheets do too, and without this the second page's header
+        # imports as a beneficiary literally called "BENEFICIARY NAME" — which
+        # is exactly the junk row already sitting in two of the RERA head tables
+        # from an earlier import.
+        if HEADER_MAP.get(_norm(record.get("name", ""))) == "name":
+            continue
+
+        records.append(record)
 
     if len(records) > MAX_ROWS:
         raise RuntimeError(

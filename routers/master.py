@@ -306,15 +306,20 @@ async def import_beneficiaries(
     being held server-side. Holding it would mean a session, an expiry and a
     memory bound; re-reading costs a second and cannot go stale.
     """
+    # .xls is deliberately absent: openpyxl reads .xlsx and .xlsm only, so
+    # accepting it here would take the upload and then fail in the reader with a
+    # vaguer message than "we do not read that format".
     name = (file.filename or "").lower()
-    reader = None
-    for kind, (fn, extensions) in tabular_import.READERS.items():
-        if name.endswith(extensions):
-            reader = fn
-            break
-    if reader is None:
+    if name.endswith(".pdf"):
+        reader = beneficiary_import.read_pdf_grid
+    elif name.endswith(".xlsx"):
+        reader = tabular_import.READERS["excel"][0]
+    elif name.endswith(".csv"):
+        reader = tabular_import.READERS["csv"][0]
+    else:
         raise HTTPException(
-            400, "Upload an .xlsx, .xls or .csv file - this is not one of those.")
+            400, "Upload an .xlsx, .csv or .pdf file. An older .xls has to be "
+                 "saved as .xlsx first.")
 
     file_bytes = await file.read()
     if not file_bytes:
@@ -322,6 +327,10 @@ async def import_beneficiaries(
 
     try:
         grid = reader(file_bytes)
+    except RuntimeError as e:
+        # The PDF reader's own refusals — encrypted, or nothing table-shaped in
+        # it — already say what to do about them.
+        raise HTTPException(400, str(e))
     except Exception as e:
         raise HTTPException(400, f"That file could not be read: {e}")
 
