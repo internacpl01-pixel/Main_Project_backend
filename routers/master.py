@@ -5,6 +5,8 @@ rera_head_master, and idw_head_master tables.
 All tables share the same shape, so a single generic CRUD router handles
 all five. The `master_type` path param selects the table.
 """
+import re
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 import permissions
@@ -56,7 +58,9 @@ _TABLES = {
     'beneficiary': {
         'label': 'Beneficiary',
         'table': 'beneficiary_master',
-        'fields': ['name', 'account_number', 'ifsc_code', 'bank_name',
+        # 'company' sits with the identifying fields rather than among the
+        # heads: it says who this payee belongs to, not how they are booked.
+        'fields': ['name', 'account_number', 'ifsc_code', 'bank_name', 'company',
                    'rera_head1', 'rera_head2', 'rera_head3',
                    'idw_head1', 'idw_head2', 'idw_head3',
                    'head1', 'head2', 'head3'],
@@ -65,6 +69,7 @@ _TABLES = {
             'account_number': 'Account Number',
             'ifsc_code': 'IFSC Code',
             'bank_name': 'Bank Name',
+            'company': 'Company',
             'rera_head1': 'RERA Head 1',
             'rera_head2': 'RERA Head 2',
             'rera_head3': 'RERA Head 3',
@@ -79,6 +84,7 @@ _TABLES = {
         # from GET /master/_schema and fetches that type's rows, so the options
         # are always this company's own heads — never a list written twice.
         'options_from': {
+            'company': 'company',
             'rera_head1': 'rera_head', 'rera_head2': 'rera_head', 'rera_head3': 'rera_head',
             'idw_head1': 'idw_head', 'idw_head2': 'idw_head', 'idw_head3': 'idw_head',
             'head1': 'head', 'head2': 'head', 'head3': 'head',
@@ -97,6 +103,7 @@ _TABLES = {
         'unique': [],
         'required': ['name'],
         'columns': ['id', 'name', 'account_number', 'ifsc_code', 'bank_name',
+                    'company',
                     'rera_head1', 'rera_head2', 'rera_head3',
                     'idw_head1', 'idw_head2', 'idw_head3',
                     'head1', 'head2', 'head3',
@@ -156,6 +163,22 @@ _TABLES = {
         'table': 'company_master',
         'fields': ['name', 'abbreviation'],
         'labels': {'name': 'Name', 'abbreviation': 'Abbreviation'},
+        # Exactly three capital letters, matching the CHECK added in 017. The
+        # rule lives in both places on purpose: the database is what makes it
+        # true, this is what makes the refusal readable.
+        #
+        # 'upper' is why lowercase is not an error — "acp" is stored as "ACP"
+        # rather than bounced, because nobody typing an abbreviation in lower
+        # case meant a different value.
+        'formats': {
+            'abbreviation': {
+                'regex': r'^[A-Z]{3}$',
+                'message': 'Abbreviation must be exactly three letters, like ACP.',
+                'upper': True,
+                'maxlength': 3,
+                'placeholder': 'ABC',
+            },
+        },
         # Both unique in the database. Only the name is required: an
         # abbreviation nobody has decided on yet should not block the row.
         'unique': ['name', 'abbreviation'],
@@ -191,6 +214,36 @@ def _get_config(master_type: str):
     if not cfg:
         raise HTTPException(404, f"Unknown master type: {master_type}")
     return cfg
+
+
+def _normalise(cfg: dict, field: str, raw) -> str | None:
+    """Trim, upper-case where the field asks for it, and turn "" into NULL.
+
+    The ""-to-NULL rule is why an optional UNIQUE column works at all: Postgres
+    permits any number of NULLs but exactly one empty string, so two rows saved
+    from a form with that box untouched would otherwise collide with each other.
+    """
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if cfg.get('formats', {}).get(field, {}).get('upper'):
+        value = value.upper()
+    return value or None
+
+
+def _check_formats(cfg: dict, values: dict) -> None:
+    """Reject a value that does not match its field's shape.
+
+    Only fields actually present are looked at, so a PATCH touching one column
+    is not asked to justify the others. Blank is not checked — a field that may
+    be empty is settled by cfg['required'], not here.
+    """
+    for field, rule in cfg.get('formats', {}).items():
+        if field not in values:
+            continue
+        value = values[field]
+        if value and not re.match(rule['regex'], value):
+            raise HTTPException(400, rule['message'])
 
 
 def _check_distinct_groups(cfg: dict, values: dict) -> None:
@@ -252,6 +305,14 @@ async def master_schema():
                         {"options_from": cfg['options_from'][f]}
                         if f in cfg.get('options_from', {}) else {}
                     ),
+                    # Shape hints for a typed field. The API and the database
+                    # both refuse a bad value regardless; these exist so the box
+                    # stops accepting one before the user presses Create.
+                    **{
+                        k: v
+                        for k, v in cfg.get('formats', {}).get(f, {}).items()
+                        if k in ('maxlength', 'placeholder', 'upper')
+                    },
                 }
                 for f in cfg['fields']
             ],
@@ -296,20 +357,26 @@ async def create_master(
     cfg = _get_config(master_type)
     fields = cfg['fields']
 
+    # Normalised once, up front, so the checks below and the values written are
+    # the same strings — an abbreviation is validated as "ACP", not as the "acp"
+    # that was typed and would then have been stored in a third form again.
+    #
+    # "" is not a value: an untouched optional input posts an empty string, and
+    # storing that makes a blank IFSC code sort and display differently from one
+    # that was never entered.
+    clean = {f: _normalise(cfg, f, body.get(f)) for f in fields}
+
     for f in cfg['required']:
-        if not str(body.get(f) or '').strip():
+        if not clean.get(f):
             raise HTTPException(400, f"{cfg['labels'].get(f, f)} is required.")
 
-    # A create carries the whole row, so the body is already the after state.
-    _check_distinct_groups(cfg, body)
+    _check_formats(cfg, clean)
+    # A create carries the whole row, so this is already the after state.
+    _check_distinct_groups(cfg, clean)
 
     placeholders = ', '.join(f'${i + 1}' for i in range(len(fields)))
     cols = ', '.join(fields)
-    # "" is not a value — an untouched optional input posts an empty string, and
-    # storing that makes a blank IFSC code sort and display differently from one
-    # that was never entered.
-    vals = [(str(body.get(f)).strip() or None) if body.get(f) is not None else None
-            for f in fields]
+    vals = [clean[f] for f in fields]
 
     async with company_connection(schema) as conn:
         try:
@@ -340,16 +407,21 @@ async def update_master(
     # error on every call — editing any master row failed. Interpolating is safe
     # here only because `f` comes from cfg['fields'], a server-side list, never
     # from the request body.
+    # Same normalisation as create, over only the fields this patch carries.
+    clean = {f: _normalise(cfg, f, body[f]) for f in cfg['fields'] if f in body}
+
     for f in cfg['required']:
-        if f in body and not str(body[f] or '').strip():
+        if f in body and not clean.get(f):
             raise HTTPException(400, f"{cfg['labels'].get(f, f)} cannot be blank.")
+
+    _check_formats(cfg, clean)
 
     for f in cfg['fields']:
         if f in body:
             sets.append(f"{f} = ${idx}")
-            # Same "" -> NULL rule as create, so clearing an optional field
-            # leaves it empty rather than holding a zero-length string.
-            params.append(str(body[f]).strip() or None if body[f] is not None else None)
+            # "" -> NULL, so clearing an optional field leaves it empty rather
+            # than holding a zero-length string.
+            params.append(clean[f])
             idx += 1
     if not sets:
         raise HTTPException(400, "No fields to update.")
@@ -366,10 +438,7 @@ async def update_master(
             )
             if current is None:
                 raise HTTPException(404, "Item not found.")
-            _check_distinct_groups(cfg, {
-                **dict(current),
-                **{k: v for k, v in body.items() if k in cfg['fields']},
-            })
+            _check_distinct_groups(cfg, {**dict(current), **clean})
 
         try:
             row = await conn.fetchrow(
