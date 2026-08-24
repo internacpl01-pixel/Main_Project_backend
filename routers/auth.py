@@ -188,11 +188,24 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     Returns a JWT token. After this, Swagger sends the token
     automatically with every request.
     """
-    username = form_data.username
+    # Trimmed, because a username pasted from a message often carries a space,
+    # and " admin" is not a different person.
+    username = (form_data.username or "").strip()
     password = form_data.password
 
     # Open a connection to find the user.
     # For super_admin (company_id = NULL), there's no schema — use 'admin'.
+    #
+    # Matched on lower(username), not on username. A username is a name, not a
+    # secret: the password is what proves who this is, and rejecting a correct
+    # password because the capital letter is in the wrong place only ever locks
+    # out the legitimate owner. accounts.py has always taken this view when
+    # creating an account — it refuses a name that collides case-insensitively —
+    # so comparing exactly here meant an account the app considered taken could
+    # still be unreachable by the spelling its owner remembered.
+    #
+    # admin/004 adds the unique index on lower(username) that both guarantees
+    # this matches at most one row and keeps the lookup off a sequential scan.
     async with company_connection("admin") as conn:
         row = await conn.fetchrow(
             """
@@ -200,7 +213,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
                    u.company_id, c.schema_name
             FROM admin.users u
             LEFT JOIN admin.companies c ON c.id = u.company_id
-            WHERE u.username = $1 AND u.is_active = true
+            WHERE lower(u.username) = lower($1) AND u.is_active = true
             """,
             username,
         )

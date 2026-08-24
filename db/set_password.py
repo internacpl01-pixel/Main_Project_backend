@@ -32,7 +32,7 @@ async def set_password(username: str, password: str) -> None:
             """
             UPDATE admin.users
             SET password_hash = $1
-            WHERE username = $2
+            WHERE lower(username) = lower($2)
             RETURNING username
             """,
             pw_hash.decode("utf-8"),
