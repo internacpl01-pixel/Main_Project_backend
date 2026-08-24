@@ -5,6 +5,7 @@ rera_head_master, and idw_head_master tables.
 All tables share the same shape, so a single generic CRUD router handles
 all five. The `master_type` path param selects the table.
 """
+import logging
 import re
 
 from fastapi import (APIRouter, Depends, File, Form, HTTPException, Query,
@@ -14,6 +15,8 @@ import permissions
 from database import company_connection
 from routers.auth import get_current_schema, require_level
 from services import beneficiary_import, tabular_import
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/master", tags=["master"])
 
@@ -284,6 +287,68 @@ def _check_distinct_groups(cfg: dict, values: dict) -> None:
 # ── Schema ───────────────────────────────────────────────────────────
 # Declared before /{master_type} on purpose: FastAPI matches in declaration
 # order, so the other way round "_schema" would be read as a master type.
+
+@router.delete("/beneficiary/all", dependencies=[Depends(require_manager)])
+async def delete_all_beneficiaries(schema: str = Depends(get_current_schema)):
+    """Empty the beneficiary table.
+
+    Exists for the same reason the import does: a list loaded from a sheet is
+    corrected by loading a better sheet, and doing that means clearing the last
+    one. Deleting 150 rows one at a time is not a workflow.
+
+    A real DELETE, not the archive that the single-row button does. Archiving
+    would leave every account number in place, and the importer matches on
+    account number -- so the next upload would call all of them duplicates and
+    the corrected sheet would not land.
+
+    One exception it cannot make: transactions.beneficiary_id is ON DELETE
+    RESTRICT, so a beneficiary the ledger has booked against cannot be removed
+    without rewriting history. Those are archived instead and counted
+    separately, so the caller is told rather than the whole operation failing
+    because of one row.
+
+    temp_trans.beneficiary_id is ON DELETE SET NULL, so staged rows survive and
+    simply lose the link. They are counted too -- someone will have to pick the
+    beneficiary again on those rows, and that is worth knowing before pressing
+    the button rather than after.
+    """
+    async with company_connection(schema) as conn:
+        async with conn.transaction():
+            total = await conn.fetchval("SELECT count(*) FROM beneficiary_master")
+
+            protected = [
+                r["beneficiary_id"] for r in await conn.fetch(
+                    "SELECT DISTINCT beneficiary_id FROM transactions "
+                    "WHERE beneficiary_id IS NOT NULL")
+            ]
+            unlinked = await conn.fetchval(
+                "SELECT count(*) FROM temp_trans WHERE beneficiary_id IS NOT NULL "
+                "AND NOT (beneficiary_id = ANY($1::bigint[]))", protected)
+
+            archived = 0
+            if protected:
+                archived = await conn.fetchval(
+                    "WITH archived AS ("
+                    "  UPDATE beneficiary_master SET is_active = false "
+                    "  WHERE id = ANY($1::bigint[]) AND is_active = true RETURNING 1"
+                    ") SELECT count(*) FROM archived", protected)
+
+            # ANY of an empty array is false for every row, so with nothing
+            # protected this is a plain "delete everything".
+            tag = await conn.execute(
+                "DELETE FROM beneficiary_master "
+                "WHERE NOT (id = ANY($1::bigint[]))", protected)
+            deleted = int(tag.split()[-1])
+
+    logger.info("[master] beneficiary clear-all: deleted=%d archived=%d unlinked=%d",
+                deleted, archived, unlinked)
+    return {
+        "total": total,
+        "deleted": deleted,
+        "archived": archived,
+        "unlinked_staged_rows": unlinked,
+    }
+
 
 @router.post("/beneficiary/import", dependencies=[Depends(require_manager)])
 async def import_beneficiaries(

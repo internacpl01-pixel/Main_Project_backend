@@ -471,8 +471,13 @@ async def commit(conn, analysis: dict, on_duplicate: str) -> dict:
                     f"VALUES ({placeholders})", *values)
                 inserted += 1
             elif on_duplicate == "overwrite":
+                # is_active is restored as well. A beneficiary can be archived
+                # rather than deleted -- the clear-all does that to anyone the
+                # ledger has booked against -- and re-importing that account
+                # number plainly means it is wanted again. Without this the row
+                # would be updated correctly and stay invisible.
                 await conn.execute(
-                    f"UPDATE beneficiary_master SET {assignments} "
+                    f"UPDATE beneficiary_master SET {assignments}, is_active = true "
                     f"WHERE id = ${len(COLUMNS) + 1}", *values, existing_id)
                 updated += 1
             else:
