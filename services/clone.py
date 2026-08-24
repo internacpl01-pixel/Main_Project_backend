@@ -49,6 +49,11 @@ COPIED_TABLES = (
     "head_master",
     "rera_head_master",
     "idw_head_master",
+    # Added with 014. Neither carries a foreign key, so position here is free —
+    # appended rather than grouped alphabetically to keep the existing order
+    # stable in the clone preview.
+    "company_master",
+    "account_type_master",
 )
 
 # Row timestamps are not carried across. A bank in the clone was added when the

@@ -37,29 +37,60 @@ _TABLES = {
         'order_by': 'bank_name',
         'label_field': 'bank_name',
     },
-    # head1/2/3 are free text, not references to the three head tables they are
-    # named after — see company/009_beneficiary_fields.sql. They record how this
-    # payee is usually booked; the ledger's own classification still comes from
-    # head_master / rera_head_master / idw_head_master and is unaffected.
+    # Nine head columns, three from each head master — see
+    # company/013_beneficiary_head_columns.sql. They record how this payee is
+    # usually booked and are chosen from the company's own master tables rather
+    # than typed. The ledger's own classification is still head_id /
+    # rera_head_id / idw_head_id on transactions and is unaffected by these.
+    #
+    # 'idw_head*' columns carry 'TCP Head' labels for the same reason the
+    # 'idw_head' master type does: the rename was to the label only.
     'beneficiary': {
         'label': 'Beneficiary',
         'table': 'beneficiary_master',
         'fields': ['name', 'account_number', 'ifsc_code', 'bank_name',
+                   'rera_head1', 'rera_head2', 'rera_head3',
+                   'idw_head1', 'idw_head2', 'idw_head3',
                    'head1', 'head2', 'head3'],
         'labels': {
             'name': 'Name',
             'account_number': 'Account Number',
             'ifsc_code': 'IFSC Code',
             'bank_name': 'Bank Name',
-            'head1': 'Head 1',
-            'head2': 'Head 2',
-            'head3': 'Head 3',
+            'rera_head1': 'RERA Head 1',
+            'rera_head2': 'RERA Head 2',
+            'rera_head3': 'RERA Head 3',
+            'idw_head1': 'TCP Head 1',
+            'idw_head2': 'TCP Head 2',
+            'idw_head3': 'TCP Head 3',
+            'head1': 'Internal Head 1',
+            'head2': 'Internal Head 2',
+            'head3': 'Internal Head 3',
         },
+        # Which master type fills each dropdown. The Master Data page reads this
+        # from GET /master/_schema and fetches that type's rows, so the options
+        # are always this company's own heads — never a list written twice.
+        'options_from': {
+            'rera_head1': 'rera_head', 'rera_head2': 'rera_head', 'rera_head3': 'rera_head',
+            'idw_head1': 'idw_head', 'idw_head2': 'idw_head', 'idw_head3': 'idw_head',
+            'head1': 'head', 'head2': 'head', 'head3': 'head',
+        },
+        # The three heads within a group must differ. Enforced in the database
+        # too (013's CHECK constraints); repeated here so the message names the
+        # field instead of quoting a constraint. Groups are separate because the
+        # same name legitimately exists in two different head tables.
+        'distinct_groups': [
+            ('rera_head1', 'rera_head2', 'rera_head3'),
+            ('idw_head1', 'idw_head2', 'idw_head3'),
+            ('head1', 'head2', 'head3'),
+        ],
         # Nothing unique: the same account can legitimately be recorded twice,
         # and the name never was unique either.
         'unique': [],
         'required': ['name'],
         'columns': ['id', 'name', 'account_number', 'ifsc_code', 'bank_name',
+                    'rera_head1', 'rera_head2', 'rera_head3',
+                    'idw_head1', 'idw_head2', 'idw_head3',
                     'head1', 'head2', 'head3',
                     'is_active', 'created_at', 'updated_at'],
         'order_by': 'name',
@@ -105,6 +136,38 @@ _TABLES = {
         'order_by': 'name',
         'label_field': 'name',
     },
+    # Group and associate companies referred to inside THIS company's books —
+    # not admin.companies, which is the app's tenant registry. See
+    # company/014_company_and_account_type_masters.sql on why the two are
+    # separate despite overlapping in content.
+    #
+    # Appended rather than slotted in next to Bank because the Master Data page
+    # opens on whichever type is listed first, and that is Bank today.
+    'company': {
+        'label': 'Company',
+        'table': 'company_master',
+        'fields': ['name', 'abbreviation'],
+        'labels': {'name': 'Name', 'abbreviation': 'Abbreviation'},
+        # Both unique in the database. Only the name is required: an
+        # abbreviation nobody has decided on yet should not block the row.
+        'unique': ['name', 'abbreviation'],
+        'required': ['name'],
+        'columns': ['id', 'name', 'abbreviation', 'is_active', 'created_at',
+                    'updated_at'],
+        'order_by': 'name',
+        'label_field': 'name',
+    },
+    'account_type': {
+        'label': 'Type of Account',
+        'table': 'account_type_master',
+        'fields': ['name'],
+        'labels': {'name': 'Name'},
+        'unique': ['name'],
+        'required': ['name'],
+        'columns': ['id', 'name', 'is_active', 'created_at', 'updated_at'],
+        'order_by': 'name',
+        'label_field': 'name',
+    },
 }
 
 
@@ -120,6 +183,35 @@ def _get_config(master_type: str):
     if not cfg:
         raise HTTPException(404, f"Unknown master type: {master_type}")
     return cfg
+
+
+def _check_distinct_groups(cfg: dict, values: dict) -> None:
+    """Reject a group of fields that are meant to differ but do not.
+
+    `values` must describe the row as it will be AFTER the write, not merely
+    what the request carried: a PATCH that sets only RERA Head 2 can still
+    collide with the RERA Head 1 already stored, and checking the body alone
+    would let that through to the database's CHECK constraint — which is a
+    correct refusal wearing an unreadable message.
+
+    Blank and missing are the same thing here and never collide, matching the
+    ""-becomes-NULL rule the writes below apply.
+    """
+    for group in cfg.get('distinct_groups', []):
+        seen: dict[str, str] = {}
+        for f in group:
+            value = str(values.get(f) or '').strip()
+            if not value:
+                continue
+            if value in seen:
+                first = cfg['labels'].get(seen[value], seen[value])
+                this = cfg['labels'].get(f, f)
+                raise HTTPException(
+                    400,
+                    f'{first} and {this} are both "{value}". '
+                    f'The three must be different.'
+                )
+            seen[value] = f
 
 
 # ── Schema ───────────────────────────────────────────────────────────
@@ -144,9 +236,21 @@ async def master_schema():
                     "key": f,
                     "label": cfg['labels'].get(f, f.replace('_', ' ').title()),
                     "required": f in cfg['required'],
+                    # Present only on fields that are chosen rather than typed.
+                    # The value is another master type's key, so the page loads
+                    # that type through the endpoint it already uses for its own
+                    # tab — no second route and no options list stored here.
+                    **(
+                        {"options_from": cfg['options_from'][f]}
+                        if f in cfg.get('options_from', {}) else {}
+                    ),
                 }
                 for f in cfg['fields']
             ],
+            # Field groups whose members must differ from one another. The page
+            # greys out a head already picked in its group rather than letting
+            # it be chosen and refused on save.
+            "distinct_groups": [list(g) for g in cfg.get('distinct_groups', [])],
         }
         for key, cfg in _TABLES.items()
     ]
@@ -187,6 +291,9 @@ async def create_master(
     for f in cfg['required']:
         if not str(body.get(f) or '').strip():
             raise HTTPException(400, f"{cfg['labels'].get(f, f)} is required.")
+
+    # A create carries the whole row, so the body is already the after state.
+    _check_distinct_groups(cfg, body)
 
     placeholders = ', '.join(f'${i + 1}' for i in range(len(fields)))
     cols = ', '.join(fields)
@@ -241,6 +348,21 @@ async def update_master(
 
     params.append(item_id)
     async with company_connection(schema) as conn:
+        if cfg.get('distinct_groups'):
+            # Read the row first and overlay the patch, so the check sees what
+            # the row is about to become rather than the handful of fields this
+            # particular request happened to send.
+            current = await conn.fetchrow(
+                f"SELECT {', '.join(cfg['fields'])} FROM {cfg['table']} WHERE id = $1",
+                item_id,
+            )
+            if current is None:
+                raise HTTPException(404, "Item not found.")
+            _check_distinct_groups(cfg, {
+                **dict(current),
+                **{k: v for k, v in body.items() if k in cfg['fields']},
+            })
+
         try:
             row = await conn.fetchrow(
                 f"UPDATE {cfg['table']} SET {', '.join(sets)} WHERE id = ${idx} "
