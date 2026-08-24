@@ -14,12 +14,17 @@ Both list endpoints are paged and searchable, and both return
 on every render, which was fine at a few hundred and is not at a few hundred
 thousand — one statement import is several hundred rows on its own.
 """
+import logging
+import re
+
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 
 import permissions
 from database import company_connection
 from routers.auth import get_company_user, get_current_schema, require_level
 from services import custom_fields, scoping
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/transactions", tags=["transactions"])
 
@@ -40,6 +45,56 @@ _MASTER_LOOKUPS = {
     "beneficiary_id": ("beneficiary_master", "beneficiary"),
     "project_id": ("projects", "project"),
 }
+
+# Which master table backs each value of fieldmap.mirrors — see
+# company/019_fieldmap_mirrors.sql. Keyed by the mirrors value, not the id
+# column, because that is what the fieldmap row stores.
+_MIRROR_TABLES = {
+    "head": "head_master",
+    "rera_head": "rera_head_master",
+    "idw_head": "idw_head_master",
+}
+
+# A fieldmap row names a physical column, and that name is interpolated into the
+# UPDATE below — Postgres has no placeholder for an identifier. The fieldmap is
+# server-side data rather than request input, but "not user input today" is a
+# weaker guarantee than a pattern that cannot express anything but a custom
+# field, so the name is matched against one before it is used.
+_CUSTOM_FIELD_RE = re.compile(r"^field_(text|num|date)_\d+$")
+
+
+async def _mirror_values(conn, chosen: dict[str, int | None]) -> dict[str, str]:
+    """Map custom column -> master name, for classifications being set.
+
+    Returns {} when the company has no mirroring columns, which is the normal
+    case for a company that never added custom fields — the caller then writes
+    only the _id columns, exactly as before this existed.
+    """
+    wanted = {key: value for key, value in chosen.items() if value is not None}
+    if not wanted:
+        return {}
+
+    rows = await conn.fetch(
+        "SELECT fieldname, mirrors FROM fieldmap "
+        "WHERE mirrors = ANY($1::text[]) AND is_active = true",
+        list(wanted),
+    )
+
+    out: dict[str, str] = {}
+    for row in rows:
+        column, target = row["fieldname"], row["mirrors"]
+        if not _CUSTOM_FIELD_RE.match(column or ""):
+            logger.warning(
+                "[classify] fieldmap row mirrors %s but names %r, which is not a "
+                "custom field column — ignored", target, column,
+            )
+            continue
+        name = await conn.fetchval(
+            f"SELECT name FROM {_MIRROR_TABLES[target]} WHERE id = $1", wanted[target]
+        )
+        if name is not None:
+            out[column] = name
+    return out
 
 
 # Page size ceiling. Export is the route for "give me everything" — it streams
@@ -665,33 +720,30 @@ async def classify_row(
             detail="Provide at least one of: head_id, rera_head_id, idw_head_id",
         )
 
-    sets = []
-    params = []
-    idx = 1
+    sets: list[str] = []
+    params: list = []
+
+    def _set(column: str, value) -> None:
+        """Add `column = $n` and its value, numbering from the params list.
+
+        Numbering off len(params) rather than a counter kept alongside it: the
+        mirror columns below are appended from inside the connection, after this
+        list was first built, and a separate index would have to be threaded
+        through that to stay in step.
+        """
+        params.append(value)
+        sets.append(f"{column} = ${len(params)}")
 
     if head_id is not None:
-        sets.append(f"head_id = ${idx}")
-        params.append(head_id)
-        idx += 1
+        _set("head_id", head_id)
     if rera_head_id is not None:
-        sets.append(f"rera_head_id = ${idx}")
-        params.append(rera_head_id)
-        idx += 1
+        _set("rera_head_id", rera_head_id)
     if idw_head_id is not None:
-        sets.append(f"idw_head_id = ${idx}")
-        params.append(idw_head_id)
-        idx += 1
+        _set("idw_head_id", idw_head_id)
     if project_id is not None:
-        sets.append(f"project_id = ${idx}")
-        params.append(project_id)
-        idx += 1
+        _set("project_id", project_id)
     if beneficiary_id is not None:
-        sets.append(f"beneficiary_id = ${idx}")
-        params.append(beneficiary_id)
-        idx += 1
-
-    sets.append("is_classified = true")
-    params.append(row_id)
+        _set("beneficiary_id", beneficiary_id)
 
     async with company_connection(user["schema"]) as conn:
         scope = await scoping.visible_project_ids(conn, user)
@@ -716,11 +768,25 @@ async def classify_row(
         if current is None or not scoping.can_use_project(scope, current["project_id"]):
             raise HTTPException(status_code=404, detail="Row not found.")
 
+        # Write the chosen name into whichever display column mirrors it, so the
+        # staging table shows the classification instead of an em dash. The _id
+        # columns above are still the real record — finalize reads those, not
+        # these — and a company with no mirroring column gets nothing extra.
+        for column, name in (await _mirror_values(conn, {
+            "head": head_id,
+            "rera_head": rera_head_id,
+            "idw_head": idw_head_id,
+        })).items():
+            _set(column, name)
+
+        sets.append("is_classified = true")
+        params.append(row_id)
+
         row = await conn.fetchrow(
             f"""
             UPDATE temp_trans
             SET {", ".join(sets)}
-            WHERE id = ${idx} AND is_classified = false
+            WHERE id = ${len(params)} AND is_classified = false
             RETURNING id
             """,
             *params,

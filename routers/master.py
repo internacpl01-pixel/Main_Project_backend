@@ -7,11 +7,13 @@ all five. The `master_type` path param selects the table.
 """
 import re
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import (APIRouter, Depends, File, Form, HTTPException, Query,
+                     UploadFile)
 
 import permissions
 from database import company_connection
 from routers.auth import get_current_schema, require_level
+from services import beneficiary_import, tabular_import
 
 router = APIRouter(prefix="/master", tags=["master"])
 
@@ -58,6 +60,10 @@ _TABLES = {
     'beneficiary': {
         'label': 'Beneficiary',
         'table': 'beneficiary_master',
+        # Turns on the Import button for this tab. A flag rather than the page
+        # naming 'beneficiary' itself, so a second importable master type is a
+        # line here and an endpoint, not an edit to the React page.
+        'importable': True,
         # 'company' sits with the identifying fields rather than among the
         # heads: it says who this payee belongs to, not how they are booked.
         'fields': ['name', 'account_number', 'ifsc_code', 'bank_name', 'company',
@@ -279,6 +285,67 @@ def _check_distinct_groups(cfg: dict, values: dict) -> None:
 # Declared before /{master_type} on purpose: FastAPI matches in declaration
 # order, so the other way round "_schema" would be read as a master type.
 
+@router.post("/beneficiary/import", dependencies=[Depends(require_manager)])
+async def import_beneficiaries(
+    file: UploadFile = File(...),
+    save: bool = Form(False, description="false previews, true writes"),
+    on_duplicate: str = Form(
+        "skip", description="skip | overwrite — what to do with rows whose "
+                            "account number already exists"),
+    schema: str = Depends(get_current_schema),
+):
+    """Bulk-load beneficiaries from an Excel or CSV sheet.
+
+    Two calls, same as the statement importers. save=false reports what would
+    happen and writes nothing; save=true performs it. The preview is not
+    politeness — the duplicate choice cannot be made before knowing how many
+    rows it covers, and a sheet with a mis-named head should be corrected in the
+    sheet rather than half-imported.
+
+    The sheet is re-read on the second call rather than the first call's result
+    being held server-side. Holding it would mean a session, an expiry and a
+    memory bound; re-reading costs a second and cannot go stale.
+    """
+    name = (file.filename or "").lower()
+    reader = None
+    for kind, (fn, extensions) in tabular_import.READERS.items():
+        if name.endswith(extensions):
+            reader = fn
+            break
+    if reader is None:
+        raise HTTPException(
+            400, "Upload an .xlsx, .xls or .csv file - this is not one of those.")
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(400, "That file is empty.")
+
+    try:
+        grid = reader(file_bytes)
+    except Exception as e:
+        raise HTTPException(400, f"That file could not be read: {e}")
+
+    async with company_connection(schema) as conn:
+        try:
+            analysis = await beneficiary_import.analyse(conn, grid)
+        except RuntimeError as e:
+            raise HTTPException(400, str(e))
+
+        if not save:
+            return {k: v for k, v in analysis.items() if not k.startswith("_")}
+
+        try:
+            result = await beneficiary_import.commit(conn, analysis, on_duplicate)
+        except RuntimeError as e:
+            raise HTTPException(400, str(e))
+
+    return {
+        **{k: v for k, v in analysis.items() if not k.startswith("_")},
+        "saved": True,
+        **result,
+    }
+
+
 @router.get("/_schema")
 async def master_schema():
     """
@@ -320,6 +387,7 @@ async def master_schema():
             # greys out a head already picked in its group rather than letting
             # it be chosen and refused on save.
             "distinct_groups": [list(g) for g in cfg.get('distinct_groups', [])],
+            "importable": bool(cfg.get('importable')),
         }
         for key, cfg in _TABLES.items()
     ]
