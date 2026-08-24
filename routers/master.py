@@ -98,6 +98,15 @@ _TABLES = {
             'idw_head1': 'idw_head', 'idw_head2': 'idw_head', 'idw_head3': 'idw_head',
             'head1': 'head', 'head2': 'head', 'head3': 'head',
         },
+        # Which column of the source master supplies the stored VALUE, when it
+        # is not that master's label_field. Company stores 'DPL' rather than
+        # 'DWARKADHIS PROJECTS PRIVATE LIMITED': the full names are long enough
+        # to swallow the row in a table showing fourteen columns, and the
+        # abbreviation is what these are called in the books anyway.
+        #
+        # The dropdown still shows both, so picking one does not require
+        # remembering which three letters belong to which company.
+        'options_value': {'company': 'abbreviation'},
         # The three heads within a group must differ. Enforced in the database
         # too (013's CHECK constraints); repeated here so the message names the
         # field instead of quoting a constraint. Groups are separate because the
@@ -202,6 +211,11 @@ _TABLES = {
         'table': 'account_type_master',
         'fields': ['name'],
         'labels': {'name': 'Name'},
+        # Stored in capitals however it is typed. No regex: there is nothing to
+        # refuse here, only a shape to impose — 'current' and 'Current' mean the
+        # same account type and should not become two rows that look different
+        # in the Bank tab's dropdown.
+        'formats': {'name': {'upper': True}},
         'unique': ['name'],
         'required': ['name'],
         'columns': ['id', 'name', 'is_active', 'created_at', 'updated_at'],
@@ -246,9 +260,12 @@ def _check_formats(cfg: dict, values: dict) -> None:
     Only fields actually present are looked at, so a PATCH touching one column
     is not asked to justify the others. Blank is not checked — a field that may
     be empty is settled by cfg['required'], not here.
+
+    'regex' is optional. A field can ask only to be upper-cased, which _normalise
+    has already done by the time this runs and which nothing can then fail.
     """
     for field, rule in cfg.get('formats', {}).items():
-        if field not in values:
+        if field not in values or 'regex' not in rule:
             continue
         value = values[field]
         if value and not re.match(rule['regex'], value):
@@ -451,6 +468,12 @@ async def master_schema():
                     **(
                         {"options_from": cfg['options_from'][f]}
                         if f in cfg.get('options_from', {}) else {}
+                    ),
+                    # Which column of that master is stored. Absent means the
+                    # master's own label_field, which is the usual case.
+                    **(
+                        {"options_value": cfg['options_value'][f]}
+                        if f in cfg.get('options_value', {}) else {}
                     ),
                     # Shape hints for a typed field. The API and the database
                     # both refuse a bad value regardless; these exist so the box

@@ -275,17 +275,22 @@ async def _master_lookups(conn) -> dict[str, dict[str, str]]:
             f"SELECT name FROM {table} WHERE is_active = true")
         lookups[table] = {r["name"].strip().lower(): r["name"] for r in rows}
 
-    # A company is matched on its name OR its abbreviation, because a sheet
-    # writes "DPL" where the master holds "DWARKADHIS PROJECTS PRIVATE LIMITED".
-    # Either way the NAME is stored — that is what the dropdown shows, so an
-    # imported row and a hand-entered one must not differ.
+    # A company is matched on its name OR its abbreviation, because a sheet may
+    # write either. What gets STORED is the abbreviation — 'DPL', not
+    # 'DWARKADHIS PROJECTS PRIVATE LIMITED' — matching what the dropdown saves,
+    # so an imported row and a hand-entered one are the same string.
+    #
+    # A company with no abbreviation falls back to its name. There is nothing
+    # else to store, and refusing the row would be a strange way to report that
+    # somebody left a field blank on a different screen.
     companies = await conn.fetch(
         "SELECT name, abbreviation FROM company_master WHERE is_active = true")
     company_map: dict[str, str] = {}
     for row in companies:
-        company_map[row["name"].strip().lower()] = row["name"]
+        stored = (row["abbreviation"] or "").strip() or row["name"]
+        company_map[row["name"].strip().lower()] = stored
         if row["abbreviation"]:
-            company_map.setdefault(row["abbreviation"].strip().lower(), row["name"])
+            company_map.setdefault(row["abbreviation"].strip().lower(), stored)
     lookups["company_master"] = company_map
     return lookups
 
