@@ -355,8 +355,13 @@ async def import_beneficiaries(
     file: UploadFile = File(...),
     save: bool = Form(False, description="false previews, true writes"),
     on_duplicate: str = Form(
-        "skip", description="skip | overwrite — what to do with rows whose "
-                            "account number already exists"),
+        "skip", description="skip | overwrite — rows whose account number AND "
+                            "company already exist"),
+    on_cross_company: str = Form(
+        "add", description="add | skip — rows whose account number exists under "
+                           "a different company. A payee may legitimately be "
+                           "recorded once per group company, so the default "
+                           "adds them"),
     schema: str = Depends(get_current_schema),
 ):
     """Bulk-load beneficiaries from an Excel or CSV sheet.
@@ -409,7 +414,8 @@ async def import_beneficiaries(
             return {k: v for k, v in analysis.items() if not k.startswith("_")}
 
         try:
-            result = await beneficiary_import.commit(conn, analysis, on_duplicate)
+            result = await beneficiary_import.commit(
+                conn, analysis, on_duplicate, on_cross_company)
         except RuntimeError as e:
             raise HTTPException(400, str(e))
 

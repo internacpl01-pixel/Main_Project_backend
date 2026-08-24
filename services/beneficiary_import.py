@@ -353,32 +353,49 @@ async def analyse(conn, grid: list[list[str]]) -> dict:
     records, detected, unmapped = read_records(grid)
     lookups = await _master_lookups(conn)
 
-    existing = {
-        (r["account_number"] or "").strip().lower(): r["id"]
-        for r in await conn.fetch(
-            "SELECT id, account_number FROM beneficiary_master "
-            "WHERE account_number IS NOT NULL AND account_number <> ''")
-    }
-
-    # Account number is the match, as asked. It leaves a gap: a beneficiary paid
-    # in cash has none, so it can never match anything, and re-importing the same
-    # sheet would add a second copy of every such row — silently, since nothing
-    # about it looks like a duplicate. Those rows fall back to the name.
+    # A beneficiary is identified by its account number AND its company, not by
+    # the account number alone.
     #
-    # Only those rows. Two beneficiaries may legitimately share a name (the same
-    # payee recorded once per project), but both of those carry account numbers
-    # and so never reach this.
-    existing_by_name = {}
+    # The same account legitimately appears once per group company -- one payee
+    # booked under AMB and again under DPL is two records, because each company
+    # keeps its own books. Keying on the account alone called the second one a
+    # repeat and threw it away, which silently lost half of a list built exactly
+    # that way.
+    #
+    # The account number on its own is still tracked, so a row whose account
+    # matches an existing record under a DIFFERENT company can be reported as
+    # that rather than passed off as brand new. It is the one case the sheet
+    # cannot settle by itself: it is either a second company's copy of a real
+    # payee, or somebody pasted the wrong account.
+    existing: dict[tuple[str, str], int] = {}
+    accounts_seen_before: dict[str, str] = {}
     for r in await conn.fetch(
-        "SELECT id, name FROM beneficiary_master "
+        "SELECT id, account_number, company FROM beneficiary_master "
+        "WHERE account_number IS NOT NULL AND account_number <> ''"
+    ):
+        account = (r["account_number"] or "").strip().lower()
+        company = (r["company"] or "").strip().lower()
+        existing[(account, company)] = r["id"]
+        accounts_seen_before.setdefault(account, r["company"] or "no company")
+
+    # A beneficiary paid in cash has no account number and can never match on
+    # one, so re-importing the sheet would add a second copy of every such row --
+    # silently, since nothing about it looks like a duplicate. Those fall back to
+    # name and company together, for the same reason as above.
+    existing_by_name: dict[tuple[str, str], int] = {}
+    for r in await conn.fetch(
+        "SELECT id, name, company FROM beneficiary_master "
         "WHERE account_number IS NULL OR account_number = ''"
     ):
-        existing_by_name.setdefault((r["name"] or "").strip().lower(), r["id"])
+        existing_by_name.setdefault(
+            ((r["name"] or "").strip().lower(), (r["company"] or "").strip().lower()),
+            r["id"])
 
     ok: list[dict] = []
     errors: list[dict] = []
     duplicates: list[dict] = []
-    seen_in_sheet: dict[str, int] = {}
+    cross_company: list[dict] = []
+    seen_in_sheet: dict[tuple[str, str, str], int] = {}
 
     for record in records:
         resolved, problems = _resolve_row(record, lookups)
@@ -391,47 +408,69 @@ async def analyse(conn, grid: list[list[str]]) -> dict:
             continue
 
         account = (resolved["account_number"] or "").strip().lower()
+        company = (resolved["company"] or "").strip().lower()
         resolved["_row"] = record["_row"]
 
-        # What this row is identified by: its account number, or its name when
-        # it has none. The key is prefixed so a name can never collide with an
-        # account number that happens to read the same.
-        key = f"a:{account}" if account else f"n:{resolved['name'].strip().lower()}"
+        # What identifies this row: account plus company, or name plus company
+        # when there is no account. The first element keeps a name from ever
+        # colliding with an account number that happens to read the same.
+        key = (("a", account, company) if account
+               else ("n", resolved["name"].strip().lower(), company))
 
-        # The same key twice in one sheet is the sheet's own duplicate, reported
-        # rather than silently letting the later row win.
+        # The same key twice in one sheet is the sheet's own duplicate. Two rows
+        # sharing an account under different companies do NOT hit this.
         if key in seen_in_sheet:
             what = "account number" if account else "name"
+            where = f" for {resolved['company']}" if resolved["company"] else ""
             errors.append({
                 "row": record["_row"],
                 "name": resolved["name"],
-                "problems": [f"{what} repeats row {seen_in_sheet[key]} in this sheet"],
+                "problems": [f"{what} repeats row {seen_in_sheet[key]}{where} "
+                             f"in this sheet"],
             })
             continue
         seen_in_sheet[key] = record["_row"]
 
-        existing_id = (existing.get(account) if account
-                       else existing_by_name.get(resolved["name"].strip().lower()))
+        existing_id = (existing.get((account, company)) if account
+                       else existing_by_name.get(
+                           (resolved["name"].strip().lower(), company)))
+
         if existing_id is not None:
             resolved["_existing_id"] = existing_id
             duplicates.append({
                 "row": record["_row"],
                 "name": resolved["name"],
                 "account_number": resolved["account_number"],
+                "company": resolved["company"],
                 "matched_on": "account number" if account else "name",
                 "existing_id": existing_id,
+            })
+        elif account and account in accounts_seen_before:
+            resolved["_cross_company"] = True
+            cross_company.append({
+                "row": record["_row"],
+                "name": resolved["name"],
+                "account_number": resolved["account_number"],
+                "company": resolved["company"] or "no company",
+                "existing_company": accounts_seen_before[account],
             })
         ok.append(resolved)
 
     return {
         "total_rows": len(records),
-        "importable": len(ok) - len(duplicates),
+        # Plainly new: neither an exact match nor an account seen under another
+        # company. The other two are counted separately because each is a
+        # question rather than a number.
+        "importable": len(ok) - len(duplicates) - len(cross_company),
         "duplicate_count": len(duplicates),
+        "cross_company_count": len(cross_company),
         "error_count": len(errors),
         "duplicates": duplicates[:PREVIEW_ROWS],
+        "cross_company": cross_company[:PREVIEW_ROWS],
         "errors": errors[:PREVIEW_ROWS],
         "errors_truncated": len(errors) > PREVIEW_ROWS,
         "duplicates_truncated": len(duplicates) > PREVIEW_ROWS,
+        "cross_company_truncated": len(cross_company) > PREVIEW_ROWS,
         "columns_detected": detected,
         "unmapped_headers": unmapped,
         "preview": [
@@ -442,18 +481,26 @@ async def analyse(conn, grid: list[list[str]]) -> dict:
     }
 
 
-async def commit(conn, analysis: dict, on_duplicate: str) -> dict:
+async def commit(conn, analysis: dict, on_duplicate: str,
+                 on_cross_company: str = "add") -> dict:
     """Write the rows the analysis found acceptable.
 
-    on_duplicate is 'skip' or 'overwrite' and only applies to rows matched on
-    account number. Rows carrying no account number cannot be matched at all and
-    are always inserted — there is nothing to compare them against.
+    on_duplicate is 'skip' or 'overwrite' and applies to rows matched to an
+    existing beneficiary on account AND company, or on name and company for the
+    rows that have no account number.
+
+    on_cross_company is 'add' or 'skip' and applies to rows whose account number
+    exists under a DIFFERENT company. 'add' treats it as that company's own copy
+    of the payee — the normal case for a group. 'skip' leaves it out, which is
+    what to choose when the repeat looks like a paste error instead.
 
     One transaction, because a half-applied sheet is worse than a refused one:
     you cannot tell by looking which half went in.
     """
     if on_duplicate not in ("skip", "overwrite"):
         raise RuntimeError("on_duplicate must be 'skip' or 'overwrite'.")
+    if on_cross_company not in ("add", "skip"):
+        raise RuntimeError("on_cross_company must be 'add' or 'skip'.")
 
     inserted = updated = skipped = 0
     columns = ", ".join(COLUMNS)
@@ -465,7 +512,9 @@ async def commit(conn, analysis: dict, on_duplicate: str) -> dict:
             values = [row.get(c) for c in COLUMNS]
             existing_id = row.get("_existing_id")
 
-            if existing_id is None:
+            if row.get("_cross_company") and on_cross_company == "skip":
+                skipped += 1
+            elif existing_id is None:
                 await conn.execute(
                     f"INSERT INTO beneficiary_master ({columns}) "
                     f"VALUES ({placeholders})", *values)
