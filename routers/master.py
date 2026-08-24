@@ -29,11 +29,19 @@ _TABLES = {
     'bank': {
         'label': 'Bank',
         'table': 'bank_master',
-        'fields': ['bank_name', 'account_number', 'ifsc_code'],
-        'labels': {'bank_name': 'Bank Name', 'account_number': 'Account Number', 'ifsc_code': 'IFSC Code'},
+        'fields': ['bank_name', 'account_number', 'ifsc_code', 'account_type',
+                   'company'],
+        'labels': {'bank_name': 'Bank Name', 'account_number': 'Account Number',
+                   'ifsc_code': 'IFSC Code', 'account_type': 'Type',
+                   'company': 'Company'},
+        # Both chosen from this company's own master tables, not typed. See
+        # company/015_bank_account_type.sql and 016_bank_company.sql on why the
+        # name is stored rather than a reference to it.
+        'options_from': {'account_type': 'account_type', 'company': 'company'},
         'unique': ['bank_name', 'account_number'],
         'required': ['bank_name'],
-        'columns': ['id', 'bank_name', 'account_number', 'ifsc_code', 'is_active', 'created_at', 'updated_at'],
+        'columns': ['id', 'bank_name', 'account_number', 'ifsc_code', 'account_type',
+                    'company', 'is_active', 'created_at', 'updated_at'],
         'order_by': 'bank_name',
         'label_field': 'bank_name',
     },
