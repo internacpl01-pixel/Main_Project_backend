@@ -37,18 +37,23 @@ _TABLES = {
         'label': 'Bank',
         'table': 'bank_master',
         'fields': ['bank_name', 'account_number', 'ifsc_code', 'account_type',
-                   'company'],
+                   'company', 'project'],
         'labels': {'bank_name': 'Bank Name', 'account_number': 'Account Number',
                    'ifsc_code': 'IFSC Code', 'account_type': 'Type',
-                   'company': 'Company'},
-        # Both chosen from this company's own master tables, not typed. See
-        # company/015_bank_account_type.sql and 016_bank_company.sql on why the
-        # name is stored rather than a reference to it.
-        'options_from': {'account_type': 'account_type', 'company': 'company'},
+                   'company': 'Company', 'project': 'Project'},
+        # All chosen from a list, not typed. See company/015, 016 and 023 on why
+        # the name is stored rather than a reference to it.
+        #
+        # 'project' is the one source that is NOT a master type: it comes from
+        # GET /projects, which applies the project scoping rules. Reading it
+        # through a master route instead would list every project to everyone,
+        # which is the thing that scoping exists to prevent.
+        'options_from': {'account_type': 'account_type', 'company': 'company',
+                         'project': 'project'},
         'unique': ['bank_name', 'account_number'],
         'required': ['bank_name'],
         'columns': ['id', 'bank_name', 'account_number', 'ifsc_code', 'account_type',
-                    'company', 'is_active', 'created_at', 'updated_at'],
+                    'company', 'project', 'is_active', 'created_at', 'updated_at'],
         'order_by': 'bank_name',
         'label_field': 'bank_name',
     },

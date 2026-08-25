@@ -439,6 +439,39 @@ async def transaction_summary(
     return [dict(r) for r in rows]
 
 
+@router.delete("/all", dependencies=[Depends(require_level(permissions.COMPANY_ADMIN))])
+async def delete_all_transactions(user: dict = Depends(get_company_user)):
+    """Empty the ledger.
+
+    Company admin only, not manager. Clearing staging throws away work nobody
+    has posted yet; this throws away the posted record itself, and the two are
+    not the same decision.
+
+    It is recoverable, which is the reason it can exist at all. Posting a row
+    does not consume it: the temp_trans row stays, still classified, and the
+    only thing stopping it being posted twice is UNIQUE (temp_trans_id) on this
+    table. Remove the transaction and that row becomes postable again -- so
+    "delete the ledger" means "un-post everything", not "lose it". Anything
+    imported is still in Imported Rows with its classification intact.
+
+    No scoping filter. A partial wipe of somebody's visible projects would leave
+    a ledger that balances for nobody, and the level required here already
+    exceeds the level at which project scoping applies.
+    """
+    async with company_connection(user["schema"]) as conn:
+        async with conn.transaction():
+            total = await conn.fetchval("SELECT count(*) FROM transactions")
+            # Counted before the delete: afterwards there is nothing left to
+            # join against and the number would always be zero.
+            restored = await conn.fetchval(
+                "SELECT count(*) FROM transactions WHERE temp_trans_id IS NOT NULL")
+            await conn.execute("DELETE FROM transactions")
+
+    logger.info("[ledger] cleared: %d transactions, %d rows back to postable",
+                total, restored)
+    return {"deleted": total, "rows_postable_again": restored}
+
+
 # ---------- Temp Import (raw rows before finalization) -----------------------
 
 @router.get("/temp-trans")
