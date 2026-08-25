@@ -50,6 +50,11 @@ _TABLES = {
         # which is the thing that scoping exists to prevent.
         'options_from': {'account_type': 'account_type', 'company': 'company',
                          'project': 'project'},
+        # Stores 'DPL', not the full registered name — same as beneficiary. The
+        # two columns are filled from the same dropdown and end up compared to
+        # each other, so one holding a different form of the same value is the
+        # kind of thing only discovered when a report groups by it.
+        'options_value': {'company': 'abbreviation'},
         'unique': ['bank_name', 'account_number'],
         'required': ['bank_name'],
         'columns': ['id', 'bank_name', 'account_number', 'ifsc_code', 'account_type',
