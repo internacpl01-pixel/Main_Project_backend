@@ -22,7 +22,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 import permissions
 from database import company_connection
 from routers.auth import get_company_user, get_current_schema, require_level
-from services import custom_fields, scoping
+from services import custom_fields, scoping, staging
 
 logger = logging.getLogger(__name__)
 
@@ -437,6 +437,37 @@ async def transaction_summary(
             *params,
         )
     return [dict(r) for r in rows]
+
+
+@router.post("/fill-company", dependencies=[Depends(require_manager)])
+async def fill_company(user: dict = Depends(get_company_user)):
+    """Set Company on every staged and posted row from its account number.
+
+    The import already does this for the batch it just staged. This is for the
+    other direction in time: a statement imported before its bank account was
+    added to Master Data has a blank Company, and adding the account should fill
+    it in rather than requiring a re-import.
+
+    Safe to run repeatedly. It only writes where the value would change, and
+    leaves rows whose account matches no bank exactly as they are.
+    """
+    async with company_connection(user["schema"]) as conn:
+        async with conn.transaction():
+            staged = await staging.fill_company_from_bank(conn, table="temp_trans")
+            posted = await staging.fill_company_from_bank(conn, table="transactions")
+
+    if staged.get("skipped"):
+        raise HTTPException(400, staged["reason"])
+
+    return {
+        "staged_updated": staged["updated"],
+        "posted_updated": posted["updated"],
+        "account_column": staged["account_column"],
+        "company_column": staged["company_column"],
+        # Account numbers on staged rows that no bank record carries. The usual
+        # reason nothing was filled, and the only one the user can act on.
+        "unmatched_accounts": staged["unmatched_accounts"],
+    }
 
 
 @router.delete("/all", dependencies=[Depends(require_level(permissions.COMPANY_ADMIN))])
