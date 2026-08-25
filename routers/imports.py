@@ -2,7 +2,8 @@
 Import routes — PDF, Excel and CSV bank statements.
 
 POST   /imports/pdf              — parse a PDF; save=false previews, save=true stages
-POST   /imports/excel            — same, for .xlsx / .xls
+POST   /imports/excel/inspect    — list a workbook's sheets, without writing
+POST   /imports/excel            — same as /pdf, for .xlsx / .xls; one batch per sheet
 POST   /imports/csv              — same, for .csv
 GET    /imports/batches          — list uploads for this company
 GET    /imports/batches/{id}     — one batch with its staged rows
@@ -30,7 +31,8 @@ from services import jobs
 from services.pdf_import import (PDF_BATCH_PAGES, process_pdf_import,
                                  start_pdf_job)
 from services.staging import DuplicateFileError
-from services.tabular_import import READERS, process_tabular_import
+from services.tabular_import import (READERS, inspect_tabular,
+                                     process_tabular_import, start_tabular_job)
 
 router = APIRouter(prefix="/imports", tags=["imports"])
 
@@ -181,22 +183,29 @@ async def get_import_job(job_id: str, user: dict = Depends(get_company_user)):
     return job
 
 
-async def _import_tabular(kind: str, file: UploadFile, save: bool, bank_id, user: dict):
+async def _import_tabular(kind: str, file: UploadFile, save: bool, bank_id,
+                          user: dict, sheets: str = "", background: bool = False):
     """Shared body for the Excel and CSV routes — only the reader differs."""
     _, allowed = READERS[kind]
     file_bytes = await _read_upload(file, allowed)
-    logger.info("[Import] %s %s save=%s schema=%s", kind, file.filename, save, user["schema"])
+    logger.info("[Import] %s %s save=%s sheets=%r background=%s schema=%s",
+                kind, file.filename, save, sheets, background, user["schema"])
+
+    call = dict(
+        schema=user["schema"],
+        file_bytes=file_bytes,
+        filename=file.filename,
+        username=user["username"],
+        kind=kind,
+        bank_id=_clean_bank_id(bank_id),
+        save=save,
+        sheets=sheets or "",
+    )
 
     try:
-        return await process_tabular_import(
-            schema=user["schema"],
-            file_bytes=file_bytes,
-            filename=file.filename,
-            username=user["username"],
-            kind=kind,
-            bank_id=_clean_bank_id(bank_id),
-            save=save,
-        )
+        if background:
+            return await start_tabular_job(**call)
+        return await process_tabular_import(**call)
     except (DuplicateFileError, RuntimeError) as e:
         raise _to_http(e)
     except Exception as e:
@@ -206,15 +215,65 @@ async def _import_tabular(kind: str, file: UploadFile, save: bool, bank_id, user
         )
 
 
+@router.post("/excel/inspect")
+async def inspect_excel(
+    file: UploadFile = File(...),
+    user: dict = Depends(get_company_user),
+):
+    """What is in this workbook, sheet by sheet. Nothing is written.
+
+    This is the spreadsheet's answer to the PDF page selector, and it has to run
+    before the user can choose anything: a workbook holds one sheet per account,
+    and the tab names alone do not say which sheets are statements, how many
+    rows each holds, or whether their columns were recognised.
+
+    Each sheet comes back with `is_statement` — decided on structure, not on the
+    sheet's name — plus its header row, the columns that matched, the ones that
+    did not, and a five-row sample. A pivot table or a beneficiary list is
+    reported with the reason it is not importable rather than left out, so a
+    sheet that SHOULD have been a statement is visibly not one.
+    """
+    file_bytes = await _read_upload(file, (".xlsx", ".xls"))
+    try:
+        return await inspect_tabular(user["schema"], file_bytes, "excel")
+    except RuntimeError as e:
+        raise _to_http(e)
+    except Exception as e:
+        logger.exception("Unexpected error inspecting workbook")
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR, f"Failed to read workbook: {e}"
+        )
+
+
 @router.post("/excel")
 async def import_excel(
     file: UploadFile = File(...),
     save: bool = Form(False, description="false previews, true stages a batch"),
     bank_id: int = Form(None, description="bank_master.id this statement belongs to"),
+    sheets: str = Form(
+        "",
+        description="Comma-separated sheet names to import. Blank imports every "
+                    "sheet that looks like a statement.",
+    ),
+    background: bool = Form(
+        False,
+        description="true returns a job id immediately; poll GET /imports/jobs/{id}",
+    ),
     user: dict = Depends(get_company_user),
 ):
-    """Parse an Excel bank statement. Same two-step flow as /imports/pdf."""
-    return await _import_tabular("excel", file, save, bank_id, user)
+    """Parse an Excel bank statement. Same flow and same options as /imports/pdf.
+
+    A workbook is not one statement. Each sheet is staged as its own batch, so
+    eight accounts on eight tabs become eight batches that can be discarded,
+    filtered and tied to a bank independently. `sheets` chooses which tabs to
+    take — the spreadsheet equivalent of the PDF page range — and blank takes
+    every sheet that has a date column and a money column.
+
+    background=true answers with a job id and reports progress per sheet, the
+    same way a long PDF does.
+    """
+    return await _import_tabular("excel", file, save, bank_id, user,
+                                 sheets=sheets, background=background)
 
 
 @router.post("/csv")
@@ -222,15 +281,21 @@ async def import_csv(
     file: UploadFile = File(...),
     save: bool = Form(False, description="false previews, true stages a batch"),
     bank_id: int = Form(None, description="bank_master.id this statement belongs to"),
+    background: bool = Form(
+        False,
+        description="true returns a job id immediately; poll GET /imports/jobs/{id}",
+    ),
     user: dict = Depends(get_company_user),
 ):
     """
-    Parse a CSV bank statement. Same two-step flow as /imports/pdf.
+    Parse a CSV bank statement. Same flow as /imports/pdf.
 
     The delimiter is sniffed (comma, semicolon, tab or pipe) and a UTF-8 BOM is
-    stripped, so a CSV exported from Excel imports without pre-editing.
+    stripped, so a CSV exported from Excel imports without pre-editing. A CSV is
+    a single sheet, so there is nothing to select.
     """
-    return await _import_tabular("csv", file, save, bank_id, user)
+    return await _import_tabular("csv", file, save, bank_id, user,
+                                 background=background)
 
 
 @router.get("/batches")
