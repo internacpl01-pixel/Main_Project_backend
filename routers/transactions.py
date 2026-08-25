@@ -47,12 +47,20 @@ _MASTER_LOOKUPS = {
 }
 
 # Which master table backs each value of fieldmap.mirrors — see
-# company/019_fieldmap_mirrors.sql. Keyed by the mirrors value, not the id
-# column, because that is what the fieldmap row stores.
+# company/019_fieldmap_mirrors.sql and 025_fieldmap_mirrors_project.sql. Keyed
+# by the mirrors value, not the id column, because that is what the fieldmap row
+# stores.
+#
+# All five Classify pickers are here. Which of them a company actually mirrors
+# is the fieldmap's answer: company_028 mirrors four (BUSINESS UNIT is its
+# Project column), companies with no custom fields mirror none, and nothing is
+# written for a classification no column claims.
 _MIRROR_TABLES = {
     "head": "head_master",
     "rera_head": "rera_head_master",
     "idw_head": "idw_head_master",
+    "project": "projects",
+    "beneficiary": "beneficiary_master",
 }
 
 # A fieldmap row names a physical column, and that name is interpolated into the
@@ -1244,10 +1252,16 @@ async def classify_row(
         # staging table shows the classification instead of an em dash. The _id
         # columns above are still the real record — finalize reads those, not
         # these — and a company with no mirroring column gets nothing extra.
+        #
+        # All five, not the three heads. Picking a project set project_id and
+        # left BUSINESS UNIT — the column that means Project — blank, so from
+        # the table the Project dropdown appeared to do nothing at all.
         for column, name in (await _mirror_values(conn, {
             "head": head_id,
             "rera_head": rera_head_id,
             "idw_head": idw_head_id,
+            "project": project_id,
+            "beneficiary": beneficiary_id,
         })).items():
             _set(column, name)
 
