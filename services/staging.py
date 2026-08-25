@@ -58,6 +58,28 @@ async def _resolve_field(conn, aliases: set[str]) -> str | None:
     return None
 
 
+async def account_column(conn) -> str | None:
+    """The column holding the account number a row was printed under, or None.
+
+    Public because the Account Number filter on the staging and ledger screens
+    has to mean the same column this module fills Company from. Two independent
+    answers to "which column is the account number" would drift the first time
+    a company renamed the field, and the symptom would be a filter that silently
+    matches nothing.
+    """
+    return await _resolve_field(conn, _ACCOUNT_ALIASES)
+
+
+async def company_column(conn) -> str | None:
+    """The column this module writes the owning company into, or None.
+
+    None is the normal answer for a company that has not added the field --
+    company_001 has an account number column and no Company column -- so callers
+    have to handle it rather than assume the column exists.
+    """
+    return await _resolve_field(conn, _COMPANY_ALIASES)
+
+
 async def fill_company_from_bank(conn, *, table: str = "temp_trans",
                                  batch_id: int | None = None) -> dict:
     """Set each row's Company from the bank that owns its account number.

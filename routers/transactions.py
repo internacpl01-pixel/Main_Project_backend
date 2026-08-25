@@ -223,6 +223,294 @@ def _search_filter(term: str, columns: list[dict], extra_exprs: tuple[str, ...],
     return "(" + " AND ".join(clauses) + ")", params, idx
 
 
+# ---------- Sorting ----------------------------------------------------------
+
+# Columns whose values sort by byte order unless they are folded first. Without
+# this 'AXIS' and 'axis' land in different halves of the alphabet and every
+# capitalised entry sorts above every lowercase one, which reads as the sort
+# being broken rather than as ASCII order.
+_TEXT_TYPES = frozenset({"text", "character varying", "character", "name"})
+
+# Sortable things that are not data columns: the row's own position, its
+# workflow state, and the master names the joins resolve. Sorting by Head means
+# sorting by the head's name, not by head_id -- an id sorts by creation order,
+# which is not an order anybody asked for.
+_TEMP_EXTRA_SORTS = {
+    "row_number":       ("t.row_number", "integer"),
+    "batch_id":         ("t.batch_id", "integer"),
+    "is_classified":    ("t.is_classified", "boolean"),
+    "created_at":       ("t.created_at", "timestamp"),
+    "project_name":     ("p.name", "text"),
+    "project_code":     ("p.code", "text"),
+    "head_name":        ("h.name", "text"),
+    "rera_head_name":   ("rh.name", "text"),
+    "idw_head_name":    ("ih.name", "text"),
+    "beneficiary_name": ("bn.name", "text"),
+}
+
+_LEDGER_EXTRA_SORTS = {
+    "id":           ("t.id", "integer"),
+    "created_at":   ("t.created_at", "timestamp"),
+    "project_name": ("p.name", "text"),
+    "project_code": ("p.code", "text"),
+    "head_name":    ("h.name", "text"),
+    "bank_name":    ("b.bank_name", "text"),
+}
+
+
+def _sort_clause(sort: str | None, direction: str, columns: list[dict],
+                 extra: dict[str, tuple[str, str]],
+                 default: str) -> tuple[str, str | None, str]:
+    """ORDER BY for the requested column, plus the sort actually applied.
+
+    A whitelist, because ORDER BY takes no bind parameter -- the only thing safe
+    to put in the string is a name this server produced. The keys come from
+    data_columns(), which reads the catalog, so a custom field is sortable the
+    moment it exists and nothing here needs updating.
+
+    An unrecognised name falls back to the default order rather than 400-ing. A
+    bookmark naming a field that has since been deleted should still list rows;
+    the response says which sort was applied, so the screen can correct itself.
+
+    NULLS LAST in both directions. A blank cell is not the smallest value, it is
+    an unknown one, and someone sorting by amount to find the largest wants the
+    largest first, not forty blanks.
+
+    The default order is kept as the tiebreak, and that is what makes paging
+    stable. Sorting on a column full of duplicates otherwise leaves the rest of
+    the order to the plan, which can differ between the page-1 and page-2
+    queries -- one row shown twice and another never shown at all.
+    """
+    known: dict[str, tuple[str, str]] = {
+        c["name"]: (f"t.{c['name']}", c.get("type") or "") for c in columns
+    }
+    known.update(extra)
+
+    if sort not in known:
+        return default, None, "asc"
+
+    expr, coltype = known[sort]
+    if coltype.lower() in _TEXT_TYPES:
+        expr = f"lower({expr})"
+    way = "desc" if (direction or "").strip().lower() == "desc" else "asc"
+    return f"{expr} {way.upper()} NULLS LAST, {default}", sort, way
+
+
+# ---------- Filters (Date / Account Number / Company) ------------------------
+
+# What the Account and Company dropdowns send for "rows with nothing in this
+# column". A distinct-values list has to be able to offer that -- the rows whose
+# account matched no bank are exactly the ones worth looking at -- and an empty
+# string cannot carry it, because an empty query param means "no filter".
+BLANK = "__none__"
+
+_DATE_TYPES = frozenset({
+    "date", "timestamp without time zone", "timestamp with time zone",
+})
+
+
+def _as_date(value: str, label: str):
+    """Parse a YYYY-MM-DD filter bound, or 400.
+
+    Parsed here rather than handed to Postgres as text. A malformed date reaching
+    the database is an unhandled DataError and a 500; parsed here it is a
+    sentence naming which of the two calendars is wrong.
+
+    The value goes on as a real date object, so the comparison is date-to-date
+    and never string-to-string -- '9' sorting after '10' is exactly the bug that
+    kind of comparison produces.
+    """
+    from datetime import date as _date
+    try:
+        return _date.fromisoformat((value or "").strip())
+    except ValueError:
+        raise HTTPException(
+            400, f"{label} must be a date in YYYY-MM-DD form, not {value!r}."
+        )
+
+
+def _date_expr(date_col: str, columns: list[dict]) -> str:
+    """t.<date column>, cast only if the column is not already a date type.
+
+    Nearly every company maps its date field to a DATE column and the cast is
+    not needed. A company that mapped it to text still gets a working range
+    filter instead of an operator-does-not-exist error.
+    """
+    coltype = next(
+        (c.get("type") or "" for c in columns if c["name"] == date_col), ""
+    )
+    return f"t.{date_col}" if coltype.lower() in _DATE_TYPES else f"t.{date_col}::date"
+
+
+async def _facet_filters(conn, *, columns: list[dict], filters: list[str],
+                         params: list, idx: int, date_from: str | None,
+                         date_to: str | None, account: str | None,
+                         company: str | None) -> int:
+    """Append the Date / Account / Company clauses. Returns the next $n.
+
+    Which physical column each of the three means is resolved from the fieldmap,
+    never hardcoded: the account number is field_text_17 in one company and can
+    be anything in another, and company_001 has no Company column at all. Asking
+    for a filter the company has no column for is a 400 that says so, rather
+    than a filter that quietly matches every row.
+
+    The account match is on digits only, the same rule the Company fill uses --
+    '1200 2464 2195' and '120024642195' are one account, and a filter that
+    disagreed with the fill would show rows filled with a company it claims are
+    a different account.
+    """
+    if date_from or date_to:
+        date_col = await custom_fields.date_column(conn)
+        if not date_col:
+            raise HTTPException(
+                400, "Cannot filter by date: this company has no date field "
+                     "mapped. Add one on the Field Mapping page."
+            )
+        expr = _date_expr(date_col, columns)
+        if date_from:
+            filters.append(f"{expr} >= ${idx}")
+            params.append(_as_date(date_from, "The From date"))
+            idx += 1
+        if date_to:
+            filters.append(f"{expr} <= ${idx}")
+            params.append(_as_date(date_to, "The To date"))
+            idx += 1
+
+    if account:
+        col = await staging.account_column(conn)
+        if not col:
+            raise HTTPException(
+                400, "Cannot filter by account number: this company has no "
+                     "account number field mapped."
+            )
+        if account == BLANK:
+            filters.append(f"(t.{col} IS NULL OR btrim(t.{col}) = '')")
+        else:
+            # ::text so Postgres knows the parameter's type inside
+            # regexp_replace; an untyped $n there is 'could not determine data
+            # type of parameter'.
+            filters.append(
+                f"regexp_replace(coalesce(t.{col}, ''), '\\D', '', 'g') "
+                f"= regexp_replace(${idx}::text, '\\D', '', 'g')"
+            )
+            params.append(account)
+            idx += 1
+
+    if company:
+        col = await staging.company_column(conn)
+        if not col:
+            raise HTTPException(
+                400, "Cannot filter by company: this company has no Company "
+                     "field mapped. Add one on the Custom Fields page."
+            )
+        if company == BLANK:
+            filters.append(f"(t.{col} IS NULL OR btrim(t.{col}) = '')")
+        else:
+            # Case-insensitive: the values are abbreviations written by hand in
+            # Master Data, and 'dpl' should not be a different company from 'DPL'.
+            filters.append(f"lower(btrim(t.{col})) = lower(btrim(${idx}::text))")
+            params.append(company)
+            idx += 1
+
+    return idx
+
+
+async def _distinct_values(conn, table: str, column: str, where: str,
+                           params: list) -> dict:
+    """{values: [{value, count}], blank: n} for one filter dropdown.
+
+    Counts come back with the values so the dropdown can say "DPL (128)". They
+    are what turns a list of account numbers into something you can act on --
+    a number with 3 rows against a number with 400 is usually a parse artefact.
+
+    Blanks are counted separately rather than listed as a value, because they
+    are one option in the dropdown regardless of how many distinct kinds of
+    empty (NULL, '', '  ') are underneath.
+    """
+    rows = await conn.fetch(
+        f"""
+        SELECT btrim(t.{column}) AS value, count(*) AS n
+          FROM {table} t
+         WHERE {where}
+           AND t.{column} IS NOT NULL
+           AND btrim(t.{column}) <> ''
+         GROUP BY 1
+         ORDER BY 1
+        """,
+        *params,
+    )
+    blank = await conn.fetchval(
+        f"""
+        SELECT count(*) FROM {table} t
+         WHERE {where}
+           AND (t.{column} IS NULL OR btrim(t.{column}) = '')
+        """,
+        *params,
+    )
+    return {
+        "values": [{"value": r["value"], "count": r["n"]} for r in rows],
+        "blank": blank,
+    }
+
+
+async def _filter_options(conn, table: str, where: str, params: list) -> dict:
+    """Everything the three filter buttons need to draw themselves.
+
+    One request on page load instead of three, and it reports which columns it
+    resolved -- a company with no Company field gets company: null and the
+    button greys itself out with a reason, rather than offering a filter that
+    cannot work.
+
+    Read across the whole table, not the current tab. A dropdown that only
+    offers the accounts present in the rows you are already looking at cannot be
+    used to change what you are looking at.
+    """
+    columns = await custom_fields.data_columns(conn)
+    label = {c["name"]: c.get("displayname") or c["name"] for c in columns}
+
+    date_col = await custom_fields.date_column(conn)
+    account_col = await staging.account_column(conn)
+    company_col = await staging.company_column(conn)
+
+    out: dict = {
+        "date": None, "account": None, "company": None,
+        "total": await conn.fetchval(
+            f"SELECT count(*) FROM {table} t WHERE {where}", *params),
+    }
+
+    if date_col:
+        expr = _date_expr(date_col, columns)
+        span = await conn.fetchrow(
+            f"SELECT min({expr}) AS lo, max({expr}) AS hi "
+            f"FROM {table} t WHERE {where}",
+            *params,
+        )
+        out["date"] = {
+            "column": date_col,
+            "label": label.get(date_col, date_col),
+            # Seeds the two calendars, and bounds them: a range outside the data
+            # can only ever return nothing.
+            "min": span["lo"].isoformat() if span["lo"] else None,
+            "max": span["hi"].isoformat() if span["hi"] else None,
+        }
+
+    if account_col:
+        out["account"] = {
+            "column": account_col,
+            "label": label.get(account_col, account_col),
+            **await _distinct_values(conn, table, account_col, where, params),
+        }
+
+    if company_col:
+        out["company"] = {
+            "column": company_col,
+            "label": label.get(company_col, company_col),
+            **await _distinct_values(conn, table, company_col, where, params),
+        }
+
+    return out
+
+
 async def _assert_live_master_ids(conn, values: dict) -> None:
     """Every non-null id must name an active row in this company's masters.
 
@@ -253,8 +541,20 @@ async def _assert_live_master_ids(conn, values: dict) -> None:
 async def list_transactions(
     project_id: int = None,
     head_id: int = None,
-    date_from: str = None,
-    date_to: str = None,
+    date_from: str = Query(None, description="Start of the date range, YYYY-MM-DD."),
+    date_to: str = Query(None, description="End of the date range, YYYY-MM-DD."),
+    account: str = Query(
+        None,
+        description='Account number the row was printed under. Matched on '
+                    'digits only. Pass "__none__" for rows with no account.',
+    ),
+    company: str = Query(
+        None,
+        description='Company the row belongs to. Pass "__none__" for rows with '
+                    'no company set.',
+    ),
+    sort: str = Query(None, description="Column to sort by; unknown names are ignored."),
+    dir: str = Query("asc", description="asc or desc."),
     search: str = Query(
         "",
         description='Free text over every column and master name, across the '
@@ -277,12 +577,15 @@ async def list_transactions(
       head_id     — only transactions for this head
       date_from   — start date (YYYY-MM-DD)
       date_to     — end date (YYYY-MM-DD)
+      account     — account number, matched on digits only
+      company     — company abbreviation, matched case-insensitively
+      sort, dir   — order by any listed column or joined master name
       search      — free text, matched against every column on the row
       page, limit — pagination; `total` in the response is the unpaged count
 
-    Returns {columns, rows, total, page, limit}. It returned a bare array until
-    it was paged; anything summing the response has to read `total` now, because
-    rows is one page and len(rows) is a page size, not a count.
+    Returns {columns, rows, total, page, limit, sort, dir}. It returned a bare
+    array until it was paged; anything summing the response has to read `total`
+    now, because rows is one page and len(rows) is a page size, not a count.
     """
     filters = ["1=1"]
     params = []
@@ -297,27 +600,24 @@ async def list_transactions(
         params.append(head_id)
         idx += 1
     async with company_connection(user["schema"]) as conn:
-        # Which column holds the date is the fieldmap's answer, not a constant.
-        # Applied here rather than above because it needs a connection.
-        date_col = await custom_fields.date_column(conn)
-        if date_col:
-            for value, op in ((date_from, ">="), (date_to, "<=")):
-                if value is not None:
-                    filters.append(f"{date_col} {op} ${idx}")
-                    params.append(value)
-                    idx += 1
-
         # Same rule as staging: the ledger reports its own columns rather than
         # asserting a fixed set, and they are the same set because the two
         # tables are kept in step.
         columns = await custom_fields.data_columns(conn)
+
+        # Date, account number and company. Which column each of the three means
+        # is the fieldmap's answer, not a constant, so this needs the connection.
+        idx = await _facet_filters(
+            conn, columns=columns, filters=filters, params=params, idx=idx,
+            date_from=date_from, date_to=date_to, account=account, company=company,
+        )
 
         scope = await scoping.visible_project_ids(conn, user)
         if scoping.scope_is_empty(scope):
             # Still report the columns. An empty result is a row count of zero,
             # not a table with no shape — the client draws its header from this.
             return {"columns": columns, "rows": [], "total": 0,
-                    "page": page, "limit": limit}
+                    "page": page, "limit": limit, "sort": None, "dir": "asc"}
         # include_unassigned=False: the "unfiled rows belong to everyone" rule
         # exists so a fresh import can be classified, which only concerns
         # staging. A row that reached the ledger with no project is filed data
@@ -353,6 +653,16 @@ async def list_transactions(
 
         total = await conn.fetchval(f"SELECT count(*) {joins} WHERE {where}", *params)
 
+        # Newest first when nothing is asked for, which is what a ledger is
+        # usually read in. t.id DESC is the tiebreak and also the whole order
+        # for a company with no date field.
+        date_col = await custom_fields.date_column(conn)
+        default_order = (f"t.{date_col} DESC NULLS LAST, t.id DESC"
+                         if date_col else "t.id DESC")
+        order_by, sort_applied, dir_applied = _sort_clause(
+            sort, dir, columns, _LEDGER_EXTRA_SORTS, default_order
+        )
+
         rows = await conn.fetch(
             f"""
             SELECT t.id, t.temp_trans_id, t.created_at,
@@ -365,7 +675,7 @@ async def list_transactions(
                    b.bank_name
             {joins}
             WHERE {where}
-            ORDER BY {f't.{date_col} DESC,' if date_col else ''} t.id DESC
+            ORDER BY {order_by}
             LIMIT ${idx} OFFSET ${idx + 1}
             """,
             *params, limit, (page - 1) * limit,
@@ -376,6 +686,11 @@ async def list_transactions(
         "total": total,
         "page": page,
         "limit": limit,
+        # What was actually ordered by, which is not always what was asked for.
+        # A sort naming a deleted field falls back rather than erroring, and the
+        # screen needs to know so its header arrow does not claim otherwise.
+        "sort": sort_applied,
+        "dir": dir_applied,
     }
 
 
@@ -401,10 +716,17 @@ async def transaction_summary(
         # Applied here rather than above because it needs a connection.
         date_col = await custom_fields.date_column(conn)
         if date_col:
-            for value, op in ((date_from, ">="), (date_to, "<=")):
+            # Parsed, not passed straight through. The bound is compared against
+            # a DATE column, so asyncpg types the parameter as a date and a bare
+            # string raised DataError -- a 500 on what is a bad request. Latent
+            # until now because the dashboard calls this with no range at all.
+            columns = await custom_fields.data_columns(conn)
+            expr = _date_expr(date_col, columns)
+            for value, op, label in ((date_from, ">=", "The From date"),
+                                     (date_to, "<=", "The To date")):
                 if value is not None:
-                    filters.append(f"{date_col} {op} ${idx}")
-                    params.append(value)
+                    filters.append(f"{expr} {op} ${idx}")
+                    params.append(_as_date(value, label))
                     idx += 1
 
         scope = await scoping.visible_project_ids(conn, user)
@@ -509,6 +831,20 @@ async def delete_all_transactions(user: dict = Depends(get_company_user)):
 async def list_temp_trans(
     batch_id: int = None,
     classified: bool = None,
+    date_from: str = Query(None, description="Start of the date range, YYYY-MM-DD."),
+    date_to: str = Query(None, description="End of the date range, YYYY-MM-DD."),
+    account: str = Query(
+        None,
+        description='Account number the row was printed under. Matched on '
+                    'digits only. Pass "__none__" for rows with no account.',
+    ),
+    company: str = Query(
+        None,
+        description='Company the row belongs to. Pass "__none__" for rows with '
+                    'no company set.',
+    ),
+    sort: str = Query(None, description="Column to sort by; unknown names are ignored."),
+    dir: str = Query("asc", description="asc or desc."),
     search: str = Query(
         "",
         description='Free text over every column and master name, across the '
@@ -530,6 +866,15 @@ async def list_temp_trans(
     Params:
       batch_id    — filter by import batch (which PDF upload)
       classified  — true = only classified rows, false = only unclassified
+      date_from,
+      date_to     — the date range, on whichever column the fieldmap calls the
+                    date field. Either end may be given on its own.
+      account     — account number, matched on digits only so a value typed
+                    with spaces still finds rows stored without them
+      company     — company abbreviation, matched case-insensitively
+      sort, dir   — order by any data column or joined master name. An
+                    unrecognised name falls back to batch/row order and the
+                    response reports what was applied.
       search      — free text over every column and every joined master name,
                     matched against the whole table rather than the page being
                     shown. Words are AND-ed and a quoted run stays a phrase;
@@ -572,6 +917,13 @@ async def list_temp_trans(
         columns = await custom_fields.data_columns(conn)
         data_cols = ", ".join(f"t.{c['name']}" for c in columns)
 
+        # Date, account number and company. Resolved from the fieldmap, so the
+        # Account Number filter means the same column the Company fill reads.
+        idx = await _facet_filters(
+            conn, columns=columns, filters=filters, params=params, idx=idx,
+            date_from=date_from, date_to=date_to, account=account, company=company,
+        )
+
         term = (search or "").strip()
         if term:
             clause, sp, idx = _search_filter(
@@ -599,6 +951,12 @@ async def list_temp_trans(
 
         total = await conn.fetchval(f"SELECT count(*) {joins} WHERE {where}", *params)
 
+        # The order the file was read in, when nothing else is asked for — and
+        # the tiebreak under everything else, so paging is stable.
+        order_by, sort_applied, dir_applied = _sort_clause(
+            sort, dir, columns, _TEMP_EXTRA_SORTS, "t.batch_id, t.row_number"
+        )
+
         rows = await conn.fetch(
             f"""
             SELECT t.id, t.batch_id, t.row_number, t.is_classified, t.created_at,
@@ -613,7 +971,7 @@ async def list_temp_trans(
                    bn.name AS beneficiary_name
             {joins}
             WHERE {where}
-            ORDER BY t.batch_id, t.row_number
+            ORDER BY {order_by}
             LIMIT ${idx} OFFSET ${idx + 1}
             """,
             *params, limit, (page - 1) * limit,
@@ -643,7 +1001,57 @@ async def list_temp_trans(
         "total": total,
         "page": page,
         "limit": limit,
+        # What was actually ordered by. A sort naming a field deleted since the
+        # page loaded falls back instead of erroring, and the header arrow has
+        # to follow that rather than claim a sort that did not happen.
+        "sort": sort_applied,
+        "dir": dir_applied,
     }
+
+
+@router.get("/temp-trans/filters")
+async def temp_trans_filter_options(user: dict = Depends(get_company_user)):
+    """The values the Date, Account Number and Company filters can offer.
+
+    Read once when the screen loads instead of three requests, and read across
+    the whole staging table rather than the tab in front of you — a dropdown
+    offering only the accounts already on screen cannot be used to change what
+    is on screen.
+
+    Scoped like the list itself. An account number is not sensitive on its own,
+    but the set of them present in a company's staging is, and a staff member
+    should not learn it from a filter dropdown.
+    """
+    async with company_connection(user["schema"]) as conn:
+        scope = await scoping.visible_project_ids(conn, user)
+        clause, params, _ = scoping.project_filter(scope, "t.project_id", 1)
+        if clause:
+            where = clause
+        elif scoping.scope_is_empty(scope):
+            where = "t.project_id IS NULL"
+        else:
+            where = "1=1"
+        return await _filter_options(conn, "temp_trans", where, params)
+
+
+@router.get("/filters")
+async def transaction_filter_options(user: dict = Depends(get_company_user)):
+    """The same three filters, for the ledger.
+
+    include_unassigned=False, matching the ledger list: a posted row with no
+    project is filed data nobody's project owns and only admins see it, so its
+    account number should not appear in a scoped user's dropdown either.
+    """
+    async with company_connection(user["schema"]) as conn:
+        scope = await scoping.visible_project_ids(conn, user)
+        if scoping.scope_is_empty(scope):
+            return {"date": None, "account": None, "company": None, "total": 0}
+        clause, params, _ = scoping.project_filter(
+            scope, "t.project_id", 1, include_unassigned=False
+        )
+        return await _filter_options(
+            conn, "transactions", clause or "1=1", params
+        )
 
 
 @router.delete("/temp-trans", dependencies=[Depends(require_manager)])
