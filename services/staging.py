@@ -58,6 +58,26 @@ async def _resolve_field(conn, aliases: set[str]) -> str | None:
     return None
 
 
+def account_digits(expr: str) -> str:
+    """SQL reducing an account number to what every spelling of it shares.
+
+    Non-digits go first, so '0455 6320 0000 264' and '045563200000264' agree.
+    Then leading zeros, and that second step is the one that matters: a
+    spreadsheet stores an account number as a NUMBER, so the account this
+    company keeps in Master Data as '045563200000264' arrives from its own Excel
+    export as '45563200000264'. The zero is formatting Excel never kept.
+
+    Comparing on digits alone therefore failed on precisely the accounts that
+    were entered carefully -- and failed silently, leaving Company blank with no
+    error to explain it. Two accounts differing only by leading zeros are the
+    same account; no bank issues both.
+
+    Used by the Company fill and by the Account Number filter, from here, so the
+    two can never disagree about whether a row belongs to an account.
+    """
+    return f"ltrim(regexp_replace(coalesce({expr}, ''), '\\D', '', 'g'), '0')"
+
+
 async def account_column(conn) -> str | None:
     """The column holding the account number a row was printed under, or None.
 
@@ -117,6 +137,9 @@ async def fill_company_from_bank(conn, *, table: str = "temp_trans",
         params.append(batch_id)
         where_batch = f" AND t.batch_id = ${len(params)}"
 
+    bank_acct = account_digits("b.account_number")
+    row_acct = account_digits(f"t.{account_col}")
+
     tag = await conn.execute(
         f"""
         UPDATE {table} t
@@ -125,9 +148,8 @@ async def fill_company_from_bank(conn, *, table: str = "temp_trans",
          WHERE b.company IS NOT NULL
            AND b.account_number IS NOT NULL
            AND t.{account_col} IS NOT NULL
-           AND regexp_replace(b.account_number, '\\D', '', 'g') <> ''
-           AND regexp_replace(b.account_number, '\\D', '', 'g')
-             = regexp_replace(t.{account_col}, '\\D', '', 'g')
+           AND {bank_acct} <> ''
+           AND {bank_acct} = {row_acct}
            AND t.{company_col} IS DISTINCT FROM b.company
            {where_batch}
         """,
@@ -144,8 +166,8 @@ async def fill_company_from_bank(conn, *, table: str = "temp_trans",
            AND NOT EXISTS (
                SELECT 1 FROM bank_master b
                 WHERE b.account_number IS NOT NULL
-                  AND regexp_replace(b.account_number, '\\D', '', 'g')
-                    = regexp_replace(t.{account_col}, '\\D', '', 'g')
+                  AND {bank_acct} <> ''
+                  AND {bank_acct} = {row_acct}
            )
         """
     )

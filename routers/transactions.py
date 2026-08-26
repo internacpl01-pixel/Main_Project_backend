@@ -394,12 +394,14 @@ async def _facet_filters(conn, *, columns: list[dict], filters: list[str],
         if account == BLANK:
             filters.append(f"(t.{col} IS NULL OR btrim(t.{col}) = '')")
         else:
-            # ::text so Postgres knows the parameter's type inside
-            # regexp_replace; an untyped $n there is 'could not determine data
-            # type of parameter'.
+            # The same reduction the Company fill uses — digits only, then
+            # leading zeros — so the filter and the fill can never disagree
+            # about which rows belong to an account. ::text so Postgres can
+            # type the parameter inside regexp_replace; an untyped $n there is
+            # 'could not determine data type of parameter'.
             filters.append(
-                f"regexp_replace(coalesce(t.{col}, ''), '\\D', '', 'g') "
-                f"= regexp_replace(${idx}::text, '\\D', '', 'g')"
+                f"{staging.account_digits(f't.{col}')} "
+                f"= {staging.account_digits(f'${idx}::text')}"
             )
             params.append(account)
             idx += 1
@@ -461,6 +463,103 @@ async def _distinct_values(conn, table: str, column: str, where: str,
     }
 
 
+def _account_label(value: str, company: str | None, account_type: str | None) -> str:
+    """'DPL-MASTER-0264' — the company, the account's type, and its last 4 digits.
+
+    A fifteen-digit account number identifies an account to a database and to
+    nobody else; the three facts a person picks an account by are whose it is,
+    what it is for, and the tail they recognise. Both parts come from the Bank
+    row the number matches, so this is a view of Master Data rather than
+    anything stored twice.
+
+    The type is printed exactly as Master Data holds it, which is upper case by
+    the rule set on that table.
+
+    Degrades rather than invents. Missing either part drops it from the label,
+    and an account no Bank row carries keeps its full number — that is the one
+    case where the digits are the useful thing, because the fix is to go and add
+    the account.
+    """
+    digits = "".join(ch for ch in (value or "") if ch.isdigit())
+    tail = digits[-4:] if len(digits) >= 4 else digits
+    parts = [p.strip() for p in (company, account_type) if p and p.strip()]
+    if not parts or not tail:
+        return value
+    return "-".join(parts + [tail])
+
+
+async def _account_values(conn, table: str, column: str, where: str,
+                          params: list) -> dict:
+    """The Account Number dropdown: distinct values, counts, and their labels.
+
+    The bank lookup is a LATERAL taking one row, not a join. A plain join would
+    multiply the row count by however many Bank entries share an account number,
+    and the count beside each account is the number people use to sanity-check
+    an import — silently doubling it would be worse than not showing it.
+
+    Matched with account_digits, the same reduction the Company fill uses. It
+    has to be: this workbook's own sheets disagree about the leading zero,
+    '045563200000264' on four of them and '45563400002314' on the others, and a
+    dropdown that labelled one and not the other would look like two different
+    kinds of account.
+    """
+    bank_acct = staging.account_digits("b.account_number")
+    value_acct = staging.account_digits("v.value")
+
+    rows = await conn.fetch(
+        f"""
+        SELECT v.value, v.n, b.company, b.account_type, b.bank_name
+          FROM (
+            SELECT btrim(t.{column}) AS value, count(*) AS n
+              FROM {table} t
+             WHERE {where}
+               AND t.{column} IS NOT NULL
+               AND btrim(t.{column}) <> ''
+             GROUP BY 1
+          ) v
+          LEFT JOIN LATERAL (
+            SELECT b.company, b.account_type, b.bank_name
+              FROM bank_master b
+             WHERE b.account_number IS NOT NULL
+               AND {bank_acct} <> ''
+               AND {bank_acct} = {value_acct}
+             -- An archived Bank row still names the account, but a live one
+             -- describes it better, so it wins.
+             ORDER BY b.is_active DESC, b.id
+             LIMIT 1
+          ) b ON true
+         ORDER BY 1
+        """,
+        *params,
+    )
+    blank = await conn.fetchval(
+        f"""
+        SELECT count(*) FROM {table} t
+         WHERE {where}
+           AND (t.{column} IS NULL OR btrim(t.{column}) = '')
+        """,
+        *params,
+    )
+    return {
+        "values": [
+            {
+                "value": r["value"],
+                "count": r["n"],
+                "label": _account_label(r["value"], r["company"], r["account_type"]),
+                "company": r["company"],
+                "account_type": r["account_type"],
+                "bank_name": r["bank_name"],
+                # Said outright rather than left to be inferred from a missing
+                # label: an account with no Bank row is also an account whose
+                # Company can never be filled in, and that is worth seeing here.
+                "in_bank_master": r["bank_name"] is not None,
+            }
+            for r in rows
+        ],
+        "blank": blank,
+    }
+
+
 async def _filter_options(conn, table: str, where: str, params: list) -> dict:
     """Everything the three filter buttons need to draw themselves.
 
@@ -506,7 +605,9 @@ async def _filter_options(conn, table: str, where: str, params: list) -> dict:
         out["account"] = {
             "column": account_col,
             "label": label.get(account_col, account_col),
-            **await _distinct_values(conn, table, account_col, where, params),
+            # Its own reader, not _distinct_values: each account is labelled
+            # from the Bank row it matches.
+            **await _account_values(conn, table, account_col, where, params),
         }
 
     if company_col:

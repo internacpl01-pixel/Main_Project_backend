@@ -64,15 +64,32 @@ def _cell(value) -> str:
     Dates become ISO. Left as datetimes, str() renders "2026-08-04 00:00:00",
     which the date detectors in parsers.py reject — every row would look undated.
 
+    A whole number loses its ".0". Excel has one numeric type, so every integer
+    comes back from openpyxl as a float and str() writes 45563200000264.0 — an
+    account number with a decimal point on the end, a reference number that no
+    longer matches the bank's, and a digits-only comparison that gains a
+    trailing zero. Rendered as an integer it is what the sheet displays.
+
     Excel error values arrive as their literal text ('#NAME?', '#REF!'). They
     are blanked rather than carried: a broken formula is not data, and '#NAME?'
     in a numeric column parses to nothing anyway while still making the cell
     look filled.
+
+    What this cannot recover is a LEADING zero. Excel dropped it when the cell
+    was stored, so '045563200000264' is simply not in the file — which is why
+    account numbers are matched with leading zeros ignored. See
+    services.staging.account_digits.
     """
     if value is None:
         return ""
     if isinstance(value, (datetime, date)):
         return value.strftime("%Y-%m-%d")
+    if isinstance(value, float) and value.is_integer():
+        # Only for values that fit an int exactly. A float big enough to have
+        # lost precision is left as it is rather than dressed up as an exact
+        # integer it no longer is.
+        if abs(value) < 2 ** 53:
+            return str(int(value))
     text = str(value).strip()
     if text.startswith("#") and text.endswith(("?", "!")) and len(text) <= 10:
         return ""
