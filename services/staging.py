@@ -84,6 +84,16 @@ def account_digits(expr: str) -> str:
     return f"ltrim(regexp_replace(coalesce({expr}, ''), '\\D', '', 'g'), '0')"
 
 
+def normalise_account(value: str) -> str:
+    """account_digits, in Python. The same rule, applied to a filter value.
+
+    Kept beside the SQL version rather than derived from it, because the two run
+    on different sides of the wire and the only thing that keeps them honest is
+    sitting next to each other: digits only, then leading zeros.
+    """
+    return "".join(ch for ch in (value or "") if ch.isdigit()).lstrip("0")
+
+
 async def account_column(conn) -> str | None:
     """The column holding the account number a row was printed under, or None.
 

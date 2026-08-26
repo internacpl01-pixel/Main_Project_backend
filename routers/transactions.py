@@ -391,20 +391,34 @@ async def _facet_filters(conn, *, columns: list[dict], filters: list[str],
                 400, "Cannot filter by account number: this company has no "
                      "account number field mapped."
             )
-        if account == BLANK:
-            filters.append(f"(t.{col} IS NULL OR btrim(t.{col}) = '')")
-        else:
-            # The same reduction the Company fill uses — digits only, then
-            # leading zeros — so the filter and the fill can never disagree
-            # about which rows belong to an account. ::text so Postgres can
-            # type the parameter inside regexp_replace; an untyped $n there is
-            # 'could not determine data type of parameter'.
-            filters.append(
-                f"{staging.account_digits(f't.{col}')} "
-                f"= {staging.account_digits(f'${idx}::text')}"
-            )
-            params.append(account)
+
+        # Comma separated, so several accounts can be asked for at once. A
+        # comma cannot occur inside an account number — the values are reduced
+        # to digits before anything is compared — so it needs no escaping, and
+        # the query string stays readable.
+        wanted = [v.strip() for v in account.split(",") if v.strip()]
+        include_blank = BLANK in wanted
+        # Normalised here rather than in SQL: one array parameter and one
+        # comparison, instead of a regexp per value per row. The rule is the
+        # one the Company fill uses, so a filter can never disagree with what
+        # filled the Company column.
+        numbers = sorted({staging.normalise_account(v)
+                          for v in wanted if v != BLANK})
+        numbers = [n for n in numbers if n]
+
+        clauses: list[str] = []
+        if numbers:
+            clauses.append(
+                f"{staging.account_digits(f't.{col}')} = ANY(${idx}::text[])")
+            params.append(numbers)
             idx += 1
+        if include_blank:
+            clauses.append(f"(t.{col} IS NULL OR btrim(t.{col}) = '')")
+
+        # Asked for accounts, none of which can name one — every value was
+        # blank or had no digits in it. Nothing matches, which is the honest
+        # answer; dropping the filter would quietly show the whole table.
+        filters.append("(" + " OR ".join(clauses) + ")" if clauses else "1 = 0")
 
     if company:
         col = await staging.company_column(conn)
@@ -654,8 +668,10 @@ async def list_transactions(
     date_to: str = Query(None, description="End of the date range, YYYY-MM-DD."),
     account: str = Query(
         None,
-        description='Account number the row was printed under. Matched on '
-                    'digits only. Pass "__none__" for rows with no account.',
+        description='Account numbers the rows were printed under, comma '
+                    'separated for several. Matched on digits only, ignoring '
+                    'leading zeros. Include "__none__" for rows with no '
+                    'account.',
     ),
     company: str = Query(
         None,
@@ -686,7 +702,7 @@ async def list_transactions(
       head_id     — only transactions for this head
       date_from   — start date (YYYY-MM-DD)
       date_to     — end date (YYYY-MM-DD)
-      account     — account number, matched on digits only
+      account     — one or more account numbers, comma separated
       company     — company abbreviation, matched case-insensitively
       sort, dir   — order by any listed column or joined master name
       search      — free text, matched against every column on the row
@@ -944,8 +960,10 @@ async def list_temp_trans(
     date_to: str = Query(None, description="End of the date range, YYYY-MM-DD."),
     account: str = Query(
         None,
-        description='Account number the row was printed under. Matched on '
-                    'digits only. Pass "__none__" for rows with no account.',
+        description='Account numbers the rows were printed under, comma '
+                    'separated for several. Matched on digits only, ignoring '
+                    'leading zeros. Include "__none__" for rows with no '
+                    'account.',
     ),
     company: str = Query(
         None,
@@ -978,8 +996,10 @@ async def list_temp_trans(
       date_from,
       date_to     — the date range, on whichever column the fieldmap calls the
                     date field. Either end may be given on its own.
-      account     — account number, matched on digits only so a value typed
-                    with spaces still finds rows stored without them
+      account     — one or more account numbers, comma separated. Matched on
+                    digits only and ignoring leading zeros, so a value typed
+                    with spaces, or copied from a sheet that dropped the
+                    leading zero, still finds its rows
       company     — company abbreviation, matched case-insensitively
       sort, dir   — order by any data column or joined master name. An
                     unrecognised name falls back to batch/row order and the
