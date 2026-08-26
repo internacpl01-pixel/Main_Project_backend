@@ -199,6 +199,13 @@ _TABLES = {
         # rather than bounced, because nobody typing an abbreviation in lower
         # case meant a different value.
         'formats': {
+            # Stored upper case however it is typed, like the abbreviation
+            # beside it and like account_type. A company written two ways is two
+            # companies to a UNIQUE constraint and to anything grouping by it,
+            # and "Ambition Colonisers Private Limited" against "AMBITION
+            # COLONISERS PRIVATE LIMITED" is the version of that mistake nobody
+            # spots by eye.
+            'name': {'upper': True},
             'abbreviation': {
                 'regex': r'^[A-Z]{3}$',
                 'message': 'Abbreviation must be exactly three letters, like ACP.',
@@ -262,6 +269,42 @@ def _normalise(cfg: dict, field: str, raw) -> str | None:
     if cfg.get('formats', {}).get(field, {}).get('upper'):
         value = value.upper()
     return value or None
+
+
+def _write_error(exc: Exception, cfg: dict, values: dict) -> HTTPException:
+    """Turn a failed insert or update into something worth reading.
+
+    Nearly every failure here is a UNIQUE violation, and it used to be handed
+    back as Postgres wrote it — 'duplicate key value violates unique constraint
+    "company_master_name_key"'. That names the index rather than the field and
+    the value rather than the fix.
+
+    It matters more now that names are stored upper case: 'Zeta Builders' and
+    'ZETA BUILDERS' used to be two rows and are now one collision, so this path
+    is reached by ordinary typing rather than only by pasting the same row
+    twice.
+
+    The constraint name is matched against the fields declared unique for this
+    table, so nothing is written down twice — a table that gains a unique column
+    gets the message for free.
+    """
+    name = getattr(exc, "constraint_name", "") or ""
+    if "unique" in str(exc).lower() or "duplicate key" in str(exc).lower():
+        for field in cfg.get("unique", []):
+            if field and field in name:
+                label = cfg["labels"].get(field, field.replace("_", " ").title())
+                shown = values.get(field)
+                message = (f'{label} "{shown}" is already used by another '
+                           f'{cfg["label"].lower()}.')
+                if cfg.get("formats", {}).get(field, {}).get("upper"):
+                    # Otherwise the refusal looks wrong to someone who typed it
+                    # in a different case and can see, on screen, that the two
+                    # are not the same string.
+                    message += (f" {label} is stored in capitals, so a "
+                                f"different case is the same entry.")
+                return HTTPException(400, message)
+        return HTTPException(400, f"That {cfg['label'].lower()} already exists.")
+    return HTTPException(400, str(exc))
 
 
 def _check_formats(cfg: dict, values: dict) -> None:
@@ -566,7 +609,7 @@ async def create_master(
                 *vals,
             )
         except Exception as e:
-            raise HTTPException(400, str(e))
+            raise _write_error(e, cfg, clean)
     return dict(row)
 
 
@@ -629,7 +672,7 @@ async def update_master(
             )
         except Exception as e:
             # Most likely a UNIQUE violation on cfg['unique'].
-            raise HTTPException(400, str(e))
+            raise _write_error(e, cfg, clean)
     if row is None:
         raise HTTPException(404, "Item not found.")
     return dict(row)
