@@ -39,6 +39,12 @@ _ACCOUNT_ALIASES = {
     "a c no", "a c number", "bank account number", "account",
 }
 _COMPANY_ALIASES = {"company", "company name", "group company"}
+# The one free-text column the Imported Rows editor lets people type into. The
+# other four editable fields are found through fieldmap.mirrors, which names
+# their master table; narration has no master, so it is matched by display name
+# the same way the two above are. "acc remarks" and "crm remarks" deliberately
+# do not match — they are separate columns this company fills in elsewhere.
+_NARRATION_ALIASES = {"narration", "narrations", "remark", "remarks", "note", "notes"}
 
 # A fieldmap row names a physical column and that name is interpolated into the
 # UPDATE below -- Postgres has no placeholder for an identifier. The fieldmap is
@@ -98,6 +104,11 @@ async def company_column(conn) -> str | None:
     have to handle it rather than assume the column exists.
     """
     return await _resolve_field(conn, _COMPANY_ALIASES)
+
+
+async def narration_column(conn) -> str | None:
+    """The free-text column the row editor lets people type into, or None."""
+    return await _resolve_field(conn, _NARRATION_ALIASES)
 
 
 async def fill_company_from_bank(conn, *, table: str = "temp_trans",

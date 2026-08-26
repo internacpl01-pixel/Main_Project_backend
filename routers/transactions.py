@@ -1086,6 +1086,8 @@ async def list_temp_trans(
             *params, limit, (page - 1) * limit,
         )
 
+        editable = await _editable_columns(conn)
+
         # Unfiltered totals, so the Clear button can state what it is about to
         # remove and grey itself out when there is nothing to remove. Taken
         # here rather than counted in the browser, which only ever holds the
@@ -1107,6 +1109,11 @@ async def list_temp_trans(
         # than left for the client to work out, so highlighting and matching can
         # never disagree about what the query meant.
         "search_terms": highlight_terms(term),
+        # Which fields the row editor may change and which column each writes,
+        # read from this company's fieldmap. Sent so the dialog is built from
+        # the company's own configuration rather than from a list of display
+        # names written into the page.
+        "editable": editable,
         "total": total,
         "page": page,
         "limit": limit,
@@ -1264,6 +1271,164 @@ async def delete_temp_row(row_id: int, user: dict = Depends(get_company_user)):
         await conn.execute("DELETE FROM temp_trans WHERE id = $1", row_id)
 
     return {"status": "deleted", "row_id": row_id, "batch_id": row["batch_id"]}
+
+
+# Which id column each editable dropdown writes, and which fieldmap.mirrors
+# value names its display column. The master table itself comes from
+# _MASTER_LOOKUPS / _MIRROR_TABLES, so nothing here names a table twice.
+_EDITABLE_PICKERS = {
+    "project_id": "project",
+    "head_id": "head",
+    "rera_head_id": "rera_head",
+    "idw_head_id": "idw_head",
+}
+
+
+async def _editable_columns(conn) -> dict:
+    """Which physical column each editable field writes, and its label.
+
+    The four dropdowns are found through fieldmap.mirrors, so they follow
+    whatever this company called the columns — BUSINESS UNIT is the project
+    column here because that fieldmap row says mirrors='project', not because
+    anything is keyed to the words "business unit". Narration has no master
+    behind it and is matched by display name.
+
+    Returned to the client so the edit dialog is built from the company's own
+    fieldmap rather than from a list written into the page.
+    """
+    display = {
+        c["name"]: (c.get("displayname") or c["name"])
+        for c in await custom_fields.data_columns(conn)
+    }
+    rows = await conn.fetch(
+        "SELECT fieldname, mirrors FROM fieldmap "
+        "WHERE mirrors = ANY($1::text[]) AND is_active = true",
+        list(_MIRROR_TABLES),
+    )
+
+    out: dict = {}
+    for row in rows:
+        column, target = row["fieldname"], row["mirrors"]
+        if not _CUSTOM_FIELD_RE.match(column or ""):
+            continue
+        out[target] = {"column": column, "label": display.get(column, column)}
+
+    narration = await staging.narration_column(conn)
+    if narration:
+        out["narration"] = {"column": narration,
+                            "label": display.get(narration, narration)}
+    return out
+
+
+@router.patch("/temp-trans/{row_id}")
+async def edit_temp_row(
+    row_id: int,
+    payload: dict = Body(
+        ...,
+        description="Any of project_id, head_id, rera_head_id, idw_head_id "
+                    "(master row ids, null to clear) and narration (free text).",
+    ),
+    user: dict = Depends(get_company_user),
+):
+    """Edit one staged row.
+
+    Replaces the Classify dialog. The difference is not cosmetic: classify
+    filled a row in once and then refused to touch it again — it required
+    `is_classified = false` — so a value picked by mistake could only be fixed by
+    deleting the row and re-importing the statement. This can be run as often as
+    the row needs.
+
+    A raw dict rather than named Body parameters, because PATCH has to tell
+    "leave this alone" apart from "set this to nothing", and a missing key and a
+    null both arrive as None through a typed parameter. A key that is present
+    and null clears the field; a key that is absent is not written at all.
+
+    Each dropdown writes two columns: the id, which is the record, and the
+    display column that mirrors it, which is what the table shows. They are
+    written together so they cannot disagree — the reason the mirrors mechanism
+    exists at all.
+    """
+    unknown = set(payload) - set(_EDITABLE_PICKERS) - {"narration"}
+    if unknown:
+        raise HTTPException(
+            400,
+            f"Not editable: {', '.join(sorted(unknown))}. This screen edits "
+            f"{', '.join(sorted(set(_EDITABLE_PICKERS) | {'narration'}))} only — "
+            f"the statement's own columns are what the bank sent and are left "
+            f"as imported.",
+        )
+    if not payload:
+        raise HTTPException(400, "Nothing to change.")
+
+    async with company_connection(user["schema"]) as conn:
+        scope = await scoping.visible_project_ids(conn, user)
+        current = await conn.fetchrow(
+            "SELECT id, project_id FROM temp_trans WHERE id = $1", row_id
+        )
+        if current is None or not scoping.can_use_project(scope, current["project_id"]):
+            raise HTTPException(404, "Staged row not found.")
+
+        # Filing a row under a project you cannot see would move it out of your
+        # own scope and lose it, so the target project is checked as well as the
+        # row — the same two checks classify made.
+        if "project_id" in payload and payload["project_id"] is not None:
+            if not scoping.can_use_project(scope, payload["project_id"]):
+                raise HTTPException(403, "You are not assigned to that project.")
+
+        chosen = {
+            field: payload[field]
+            for field in _EDITABLE_PICKERS
+            if field in payload and payload[field] is not None
+        }
+        await _assert_live_master_ids(conn, chosen)
+
+        columns = await _editable_columns(conn)
+        sets: list[str] = []
+        params: list = []
+
+        def _set(column: str, value) -> None:
+            params.append(value)
+            sets.append(f"{column} = ${len(params)}")
+
+        for field, target in _EDITABLE_PICKERS.items():
+            if field not in payload:
+                continue
+            value = payload[field]
+            _set(field, value)
+            mirror = columns.get(target)
+            if not mirror:
+                # No display column mirrors this master, so the id is the whole
+                # record here. Nothing to keep in step.
+                continue
+            if value is None:
+                _set(mirror["column"], None)
+            else:
+                name = await conn.fetchval(
+                    f"SELECT name FROM {_MIRROR_TABLES[target]} WHERE id = $1",
+                    value,
+                )
+                _set(mirror["column"], name)
+
+        if "narration" in payload:
+            mirror = columns.get("narration")
+            if not mirror:
+                raise HTTPException(
+                    400, "This company has no narration column to write to."
+                )
+            text = payload["narration"]
+            text = (str(text).strip() or None) if text is not None else None
+            _set(mirror["column"], text)
+
+        params.append(row_id)
+        updated = await conn.fetchrow(
+            f"UPDATE temp_trans SET {', '.join(sets)} "
+            f"WHERE id = ${len(params)} RETURNING id",
+            *params,
+        )
+
+    if updated is None:
+        raise HTTPException(404, "Staged row not found.")
+    return {"status": "updated", "row_id": row_id, "changed": sorted(payload)}
 
 
 @router.post("/temp-trans/{row_id}/classify")
