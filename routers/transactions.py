@@ -917,6 +917,46 @@ async def fill_company(user: dict = Depends(get_company_user)):
     }
 
 
+@router.post("/fill-derived", dependencies=[Depends(require_manager)])
+async def fill_derived(user: dict = Depends(get_company_user)):
+    """Recompute every column this app derives, on staged and posted rows.
+
+    Two of them today: Company, which follows from the account number via the
+    Bank table, and FY, which follows from the row's own date.
+
+    The import already does both for the batch it just staged, so this is for
+    the other direction in time — rows imported before the column existed, or
+    before the bank account was added to Master Data. Safe to run repeatedly:
+    each fill only writes where the value would change.
+    """
+    async with company_connection(user["schema"]) as conn:
+        async with conn.transaction():
+            company_staged = await staging.fill_company_from_bank(conn, table="temp_trans")
+            company_posted = await staging.fill_company_from_bank(conn, table="transactions")
+            fy_staged = await staging.fill_financial_year(conn, table="temp_trans")
+            fy_posted = await staging.fill_financial_year(conn, table="transactions")
+
+    return {
+        "company": {
+            "staged_updated": company_staged["updated"],
+            "posted_updated": company_posted["updated"],
+            "skipped": company_staged.get("skipped", False),
+            "reason": company_staged.get("reason"),
+            # Account numbers on staged rows that no bank record carries — the
+            # usual reason nothing was filled, and the only one you can act on.
+            "unmatched_accounts": company_staged.get("unmatched_accounts"),
+        },
+        "financial_year": {
+            "staged_updated": fy_staged["updated"],
+            "posted_updated": fy_posted["updated"],
+            "skipped": fy_staged.get("skipped", False),
+            "reason": fy_staged.get("reason"),
+            # The only reason a row can be left without one.
+            "undated_rows": fy_staged.get("undated_rows"),
+        },
+    }
+
+
 @router.delete("/all", dependencies=[Depends(require_level(permissions.COMPANY_ADMIN))])
 async def delete_all_transactions(user: dict = Depends(get_company_user)):
     """Empty the ledger.

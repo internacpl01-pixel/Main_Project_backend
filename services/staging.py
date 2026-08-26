@@ -121,6 +121,95 @@ async def narration_column(conn) -> str | None:
     return await _resolve_field(conn, _NARRATION_ALIASES)
 
 
+# ── Financial year, derived from the row's own date ──────────────────────────
+
+_FY_ALIASES = {"fy", "financial year", "fin year", "f y", "fiscal year"}
+
+
+def financial_year_expr(date_expr: str) -> str:
+    """SQL turning a date into 'FY 25-26'.
+
+    The Indian financial year runs 1 April to 31 March, so the label needs the
+    year it started and the year it ends. Shifting the date back three months
+    lands on the first, forward nine months on the second: 2026-03-31 gives 2025
+    and 2026, and the next day gives 2026 and 2027.
+
+    Arithmetic rather than a CASE on the month, which means it is right for
+    every year without being told about any of them -- including across a
+    century, where 2000-03-31 is FY 99-00.
+    """
+    return (f"'FY ' || to_char({date_expr} - interval '3 months', 'YY') || '-' || "
+            f"to_char({date_expr} + interval '9 months', 'YY')")
+
+
+async def financial_year_column(conn) -> str | None:
+    """The column holding the financial year label, or None."""
+    return await _resolve_field(conn, _FY_ALIASES)
+
+
+async def fill_financial_year(conn, *, table: str = "temp_trans",
+                              batch_id: int | None = None) -> dict:
+    """Set each row's FY from the date it carries.
+
+    Derived on write rather than computed on read, so the column can be sorted,
+    filtered and exported like any other -- which is the whole reason it is a
+    column and not a formatting rule in the browser.
+
+    Only writes where the value would change, so it is safe to run repeatedly.
+    Rows with no date are left alone: there is no year to derive and blanking
+    the cell would lose a value someone may have put there by hand.
+    """
+    from services import custom_fields
+
+    fy_col = await financial_year_column(conn)
+    date_col = await custom_fields.date_column(conn)
+
+    if not fy_col or not date_col:
+        missing = []
+        if not fy_col:
+            missing.append("an FY column")
+        if not date_col:
+            missing.append("a date column")
+        logger.info("[FY fill] skipped on %s: fieldmap has no %s",
+                    table, " and no ".join(missing))
+        return {"updated": 0, "skipped": True,
+                "reason": f"This company's fieldmap has no {' and no '.join(missing)}."}
+
+    params: list = []
+    where_batch = ""
+    if batch_id is not None:
+        params.append(batch_id)
+        where_batch = f" AND t.batch_id = ${len(params)}"
+
+    expr = financial_year_expr(f"t.{date_col}")
+    tag = await conn.execute(
+        f"""
+        UPDATE {table} t
+           SET {fy_col} = {expr}
+         WHERE t.{date_col} IS NOT NULL
+           AND t.{fy_col} IS DISTINCT FROM ({expr})
+           {where_batch}
+        """,
+        *params,
+    )
+    updated = int(tag.split()[-1])
+
+    undated = await conn.fetchval(
+        f"SELECT count(*) FROM {table} t WHERE t.{date_col} IS NULL"
+    )
+
+    logger.info("[FY fill] %s: %d rows set, %d rows have no date",
+                table, updated, undated)
+    return {
+        "updated": updated,
+        "skipped": False,
+        "fy_column": fy_col,
+        "date_column": date_col,
+        # The only reason a row can be left without an FY.
+        "undated_rows": undated,
+    }
+
+
 async def fill_company_from_bank(conn, *, table: str = "temp_trans",
                                  batch_id: int | None = None) -> dict:
     """Set each row's Company from the bank that owns its account number.
@@ -328,11 +417,23 @@ async def stage_batch(
             logger.exception("[stage] company fill failed for batch %s", batch_id)
             filled = {"updated": 0}
 
-    logger.info("[stage] batch %s: %d rows, %d duplicate rows, %d company set",
-                batch_id, inserted, duplicates, filled.get("updated", 0))
+        # The financial year follows from the date the same way the company
+        # follows from the account number, and is filled here for the same
+        # reason: it is knowable, so nobody should have to type it. Also not
+        # fatal — a statement still stages with the column blank.
+        try:
+            fy = await fill_financial_year(conn, batch_id=batch_id)
+        except Exception:
+            logger.exception("[stage] FY fill failed for batch %s", batch_id)
+            fy = {"updated": 0}
+
+    logger.info("[stage] batch %s: %d rows, %d duplicate rows, %d company set, %d FY set",
+                batch_id, inserted, duplicates,
+                filled.get("updated", 0), fy.get("updated", 0))
     return {
         "batch_id": batch_id,
         "inserted": inserted,
         "duplicate_rows": duplicates,
         "company_filled": filled.get("updated", 0),
+        "financial_year_filled": fy.get("updated", 0),
     }
