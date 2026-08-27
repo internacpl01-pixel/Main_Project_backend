@@ -310,6 +310,7 @@ _STAGING_INTERNALS = frozenset({
     "row_hash",      # dedup fingerprint
     "row_number",    # position in the source file
     "is_classified", # workflow state, rendered as the Status column
+    "is_locked",     # workflow state, rendered as the padlock button
     "raw_data",      # the parser's untouched output
     "created_at",
     "updated_at",
