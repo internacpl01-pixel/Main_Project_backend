@@ -1128,7 +1128,8 @@ async def list_temp_trans(
 
         rows = await conn.fetch(
             f"""
-            SELECT t.id, t.batch_id, t.row_number, t.is_classified, t.created_at,
+            SELECT t.id, t.batch_id, t.row_number, t.is_classified, t.is_locked,
+                   t.created_at,
                    t.project_id, t.beneficiary_id, t.head_id, t.rera_head_id,
                    t.idw_head_id,
                    {data_cols},
@@ -1267,6 +1268,19 @@ async def clear_temp_trans(schema: str = Depends(get_current_schema)):
                 f"unposted batches individually.",
             )
 
+        # Same standing as the posted check: a Clear All that silently took
+        # locked rows with it would make the lock a decoration.
+        locked = await conn.fetchval(
+            "SELECT count(*) FROM temp_trans WHERE is_locked"
+        )
+        if locked:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Cannot clear staging: {locked} "
+                f"{'row is' if locked == 1 else 'rows are'} locked. Unlock "
+                f"{'it' if locked == 1 else 'them'} first.",
+            )
+
         rows = await conn.fetchval("SELECT count(*) FROM temp_trans")
         batches = await conn.fetchval("SELECT count(*) FROM import_batches")
         # One statement: temp_trans cascades from import_batches, so deleting
@@ -1305,7 +1319,8 @@ async def delete_temp_row(row_id: int, user: dict = Depends(get_company_user)):
     """
     async with company_connection(user["schema"]) as conn:
         row = await conn.fetchrow(
-            "SELECT id, batch_id, row_number, project_id FROM temp_trans WHERE id = $1",
+            "SELECT id, batch_id, row_number, project_id, is_locked "
+            "FROM temp_trans WHERE id = $1",
             row_id,
         )
         if row is None:
@@ -1317,6 +1332,14 @@ async def delete_temp_row(row_id: int, user: dict = Depends(get_company_user)):
         # classified yet is still removable.
         if not scoping.can_use_project(scope, row["project_id"]):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Staged row not found.")
+
+        # A lock that stopped edits but not deletion would protect a row from
+        # a typo and not from the bin. Same unlock-first rule for both.
+        if row["is_locked"]:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "This row is locked. Unlock it first to delete it.",
+            )
 
         posted = await conn.fetchval(
             "SELECT id FROM transactions WHERE temp_trans_id = $1", row_id
@@ -1423,10 +1446,17 @@ async def edit_temp_row(
     async with company_connection(user["schema"]) as conn:
         scope = await scoping.visible_project_ids(conn, user)
         current = await conn.fetchrow(
-            "SELECT id, project_id FROM temp_trans WHERE id = $1", row_id
+            "SELECT id, project_id, is_locked FROM temp_trans WHERE id = $1", row_id
         )
         if current is None or not scoping.can_use_project(scope, current["project_id"]):
             raise HTTPException(404, "Staged row not found.")
+        if current["is_locked"]:
+            # 409, not 403: nothing about the caller is wrong — the row's own
+            # state refuses the write, and the fix is on the row.
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "This row is locked. Unlock it first to edit it.",
+            )
 
         # Filing a row under a project you cannot see would move it out of your
         # own scope and lose it, so the target project is checked as well as the
@@ -1489,6 +1519,43 @@ async def edit_temp_row(
     if updated is None:
         raise HTTPException(404, "Staged row not found.")
     return {"status": "updated", "row_id": row_id, "changed": sorted(payload)}
+
+
+@router.post("/temp-trans/{row_id}/lock")
+async def set_temp_row_lock(
+    row_id: int,
+    locked: bool = Body(..., embed=True),
+    user: dict = Depends(get_company_user),
+):
+    """Lock or unlock one staged row.
+
+    While locked, PATCH and DELETE on the row are refused with a 409, and
+    Clear All refuses while any locked row exists — the row is done being
+    worked on until someone deliberately unlocks it.
+
+    Same access as editing, not manager-gated: the lock protects a row from
+    accident, not from colleagues, and anyone trusted to edit a row is trusted
+    to say it is finished. Setting the state it already has succeeds and does
+    nothing, so two people locking the same row is not an error.
+
+    Scope-checked like every other row operation — a row filed under a project
+    you cannot see is a row you cannot lock, and the answer is the same 404 a
+    missing row gets.
+    """
+    async with company_connection(user["schema"]) as conn:
+        current = await conn.fetchrow(
+            "SELECT id, project_id FROM temp_trans WHERE id = $1", row_id
+        )
+        scope = await scoping.visible_project_ids(conn, user)
+        if current is None or not scoping.can_use_project(scope, current["project_id"]):
+            raise HTTPException(404, "Staged row not found.")
+
+        await conn.execute(
+            "UPDATE temp_trans SET is_locked = $1 WHERE id = $2", locked, row_id
+        )
+
+    return {"status": "locked" if locked else "unlocked", "row_id": row_id,
+            "is_locked": locked}
 
 
 @router.post("/temp-trans/{row_id}/classify")
@@ -1569,10 +1636,17 @@ async def classify_row(
         })
 
         current = await conn.fetchrow(
-            "SELECT project_id FROM temp_trans WHERE id = $1", row_id
+            "SELECT project_id, is_locked FROM temp_trans WHERE id = $1", row_id
         )
         if current is None or not scoping.can_use_project(scope, current["project_id"]):
             raise HTTPException(status_code=404, detail="Row not found.")
+        # The UI no longer calls this route, but it still writes the row, so it
+        # honours the lock like the edit it predates.
+        if current["is_locked"]:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "This row is locked. Unlock it first to edit it.",
+            )
 
         # Write the chosen name into whichever display column mirrors it, so the
         # staging table shows the classification instead of an em dash. The _id
