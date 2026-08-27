@@ -22,7 +22,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 import permissions
 from database import company_connection
 from routers.auth import get_company_user, get_current_schema, require_level
-from services import custom_fields, scoping, staging
+from services import custom_fields, rules, scoping, staging
 
 logger = logging.getLogger(__name__)
 
@@ -1209,6 +1209,304 @@ async def temp_trans_filter_options(user: dict = Depends(get_company_user)):
         else:
             where = "1=1"
         return await _filter_options(conn, "temp_trans", where, params)
+
+
+async def _rule_context(conn, account_type: str, account_number: str):
+    """Resolve everything a rule check and a rule fix share, or 400 saying why.
+
+    Returns (rule, digits, account_col, bank, expected, allowed_ids), where
+    `expected` maps each direction to the master rows the rule accepts, in
+    order of preference, and `allowed_ids` is the same thing as id sets.
+
+    Checked here, identically, on both endpoints — the fix must never trust
+    the browser's copy of a check that may be minutes old.
+    """
+    wanted = (account_type or "").strip().upper()
+    rule = rules.rule_for(wanted)
+    if rule is None:
+        raise HTTPException(
+            400,
+            f"No rules are written for {wanted or 'untyped'} accounts yet. "
+            f"Rules exist for: {', '.join(rules.supported_types())}.",
+        )
+
+    digits = staging.normalise_account(account_number)
+    if not digits:
+        raise HTTPException(400, "That account number has no digits in it.")
+
+    account_col = await staging.account_column(conn)
+    if not account_col:
+        raise HTTPException(
+            400, "This company has no account number field mapped, so rows "
+                 "cannot be matched to an account. Map one on the Field "
+                 "Mapping page first.")
+
+    # The account's type comes from the Bank master, matched on digits like
+    # everything else. A live row describes the account better than an
+    # archived one, so it wins — same preference the filter labels use.
+    bank_acct = staging.account_digits("b.account_number")
+    bank = await conn.fetchrow(
+        f"""
+        SELECT b.account_number, b.account_type, b.bank_name, b.company
+          FROM bank_master b
+         WHERE b.account_number IS NOT NULL
+           AND {bank_acct} <> ''
+           AND {bank_acct} = $1
+         ORDER BY b.is_active DESC, b.id
+         LIMIT 1
+        """,
+        digits,
+    )
+    if bank is None:
+        raise HTTPException(
+            400, f"Account {account_number} is not in the Bank master, so its "
+                 f"type is unknown. Add it under Master Data first.")
+    actual = (bank["account_type"] or "").strip().upper()
+    if actual != wanted:
+        raise HTTPException(
+            400, f"Account {account_number} is recorded as "
+                 f"{'a ' + actual if actual else 'an untyped'} account in the "
+                 f"Bank master, not {wanted}.")
+
+    try:
+        expected = await rules.resolve_expected(conn, rule)
+    except rules.MissingRuleHeads as e:
+        raise HTTPException(400, str(e))
+
+    allowed_ids = {d: {h["id"] for h in heads} for d, heads in expected.items()}
+    return rule, digits, account_col, bank, expected, allowed_ids
+
+
+@router.post("/temp-trans/check-rules")
+async def check_temp_rules(
+    account_type: str = Body(..., description="The type the Bank master gives "
+                                              "the account — MASTER, RERA, IDW "
+                                              "or FREE."),
+    account_number: str = Body(..., description="The account whose staged rows "
+                                                "to check, matched on digits "
+                                                "only."),
+    user: dict = Depends(get_company_user),
+):
+    """Check one account's staged rows against its account-type rule.
+
+    Reads only — nothing is changed until /check-rules/apply is called with
+    the rows the user agreed to fix. Every row printed under the account is
+    judged by its direction: the RERA rule wants credits classified 'Master to
+    RERA' and debits 'RERA to IDW' or 'Customer Cancellation'. Which master
+    rows those are is resolved against this company's own heads by meaning
+    rather than exact spelling, so 'Master 2 RERA' satisfies it.
+
+    A row with no CR/DR marker cannot be judged and is reported separately
+    rather than counted on either side. Scoped like the list itself.
+    """
+    async with company_connection(user["schema"]) as conn:
+        rule, digits, account_col, bank, expected, allowed_ids = \
+            await _rule_context(conn, account_type, account_number)
+
+        filters = ["1=1"]
+        params: list = []
+        idx = 1
+
+        scope = await scoping.visible_project_ids(conn, user)
+        clause, scope_params, idx = scoping.project_filter(scope, "t.project_id", idx)
+        if clause:
+            filters.append(clause)
+            params.extend(scope_params)
+        elif scoping.scope_is_empty(scope):
+            filters.append("t.project_id IS NULL")
+
+        filters.append(f"{staging.account_digits(f't.{account_col}')} = ${idx}")
+        params.append(digits)
+        idx += 1
+
+        # Date and amount ride along so the dialog can say which rows it
+        # means — a conflict list of bare ids cannot be reviewed.
+        columns = await custom_fields.data_columns(conn)
+        date_col = await custom_fields.date_column(conn)
+        date_sel = (f"{_date_expr(date_col, columns)} AS txn_date,"
+                    if date_col else "NULL::date AS txn_date,")
+
+        field = rule["field"]
+        rows = await conn.fetch(
+            f"""
+            SELECT t.id, t.batch_id, t.row_number, t.is_locked,
+                   upper(btrim(coalesce(t.credit_debit, ''))) AS direction,
+                   t.amount,
+                   {date_sel}
+                   t.{field} AS current_id,
+                   m.name AS current_name
+              FROM temp_trans t
+              LEFT JOIN {rule['master_table']} m ON m.id = t.{field}
+             WHERE {' AND '.join(filters)}
+             ORDER BY t.batch_id, t.row_number
+            """,
+            *params,
+        )
+
+        checked: list[dict] = []
+        ok = conflicts = locked_conflicts = no_direction = 0
+        for r in rows:
+            row = dict(r)
+            direction = row["direction"] or None
+            row["direction"] = direction
+            if direction in allowed_ids:
+                if row["current_id"] in allowed_ids[direction]:
+                    row["status"] = "ok"
+                    ok += 1
+                else:
+                    # NULL is a conflict too: "must be" is not satisfied by
+                    # nothing.
+                    row["status"] = "conflict"
+                    conflicts += 1
+                    if row["is_locked"]:
+                        locked_conflicts += 1
+            else:
+                row["status"] = "no_direction"
+                no_direction += 1
+            checked.append(row)
+
+        # The company's own name for the column being judged, when a fieldmap
+        # row mirrors this master — the dialog should speak the fieldmap's
+        # language, not this file's.
+        ecols = await _editable_columns(conn)
+        target_label = (ecols.get(rule["mirrors"]) or {}).get("label") or rule["label"]
+
+    return {
+        "account_type": (account_type or "").strip().upper(),
+        "account": {
+            "value": account_number,
+            "label": _account_label(bank["account_number"], bank["company"],
+                                    bank["account_type"]),
+            "bank_name": bank["bank_name"],
+        },
+        "target": {"field": field, "label": target_label},
+        "expected": expected,
+        "why": {d: spec["why"] for d, spec in rule["directions"].items()},
+        "rows": checked,
+        "summary": {
+            "total": len(checked),
+            "ok": ok,
+            "conflicts": conflicts,
+            "locked_conflicts": locked_conflicts,
+            "no_direction": no_direction,
+        },
+    }
+
+
+@router.post("/temp-trans/check-rules/apply")
+async def apply_temp_rules(
+    account_type: str = Body(...),
+    account_number: str = Body(...),
+    rows: list[dict] = Body(..., description="[{id, head_id}] — the conflicting "
+                                             "rows and the rule head chosen for "
+                                             "each."),
+    user: dict = Depends(get_company_user),
+):
+    """Replace the heads the rule found wrong, as chosen in the dialog.
+
+    Applies the rule rather than trusting the request: every target head is
+    re-checked against what the rule allows for that row's direction, on the
+    row's current state — this is not a bulk edit endpoint wearing a rule's
+    name. Locked rows are skipped and counted, the same standing the padlock
+    has everywhere else; rows that no longer match the account or the caller's
+    scope are skipped too, because they are no longer what the user saw.
+
+    Writes the id column and the display column that mirrors it together,
+    exactly as the row editor does — the pair must never disagree.
+    """
+    if not rows:
+        raise HTTPException(400, "No rows to change.")
+    wanted_rows: dict[int, int] = {}
+    for entry in rows:
+        try:
+            wanted_rows[int(entry["id"])] = int(entry["head_id"])
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(400, "Each row needs an id and a head_id.")
+
+    async with company_connection(user["schema"]) as conn:
+        rule, digits, account_col, bank, expected, allowed_ids = \
+            await _rule_context(conn, account_type, account_number)
+
+        filters = ["t.id = ANY($1::bigint[])"]
+        params: list = [list(wanted_rows)]
+        idx = 2
+
+        scope = await scoping.visible_project_ids(conn, user)
+        clause, scope_params, idx = scoping.project_filter(scope, "t.project_id", idx)
+        if clause:
+            filters.append(clause)
+            params.extend(scope_params)
+        elif scoping.scope_is_empty(scope):
+            filters.append("t.project_id IS NULL")
+
+        filters.append(f"{staging.account_digits(f't.{account_col}')} = ${idx}")
+        params.append(digits)
+        idx += 1
+
+        current = await conn.fetch(
+            f"""
+            SELECT t.id, t.is_locked,
+                   upper(btrim(coalesce(t.credit_debit, ''))) AS direction
+              FROM temp_trans t
+             WHERE {' AND '.join(filters)}
+            """,
+            *params,
+        )
+
+        names = {h["id"]: h["name"] for heads in expected.values() for h in heads}
+        by_head: dict[int, list[int]] = {}
+        skipped_locked = 0
+        found_ids: set[int] = set()
+        for r in current:
+            found_ids.add(r["id"])
+            chosen = wanted_rows[r["id"]]
+            direction = r["direction"] or None
+            if direction not in allowed_ids or chosen not in allowed_ids[direction]:
+                raise HTTPException(
+                    400,
+                    f"Head {chosen} is not one the "
+                    f"{(account_type or '').strip().upper()} rule allows for a "
+                    f"{direction or 'directionless'} row. The rows may have "
+                    f"changed since the check — run Check Rules again.",
+                )
+            if r["is_locked"]:
+                skipped_locked += 1
+                continue
+            by_head.setdefault(chosen, []).append(r["id"])
+
+        ecols = await _editable_columns(conn)
+        mirror = ecols.get(rule["mirrors"])
+
+        updated_ids: list[int] = []
+        for head_id, ids in by_head.items():
+            sets = [f"{rule['field']} = $1"]
+            uparams: list = [head_id]
+            if mirror:
+                uparams.append(names[head_id])
+                sets.append(f"{mirror['column']} = ${len(uparams)}")
+            uparams.append(ids)
+            done = await conn.fetch(
+                f"UPDATE temp_trans SET {', '.join(sets)} "
+                # NOT is_locked again in the WHERE: the read above and this
+                # write are the belt and braces against a lock landing between
+                # them.
+                f"WHERE id = ANY(${len(uparams)}::bigint[]) AND NOT is_locked "
+                f"RETURNING id",
+                *uparams,
+            )
+            updated_ids.extend(row["id"] for row in done)
+
+    logger.info("[check-rules] %s %s: %d updated, %d locked skipped, %d gone",
+                (account_type or "").strip().upper(), digits,
+                len(updated_ids), skipped_locked,
+                len(set(wanted_rows) - found_ids))
+    return {
+        "status": "applied",
+        "updated": len(updated_ids),
+        "updated_ids": sorted(updated_ids),
+        "skipped_locked": skipped_locked,
+        "skipped_missing": len(set(wanted_rows) - found_ids),
+    }
 
 
 @router.get("/filters")
