@@ -1443,12 +1443,19 @@ async def apply_temp_rules(
         params.append(digits)
         idx += 1
 
+        # FOR UPDATE, because the scope and account checks above are made on
+        # this read and enforced by the write below — and project_id, which
+        # scope is decided by, is a column the row editor can change. Without
+        # the lock another session could move a row out of this caller's scope
+        # between the two statements and the write would still land on it.
+        # Held for the rest of the transaction, which is the next statement.
         current = await conn.fetch(
             f"""
             SELECT t.id, t.is_locked,
                    upper(btrim(coalesce(t.credit_debit, ''))) AS direction
               FROM temp_trans t
              WHERE {' AND '.join(filters)}
+             FOR UPDATE
             """,
             *params,
         )
