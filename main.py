@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from database import close_pool, init_pool
 from routers import (auth, companies, custom_fields, export, fieldmap, imports,
-                     master, projects, transactions, users)
+                     master, projects, rules, transactions, users)
 
 
 @asynccontextmanager
@@ -78,6 +78,7 @@ app.include_router(companies.router)
 app.include_router(users.router)
 app.include_router(projects.router)
 app.include_router(master.router)
+app.include_router(rules.router)
 app.include_router(fieldmap.router)
 app.include_router(custom_fields.router)
 app.include_router(imports.router)

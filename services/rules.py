@@ -1,136 +1,150 @@
 """
-Account-type rules for staged rows.
+Account-type rules for staged rows, read from the company's own `rule` table.
 
 The Bank master types every account — MASTER, RERA, IDW, FREE, whatever rows
-account_type_master holds — and some of those types carry a rule about how a
-row printed under such an account must be classified. The Check Rules button
-on Imported Rows picks one account and checks its staged rows against the
-rule for that account's type.
+account_type_master holds — and the `rule` table says which heads a row printed
+under such an account may legitimately carry, and in which direction. The Check
+Rules button on Imported Rows picks one account and judges its staged rows
+against the rows recorded for that account's type.
 
-Only RERA has a rule so far:
+One row of `rule` is one fact: this head, on this account type, means money in
+(CR), money out (DR), or either (BOTH). A head with no row for a type is simply
+not an answer there — which is how a blank cell on the Rules grid is stored, and
+why nothing here has to carry a list of what is "not allowed".
 
-  - money coming IN (CR) must be classified "Master to RERA" — a RERA
-    account is funded by transfer from the Master collection account;
-  - money going OUT (DR) must be "RERA to IDW", unless it is a customer
-    cancellation refund.
+This module used to hold the rule as a Python literal, with the heads named by
+spelling and matched against the company's master rows after folding. None of
+that is needed now: the rule points at head ids, so 'Master 2 RERA' versus
+'Master to RERA' is a question the user answered once by picking a row from a
+dropdown, not a question this code has to keep guessing at. Adding a rule for
+MASTER, IDW or FREE is data entry on the Rules page, not an edit here.
 
-The rule is written against meanings, not stored strings. The heads it names
-live in each company's own master table under that company's own spelling —
-'Master 2 RERA', 'RERA 2 IDW' and 'Cust Cancellation' in the seeded data —
-so each expectation is a set of accepted spellings, matched against the live
-master rows after normalisation. A company that renames a head within reason
-keeps a working rule; a company missing one is told which entry the rule
-needs, rather than shown a rule that can never pass.
+See company/028_rule_table.sql.
 """
-import re
+from __future__ import annotations
 
-# Which classification each rule is about: the id column on temp_trans, the
-# fieldmap.mirrors key that names its display column, and the master table its
-# values come from. 'label' is what messages call that master when the company
-# has no mirroring column to borrow a name from.
+# What every rule judges and writes.
 #
-# Per direction, 'expected' lists the acceptable answers in order of
-# preference — the first is what a blanket fix applies, the rest are the
-# legitimate alternatives the dialog offers. 'accept' holds the spellings that
-# count as that answer, in normalise_head() form.
-RULES = {
-    "RERA": {
-        "field": "rera_head_id",
-        "mirrors": "rera_head",
-        "master_table": "rera_head_master",
-        "label": "RERA head",
-        "directions": {
-            "CR": {
-                "why": "Money coming into a RERA account is the transfer "
-                       "from the Master account.",
-                "expected": [
-                    {"label": "Master to RERA",
-                     "accept": {"master to rera"}},
-                ],
-            },
-            "DR": {
-                "why": "Money leaving a RERA account goes to IDW, unless it "
-                       "is a customer cancellation refund.",
-                "expected": [
-                    {"label": "RERA to IDW",
-                     "accept": {"rera to idw"}},
-                    {"label": "Customer Cancellation",
-                     "accept": {"customer cancellation", "cust cancellation"}},
-                ],
-            },
-        },
-    },
+# Fixed, and honestly so: the heads on the Rules grid come from
+# rera_head_master because rera_head_id is the column Check Rules puts its
+# answer into. A head offered from any other master could be shown in the
+# dropdown and then not saved, which is worse than not offering it. If a second
+# master ever needs its own rules, this becomes a per-rule column rather than a
+# constant — the rest of this module already treats it as data.
+TARGET = {
+    "field": "rera_head_id",
+    "mirrors": "rera_head",
+    "master_table": "rera_head_master",
+    "label": "RERA head",
 }
 
-
-def normalise_head(name: str) -> str:
-    """Fold a head name for matching: 'Master 2 RERA' -> 'master to rera'.
-
-    Lower-cased, punctuation collapsed to spaces, and a lone digit 2 read as
-    'to' — bookkeepers write transfer heads both ways, and in that position it
-    is the join word, not a quantity.
-    """
-    words = re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).split()
-    return " ".join("to" if w == "2" else w for w in words)
-
-
-def rule_for(account_type: str) -> dict | None:
-    """The rule for an account type, or None — most types have none yet."""
-    return RULES.get((account_type or "").strip().upper())
-
-
-def supported_types() -> list[str]:
-    """The account types that carry a rule, for messages that must say so."""
-    return sorted(RULES)
+# The directions a row can be judged in. BOTH is not one of them: it is an
+# answer a head can carry, meaning it satisfies either of these.
+DIRECTIONS = ("CR", "DR")
 
 
 class MissingRuleHeads(RuntimeError):
-    """The master table lacks a head the rule needs to name."""
+    """This account type has no rule, or none its heads can still satisfy."""
 
 
-async def resolve_expected(conn, rule: dict) -> dict[str, list[dict]]:
-    """Map each direction to the live master rows the rule accepts.
+async def allowed_heads(conn, account_type: str) -> dict[str, list[dict]]:
+    """The heads each direction accepts for an account type.
 
-    Returns {"CR": [{"id", "name"}, ...], "DR": [...]} resolved against this
-    company's own active rows, in the rule's order of preference. Raises
-    MissingRuleHeads naming what is absent — a rule that cannot name its own
-    heads must refuse to run, because "0 conflicts" from a rule matching
-    nothing reads as a clean bill.
+    Returns {"CR": [{"id", "name"}, ...], "DR": [...]}, ordered by name so the
+    dropdown reads the same on every run and the first entry — which is what a
+    blanket fix applies — is stable across restarts.
+
+    Only active heads count. A head switched off in Master Data is not an answer
+    anyone should be offered, and leaving it in would let the fix write a value
+    the row editor would not.
+
+    Raises MissingRuleHeads when nothing is recorded, rather than returning two
+    empty lists: "0 conflicts" from a rule that accepts nothing reads as a clean
+    bill of health, and it is the opposite.
     """
     rows = await conn.fetch(
-        f"SELECT id, name FROM {rule['master_table']} "
-        f"WHERE is_active = true ORDER BY id"
+        f"""
+        SELECT r.direction, h.id, h.name
+          FROM rule r
+          JOIN {TARGET['master_table']} h ON h.id = r.head_id
+         WHERE upper(btrim(r.account_type)) = $1
+           AND h.is_active = true
+         ORDER BY h.name, h.id
+        """,
+        (account_type or "").strip().upper(),
     )
-    by_norm: dict[str, list[dict]] = {}
+
+    out: dict[str, list[dict]] = {d: [] for d in DIRECTIONS}
     for r in rows:
-        by_norm.setdefault(normalise_head(r["name"]), []).append(
-            {"id": r["id"], "name": r["name"]})
+        head = {"id": r["id"], "name": r["name"]}
+        # BOTH lands in both lists — that is the whole of what it means.
+        for d in (DIRECTIONS if r["direction"] == "BOTH" else (r["direction"],)):
+            if d in out:
+                out[d].append(head)
 
-    out: dict[str, list[dict]] = {}
-    missing: list[str] = []
-    for direction, spec in rule["directions"].items():
-        found: list[dict] = []
-        for exp in spec["expected"]:
-            # EVERY live row matching any accepted spelling counts. A company
-            # holding both 'RERA 2 IDW' and 'RERA to IDW' meant the same head
-            # twice; a row classified with either complies, and flagging one
-            # of them would rewrite correct data to its duplicate. The
-            # spellings are walked in sorted order and the rows arrive
-            # id-ordered, so the fix default — the first entry — is the same
-            # row on every run.
-            hits = [h for a in sorted(exp["accept"]) for h in by_norm.get(a, [])]
-            if not hits:
-                missing.append(exp["label"])
-            else:
-                found.extend(hits)
-        out[direction] = found
-
-    if missing:
-        names = sorted(set(missing))
+    if not any(out.values()):
         raise MissingRuleHeads(
-            f"The {rule['label']} master has no entry for: {', '.join(names)}. "
-            f"The rule cannot check or fix anything until "
-            f"{'this head exists' if len(names) == 1 else 'these heads exist'} — "
-            f"add {'it' if len(names) == 1 else 'them'} under Master Data."
+            f"No rule is set for {(account_type or '').strip().upper() or 'untyped'} "
+            f"accounts yet. Open the Rules page and mark which heads are valid "
+            f"for this account type, and in which direction."
         )
     return out
+
+
+async def supported_types(conn) -> list[str]:
+    """The account types that have at least one usable rule row.
+
+    Counts only rows whose head is still active, so a type whose every head was
+    switched off is reported as having no rule — which is what running it would
+    find anyway.
+    """
+    rows = await conn.fetch(
+        f"""
+        SELECT DISTINCT upper(btrim(r.account_type)) AS account_type
+          FROM rule r
+          JOIN {TARGET['master_table']} h ON h.id = r.head_id
+         WHERE h.is_active = true
+         ORDER BY 1
+        """
+    )
+    return [r["account_type"] for r in rows]
+
+
+def explain(account_type: str, expected: dict[str, list[dict]]) -> dict[str, str]:
+    """The sentence shown under each direction, built from the rule itself.
+
+    Written from the data rather than stored beside it, so it can never drift
+    from what the check actually does — the old hardcoded rule carried a
+    sentence about IDW and cancellations that nothing verified.
+    """
+    kind = (account_type or "").strip().upper() or "this"
+    words = {"CR": "coming into", "DR": "leaving"}
+    out: dict[str, str] = {}
+    for d in DIRECTIONS:
+        heads = expected.get(d) or []
+        if not heads:
+            out[d] = (f"No head is marked {d} for {kind} accounts, so a "
+                      f"{'credit' if d == 'CR' else 'debit'} here cannot be "
+                      f"classified under this rule.")
+            continue
+        names = [h["name"] for h in heads]
+        listed = names[0] if len(names) == 1 else (
+            ", ".join(names[:-1]) + " or " + names[-1])
+        out[d] = (f"Money {words[d]} a {kind} account is recorded as {listed}.")
+    return out
+
+
+def judge(direction: str | None, current_id: int | None,
+          allowed_ids: dict[str, set[int]]) -> str:
+    """What the rule says about one row: ok, conflict, or no_direction.
+
+    A row with no CR/DR marker cannot be judged at all and is reported
+    separately rather than counted against the rule — it is missing the one
+    thing the rule is keyed on, not breaking it.
+
+    A row whose head is NULL is a conflict: "must be one of these" is not
+    satisfied by nothing.
+    """
+    if direction not in allowed_ids:
+        return "no_direction"
+    return "ok" if current_id in allowed_ids[direction] else "conflict"

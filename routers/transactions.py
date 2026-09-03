@@ -1214,22 +1214,17 @@ async def temp_trans_filter_options(user: dict = Depends(get_company_user)):
 async def _rule_context(conn, account_type: str, account_number: str):
     """Resolve everything a rule check and a rule fix share, or 400 saying why.
 
-    Returns (rule, digits, account_col, bank, expected, allowed_ids), where
-    `expected` maps each direction to the master rows the rule accepts, in
-    order of preference, and `allowed_ids` is the same thing as id sets.
+    Returns (target, digits, account_col, bank, expected, allowed_ids), where
+    `target` names the column being judged, `expected` maps each direction to
+    the heads the `rule` table accepts for this account type, and `allowed_ids`
+    is the same thing as id sets.
 
     Checked here, identically, on both endpoints — the fix must never trust
-    the browser's copy of a check that may be minutes old.
+    the browser's copy of a check that may be minutes old, and since the rule
+    is now editable from the Rules page it can genuinely have changed between
+    the check and the fix.
     """
     wanted = (account_type or "").strip().upper()
-    rule = rules.rule_for(wanted)
-    if rule is None:
-        raise HTTPException(
-            400,
-            f"No rules are written for {wanted or 'untyped'} accounts yet. "
-            f"Rules exist for: {', '.join(rules.supported_types())}.",
-        )
-
     digits = staging.normalise_account(account_number)
     if not digits:
         raise HTTPException(400, "That account number has no digits in it.")
@@ -1268,13 +1263,20 @@ async def _rule_context(conn, account_type: str, account_number: str):
                  f"{'a ' + actual if actual else 'an untyped'} account in the "
                  f"Bank master, not {wanted}.")
 
+    # Read after the account has been confirmed to be of this type, so a type
+    # with no rule is only reported once the account itself checks out — being
+    # told "no rule for MASTER" about an account that is actually RERA would
+    # send someone to the Rules page to fix the wrong thing.
     try:
-        expected = await rules.resolve_expected(conn, rule)
+        expected = await rules.allowed_heads(conn, wanted)
     except rules.MissingRuleHeads as e:
-        raise HTTPException(400, str(e))
+        supported = await rules.supported_types(conn)
+        extra = (f" Rules are set for: {', '.join(supported)}." if supported
+                 else " No account type has a rule yet.")
+        raise HTTPException(400, str(e) + extra)
 
     allowed_ids = {d: {h["id"] for h in heads} for d, heads in expected.items()}
-    return rule, digits, account_col, bank, expected, allowed_ids
+    return rules.TARGET, digits, account_col, bank, expected, allowed_ids
 
 
 @router.post("/temp-trans/check-rules")
@@ -1291,10 +1293,10 @@ async def check_temp_rules(
 
     Reads only — nothing is changed until /check-rules/apply is called with
     the rows the user agreed to fix. Every row printed under the account is
-    judged by its direction: the RERA rule wants credits classified 'Master to
-    RERA' and debits 'RERA to IDW' or 'Customer Cancellation'. Which master
-    rows those are is resolved against this company's own heads by meaning
-    rather than exact spelling, so 'Master 2 RERA' satisfies it.
+    judged by its direction against the company's own `rule` table: a credit
+    must carry one of the heads marked CR (or BOTH) for this account type, a
+    debit one of those marked DR. Which heads those are is the user's answer,
+    entered on the Rules page, not anything written here.
 
     A row with no CR/DR marker cannot be judged and is reported separately
     rather than counted on either side. Scoped like the list itself.
@@ -1349,19 +1351,15 @@ async def check_temp_rules(
             row = dict(r)
             direction = row["direction"] or None
             row["direction"] = direction
-            if direction in allowed_ids:
-                if row["current_id"] in allowed_ids[direction]:
-                    row["status"] = "ok"
-                    ok += 1
-                else:
-                    # NULL is a conflict too: "must be" is not satisfied by
-                    # nothing.
-                    row["status"] = "conflict"
-                    conflicts += 1
-                    if row["is_locked"]:
-                        locked_conflicts += 1
+            status = rules.judge(direction, row["current_id"], allowed_ids)
+            row["status"] = status
+            if status == "ok":
+                ok += 1
+            elif status == "conflict":
+                conflicts += 1
+                if row["is_locked"]:
+                    locked_conflicts += 1
             else:
-                row["status"] = "no_direction"
                 no_direction += 1
             checked.append(row)
 
@@ -1371,8 +1369,9 @@ async def check_temp_rules(
         ecols = await _editable_columns(conn)
         target_label = (ecols.get(rule["mirrors"]) or {}).get("label") or rule["label"]
 
+    wanted = (account_type or "").strip().upper()
     return {
-        "account_type": (account_type or "").strip().upper(),
+        "account_type": wanted,
         "account": {
             "value": account_number,
             "label": _account_label(bank["account_number"], bank["company"],
@@ -1381,7 +1380,9 @@ async def check_temp_rules(
         },
         "target": {"field": field, "label": target_label},
         "expected": expected,
-        "why": {d: spec["why"] for d, spec in rule["directions"].items()},
+        # Written from the rule that just ran, so the sentence on screen can
+        # never describe a rule other than the one that judged these rows.
+        "why": rules.explain(wanted, expected),
         "rows": checked,
         "summary": {
             "total": len(checked),
