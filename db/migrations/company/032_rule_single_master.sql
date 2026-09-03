@@ -4,7 +4,7 @@
 --
 -- Undoes 031_rule_multi_master.sql and puts the grid back on one table.
 --
--- WHAT 031 DID AND WHY IT IS BEING REVERSED
+-- WHY 031 IS BEING REVERSED
 --
 -- 031 split `rule` into rule_head / rule_rera_head / rule_idw_head, one per
 -- master, unified by a view `rule_v`, and taught services/rules.py to pick a
@@ -17,48 +17,46 @@
 --      falling back to the RERA master. Account types come from each company's
 --      own account_type_master -- company_028 alone also has AMB, DPL and MERA
 --      -- so any type not in that list silently got RERA's heads offered for it
---      and RERA's column written to. The standing rule here is that nothing is
---      keyed to a particular company's words.
+--      and RERA's column written to. Nothing here is keyed to one company's
+--      words, and this was.
 --
 --   2. It was a second design for a feature that had just been built to a
---      different one. 028 made the grid deliberately single-master, and said so
+--      different one. 028 made the grid deliberately single-master and said so
 --      out loud: rera_head_id is the column Check Rules writes, so a head from
 --      another master could be shown and then not saved. If a second master
 --      ever earns rules, the plan of record is a per-rule target column -- one
---      table, one more field -- not three tables, a view, and a name-keyed map.
+--      table, one more field, resolved from the fieldmap -- not three tables, a
+--      view, and a name-keyed map.
 --
--- The split also cost every company its grid. 031 copies `rule` into
--- rule_rera_head and then drops `rule`, which is correct exactly once; it was
--- re-run by a hand-written script that dropped rule_rera_head first, so the
--- second pass found no `rule` to copy from and left every schema with empty
--- tables. That is a migration runner's job precisely because it refuses to
--- apply a file twice. Nothing outside `python -m db.migrate upgrade` should
--- ever write admin.schema_migrations.
+-- HOW THIS ONE IS WRITTEN, AND WHY IT MATTERS
 --
--- WHAT THIS FILE DOES
+-- By RENAMING rule_rera_head back to `rule`, not by creating a new table and
+-- copying into it. Three reasons, and the middle one is the whole lesson of the
+-- incident this migration cleans up:
 --
---   1. refuses to run if rule_head or rule_idw_head holds anything, so a
---      schema that did put data there is never silently emptied,
---   2. recreates `rule` exactly as 028 and 029 left it,
---   3. copies rule_rera_head back into it,
---   4. drops rule_v and the three tables,
---   5. puts rule_condition_head back to a real foreign key on rera_head_master,
---   6. re-seeds the three rows 028 seeded, for the companies whose grid was
---      emptied. ON CONFLICT DO NOTHING, so a company that still has them keeps
---      exactly what it has.
+--   * Renaming cannot lose rows. A create-and-copy has an order to get wrong,
+--     and getting it wrong is exactly how every company's grid was emptied: a
+--     hand-written re-apply script dropped `rule` before the copy that was
+--     supposed to read from it, so the copy found nothing and reported success.
+--   * rule_rera_head is already structurally identical to 028's `rule` -- same
+--     columns, same CHECKs, same UNIQUE, same FK to rera_head_master. Only the
+--     names differ, so renaming is the honest inverse of what 031 did.
+--   * A fresh CREATE TABLE cannot even run here. 031 gave rule_head the
+--     constraint name `rule_head_type_unique`, which is the name 028 gave the
+--     UNIQUE on `rule`. Index names are unique per schema, so creating `rule`
+--     while rule_head still exists fails with a duplicate relation -- which is
+--     the same collision that stopped 031 mid-run in the first place.
 --
--- Cells entered by hand since 028 cannot be recovered from here -- they were
--- data, not schema. They are restored separately, per company, from a record of
--- what those companies held before the wipe.
+-- Everything below is guarded, so this is safe on a schema where 031 landed
+-- cleanly, on one where it was re-run, and on one that somehow never got it.
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
 -- 1.  Refuse rather than discard.
 --
--- These two tables have no home in a single-master grid: `rule.head_id`
--- references rera_head_master, so a row pointing at head_master or
--- idw_head_master cannot be carried across. Every schema was checked before
--- this was written and all three tables were empty everywhere, which is why a
+-- rule.head_id references rera_head_master, so a row pointing at head_master or
+-- idw_head_master has no home in a single-master grid. Every schema was checked
+-- before this was written and both tables were empty everywhere, which is why a
 -- hard stop is safe to ask for -- if it ever fires, somebody has data that
 -- needs a decision, not a DROP.
 -- ---------------------------------------------------------------------------
@@ -89,11 +87,73 @@ BEGIN
 END $$;
 
 -- ---------------------------------------------------------------------------
--- 2.  `rule`, exactly as 028 created it and 029 tightened it.
+-- 2.  The view goes first -- it reads all three tables and would block the
+--     renames below. It owns no data of its own.
+-- ---------------------------------------------------------------------------
+
+DROP VIEW IF EXISTS rule_v;
+
+-- ---------------------------------------------------------------------------
+-- 3.  The other two masters' tables go next, BEFORE the rename below.
 --
--- IF NOT EXISTS so this is a no-op on a schema that somehow still has it. The
--- comments 028 carried are not repeated here; that file is still the one to
--- read for what a row means.
+-- Order is load-bearing. 031 named rule_head's unique constraint
+-- `rule_head_type_unique`, which is the name 028 gave the one on `rule` -- so
+-- renaming rule_rera_head's constraint to it while rule_head still exists
+-- fails with a duplicate relation, index names being unique per schema. The
+-- guard above has already established both tables are empty, so there is
+-- nothing here to weigh against getting the order right.
+-- ---------------------------------------------------------------------------
+
+DROP TABLE IF EXISTS rule_head;
+DROP TABLE IF EXISTS rule_idw_head;
+
+-- ---------------------------------------------------------------------------
+-- 4.  rule_rera_head becomes `rule` again, rows and all.
+--
+-- Every name 031 coined is put back to the one 028 and 029 used, so a schema
+-- that has been through 031 and 032 is indistinguishable from one that never
+-- left. RENAME CONSTRAINT also renames the index behind a UNIQUE or PRIMARY
+-- KEY, so the two index names come along without being touched separately; the
+-- plain index and the sequence do have to be named.
+--
+-- Guarded on `rule` not already existing, so this is a no-op on a schema where
+-- 031 never ran.
+-- ---------------------------------------------------------------------------
+
+DO $$
+BEGIN
+    IF to_regclass(current_schema() || '.rule_rera_head') IS NOT NULL
+       AND to_regclass(current_schema() || '.rule') IS NULL THEN
+
+        ALTER TABLE rule_rera_head RENAME TO rule;
+
+        ALTER TABLE rule RENAME CONSTRAINT rule_rera_head_pkey
+                                        TO rule_pkey;
+        ALTER TABLE rule RENAME CONSTRAINT rule_rera_head_type_unique
+                                        TO rule_head_type_unique;
+        ALTER TABLE rule RENAME CONSTRAINT rule_rera_head_direction_check
+                                        TO rule_direction_check;
+        ALTER TABLE rule RENAME CONSTRAINT rule_rera_head_account_type_upper
+                                        TO rule_account_type_upper;
+        ALTER TABLE rule RENAME CONSTRAINT rule_rera_head_account_type_filled
+                                        TO rule_account_type_filled;
+        ALTER TABLE rule RENAME CONSTRAINT rule_rera_head_head_id_fkey
+                                        TO rule_head_id_fkey;
+
+        ALTER SEQUENCE rule_rera_head_id_seq RENAME TO rule_id_seq;
+
+        IF to_regclass(current_schema() || '.rule_rera_head_account_type_idx')
+           IS NOT NULL THEN
+            ALTER INDEX rule_rera_head_account_type_idx
+                RENAME TO rule_account_type_idx;
+        END IF;
+    END IF;
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- 5.  Create `rule` from scratch only if there was nothing to rename -- a
+--     schema provisioned in some order this file cannot see. Same shape 028
+--     created and 029 tightened.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS rule (
@@ -120,48 +180,17 @@ CREATE TABLE IF NOT EXISTS rule (
 CREATE INDEX IF NOT EXISTS rule_account_type_idx ON rule (account_type);
 
 -- ---------------------------------------------------------------------------
--- 3.  Carry rule_rera_head back.
---
--- Empty in every schema as of this migration, but written anyway: this file
--- has to be correct for a schema where 031 landed cleanly and was never
--- re-run, which is the state it was designed to produce.
--- ---------------------------------------------------------------------------
-
-DO $$
-BEGIN
-    IF to_regclass(current_schema() || '.rule_rera_head') IS NOT NULL THEN
-        INSERT INTO rule (head_id, account_type, direction, created_at, updated_at)
-        SELECT head_id, account_type, direction, created_at, updated_at
-          FROM rule_rera_head
-        ON CONFLICT (head_id, account_type) DO NOTHING;
-    END IF;
-END $$;
-
--- ---------------------------------------------------------------------------
--- 4.  Drop the split.
---
--- The view first, then the tables it reads -- CASCADE would do it either way,
--- but naming the order says the view is a reader and not something with data
--- of its own.
--- ---------------------------------------------------------------------------
-
-DROP VIEW  IF EXISTS rule_v;
-DROP TABLE IF EXISTS rule_head;
-DROP TABLE IF EXISTS rule_rera_head;
-DROP TABLE IF EXISTS rule_idw_head;
-
--- ---------------------------------------------------------------------------
--- 5.  rule_condition_head goes back to a real foreign key.
+-- 6.  rule_condition_head goes back to a real foreign key.
 --
 -- 031 dropped the FK and added master_kind so a condition could name a head
 -- from any of the three masters. With one master there is one place a head can
--- come from, and the database can enforce it again -- which is better than
--- Python enforcing it, because CASCADE then keeps the table honest when a head
--- is deleted in Master Data.
+-- come from, and the database can enforce it again -- which beats Python
+-- enforcing it, because CASCADE then keeps the table honest when a head is
+-- deleted in Master Data.
 --
--- Orphans are cleared first. There are none (the table is empty everywhere),
--- but ADD CONSTRAINT validates existing rows and a migration that can fail on
--- data it did not check is a migration that fails at the worst moment.
+-- Orphans are cleared first. There are none, but ADD CONSTRAINT validates the
+-- rows already there, and a migration that can fail on data it never checked is
+-- one that fails at the worst possible moment.
 -- ---------------------------------------------------------------------------
 
 ALTER TABLE rule_condition_head DROP COLUMN IF EXISTS master_kind;
@@ -177,7 +206,7 @@ ALTER TABLE rule_condition_head
     FOREIGN KEY (head_id) REFERENCES rera_head_master(id) ON DELETE CASCADE;
 
 -- =============================================================================
--- 6.  Re-seed the three rows 028 seeded.
+-- 7.  Re-seed the three rows 028 seeded.
 --
 -- Verbatim from 028, including the reason the join word is matched as (2|to)
 -- rather than rewritten: a backreference in the replacement is read as U+0001
@@ -186,6 +215,10 @@ ALTER TABLE rule_condition_head
 -- ON CONFLICT DO NOTHING throughout, so this restores a grid that was emptied
 -- and leaves alone one that was not. A company whose rera_head_master lacks a
 -- head gets no row for it, exactly as on day one.
+--
+-- Cells entered by hand since 028 are NOT recoverable from here -- they were
+-- data, not schema, and no migration can know them. They are restored per
+-- company from a record of what those companies held before the wipe.
 -- =============================================================================
 
 INSERT INTO rule (head_id, account_type, direction)

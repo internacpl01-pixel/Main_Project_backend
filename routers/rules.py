@@ -664,6 +664,10 @@ async def rule_summary(user: dict = Depends(get_company_user)):
     What the Rules page shows above the grid and what the Check Rules dialog
     uses to say whether a type has a rule at all — so a user picking a type with
     no rule learns it before running a check rather than from a 400 afterwards.
+
+    Conditions are counted alongside the grid cells, because a type judged
+    entirely by conditions does have a rule — reporting it as having none would
+    send someone to fill in a grid column they deliberately left blank.
     """
     async with company_connection(user["schema"]) as conn:
         rows = await conn.fetch(
@@ -679,5 +683,20 @@ async def rule_summary(user: dict = Depends(get_company_user)):
              ORDER BY 1
             """
         )
-    return {r["account_type"]: {"cr": r["cr"], "dr": r["dr"], "total": r["total"]}
-            for r in rows}
+        conds = await conn.fetch(
+            """
+            SELECT upper(btrim(account_type)) AS account_type, count(*) AS n
+              FROM rule_condition
+             WHERE is_active = true
+             GROUP BY 1
+            """
+        )
+
+    out = {r["account_type"]: {"cr": r["cr"], "dr": r["dr"],
+                               "total": r["total"], "conditions": 0}
+           for r in rows}
+    for c in conds:
+        out.setdefault(c["account_type"],
+                       {"cr": 0, "dr": 0, "total": 0, "conditions": 0})
+        out[c["account_type"]]["conditions"] = c["n"]
+    return dict(sorted(out.items()))

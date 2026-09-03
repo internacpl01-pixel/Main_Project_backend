@@ -1530,6 +1530,10 @@ async def apply_temp_rules(
         names = {h["id"]: h["name"] for heads in expected.values() for h in heads}
         names.update({h["id"]: h["name"]
                       for c in conditions for h in c["heads"]})
+        # The fieldmap's word for each column, so a refusal below names the
+        # column the way the user's own screens do rather than exposing
+        # field_text_1 — the same courtesy the check response already extends.
+        labels = {c["name"]: c["displayname"] for c in ctx["columns"]}
         by_head: dict[int, list[int]] = {}
         skipped_locked = 0
         found_ids: set[int] = set()
@@ -1550,7 +1554,8 @@ async def apply_temp_rules(
                     f"'{names.get(chosen, chosen)}' is not one the "
                     f"{(account_type or '').strip().upper()} rule allows for a "
                     f"{direction or 'directionless'} row"
-                    + (f" matching “{rules.phrase(cond)}”" if cond else "")
+                    + (f" matching “{rules.phrase(cond, labels.get(cond['subject_field']))}”"
+                       if cond else "")
                     + ". The rows may have changed since the check — run Check "
                       "Rules again.",
                 )
