@@ -1310,8 +1310,8 @@ async def _rule_context(conn, account_type: str, account_number: str) -> dict:
 @router.post("/temp-trans/check-rules")
 async def check_temp_rules(
     account_type: str = Body(..., description="The type the Bank master gives "
-                                              "the account — MASTER, RERA, IDW "
-                                              "or FREE."),
+                                              "the account — one of the company's "
+                                              "own rows in account_type_master."),
     account_number: str = Body(..., description="The account whose staged rows "
                                                 "to check, matched on digits "
                                                 "only."),

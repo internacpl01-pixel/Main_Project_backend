@@ -96,7 +96,8 @@ async def rule_matrix(user: dict = Depends(get_company_user)):
 
 @router.put("/cell", dependencies=[Depends(require_manager)])
 async def set_rule_cell(
-    head_id: int = Body(..., description="A row in the RERA Head master."),
+    head_id: int = Body(
+        ..., description=f"A row in {rules.TARGET['master_table']}."),
     account_type: str = Body(..., description="An active account type."),
     direction: str | None = Body(
         None, description="CR or DR — or null to clear the cell."),

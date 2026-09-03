@@ -2,7 +2,16 @@
 
 Runs against the real ASGI app with get_current_user overridden -- no login, no
 password, per the standing rule. Read-only apart from one condition it creates
-in company_028 and deletes again, and one grid cell it sets back to what it was.
+in company_028 and deletes again.
+
+Nothing here is pinned to a snapshot of the rules. Migration 033 removed the
+three seeded grid rows, so every rule in the database is now one a person
+entered and can change between runs; an assertion naming a head or a row count
+would fail on the next edit and teach everyone to ignore this file. What it
+asserts instead are the properties that must hold whatever the rules say: the
+summary agrees with the grid, a condition outranks the grid for exactly the rows
+it describes and no others, every rejection still rejects, and the state it
+found is the state it leaves.
 """
 import asyncio
 
@@ -54,15 +63,43 @@ async def main() -> None:
               "master_kind" in r.text, False)
         note("heads", len(m["heads"]))
         note("account types", m["account_types"])
+        head_ids = {h["id"] for h in m["heads"]}
         filled = {(h, t): d for h, row in m["cells"].items()
                   for t, d in row.items()}
-        check("five cells set", len(filled), 5)
+        note("cells set", len(filled))
+        check("every cell holds a direction the check accepts",
+              set(filled.values()) <= set(m["directions"]), True)
+        check("every cell names a type the page offers",
+              {t for _h, t in filled} <= set(m["account_types"]), True)
+
+        # Read once, up here, because the summary counts conditions too.
+        r = await cl.get("/rules/conditions")
+        check("GET /rules/conditions is 200", r.status_code, 200)
+        opts = r.json()
+        before = {c["id"] for c in opts["conditions"]}
+        note("conditions already written", len(before))
+
+        # 033 removed the seeded rules, so the grid holds nothing this file put
+        # there — every row in it was entered by a person and can change between
+        # runs. So assert the two endpoints agree with EACH OTHER rather than
+        # with a snapshot, which is the property that was actually worth pinning.
+        want: dict[str, dict] = {}
+        for (h, t), d in filled.items():
+            if int(h) not in head_ids:
+                continue          # summary joins active heads only; match it
+            e = want.setdefault(t, {"cr": 0, "dr": 0, "total": 0,
+                                    "conditions": 0})
+            e[d.lower()] += 1
+            e["total"] += 1
+        for c in opts["conditions"]:
+            if c["is_active"]:
+                want.setdefault(c["account_type"],
+                                {"cr": 0, "dr": 0, "total": 0,
+                                 "conditions": 0})["conditions"] += 1
 
         r = await cl.get("/rules/summary")
         check("GET /rules/summary is 200", r.status_code, 200)
-        check("summary matches the restored grid", r.json(),
-              {"IDW": {"cr": 1, "dr": 0, "total": 1, "conditions": 0},
-               "RERA": {"cr": 1, "dr": 3, "total": 4, "conditions": 0}})
+        check("summary agrees with the grid and the conditions", r.json(), want)
 
         print("\n-- check rules, grid only --")
         r = await cl.post("/transactions/temp-trans/check-rules",
@@ -71,18 +108,19 @@ async def main() -> None:
         check("check-rules is 200", r.status_code, 200)
         res = r.json()
         note("summary", res["summary"])
-        check("no conditions yet", res["conditions"], {})
-        check("every row judged by the grid",
-              {row["rule_id"] for row in res["rows"]}, {None})
+        check("no row is judged by a condition that does not exist",
+              {row["rule_id"] for row in res["rows"]} <= (before | {None}), True)
+        note("rows already judged by a condition",
+             sum(1 for row in res["rows"] if row["rule_id"] is not None))
+        # Which rule owns each row before this run adds one, compared per row
+        # further down: "nothing else changed hands" is the invariant, and a
+        # count cannot tell a swap from a no-op.
+        owner = {row["id"]: row["rule_id"] for row in res["rows"]}
         base_conflicts = res["summary"]["conflicts"]
         note("expected CR", [h["name"] for h in res["expected"]["CR"]])
         note("expected DR", [h["name"] for h in res["expected"]["DR"]])
 
         print("\n-- conditions --")
-        r = await cl.get("/rules/conditions")
-        check("GET /rules/conditions is 200", r.status_code, 200)
-        opts = r.json()
-        check("starts with none", opts["conditions"], [])
         ops = {o["name"] for o in opts["operators"]}
         check("contains is offered", "contains" in ops, True)
         note("operators", len(ops))
@@ -94,9 +132,17 @@ async def main() -> None:
 
         # A head deliberately NOT on the RERA/DR grid, to prove a condition can
         # admit one the grid leaves blank -- the semantics chosen on 2026-09-03.
-        off_grid = heads["Master to Free"]
-        check("'Master to Free' is not a grid answer for a RERA debit",
-              off_grid in {h["id"] for h in res["expected"]["DR"]}, False)
+        # Chosen from what the grid actually says rather than named outright:
+        # since 033 the grid is the company's, and any head named here could be
+        # on it by the next run.
+        dr_ids = {h["id"] for h in res["expected"]["DR"]}
+        off_grid_name = next(
+            (n for n in ("Master to Free",) if heads.get(n) not in dr_ids
+             and n in heads),
+            next(n for n, i in sorted(heads.items()) if i not in dr_ids))
+        off_grid = heads[off_grid_name]
+        check(f"'{off_grid_name}' is not a grid answer for a RERA debit",
+              off_grid in dr_ids, False)
 
         print("\n-- rejects bad input --")
         bad = {"account_type": "RERA", "direction": "DR",
@@ -141,8 +187,9 @@ async def main() -> None:
         # The Check Rules dropdown reads this to say whether a type has a rule
         # at all, so a condition has to register there too.
         rr = await cl.get("/rules/summary")
-        check("summary counts the condition",
-              rr.json()["RERA"]["conditions"], 1)
+        check("summary counts the new condition",
+              rr.json()["RERA"]["conditions"],
+              want.get("RERA", {}).get("conditions", 0) + 1)
 
         print("\n-- the condition outranks the grid --")
         r = await cl.post("/transactions/temp-trans/check-rules",
@@ -153,24 +200,33 @@ async def main() -> None:
         check("two rows judged by the condition", len(judged), 2)
         check("its heads are offered instead of the grid's",
               [h["name"] for h in res2["conditions"][str(cid)]["heads"]],
-              ["Master to Free"])
-        check("other rows still judged by the grid",
-              all(row["rule_id"] is None
-                  for row in res2["rows"] if row["rule_id"] != cid), True)
+              [off_grid_name])
+        # Per row, not per count: a condition that stole one row and handed back
+        # another would keep every total identical.
+        check("only the rows it describes changed hands",
+              {row["id"] for row in res2["rows"]
+               if row["rule_id"] != owner.get(row["id"])},
+              {row["id"] for row in judged})
         check("conflict count unchanged (heads are still unset)",
               res2["summary"]["conflicts"], base_conflicts)
 
         print("\n-- apply is re-checked server side --")
-        target = judged[0]
-        grid_head = res["expected"]["DR"][0]["id"]
-        rr = await cl.post("/transactions/temp-trans/check-rules/apply",
-                           json={"account_type": "RERA",
-                                 "account_number": ACCOUNT,
-                                 "rows": [{"id": target["id"],
-                                           "head_id": grid_head}]})
-        check("refuses a grid head on a row the condition owns",
-              rr.status_code, 400)
-        note("refusal", rr.json().get("detail", "")[:120])
+        # Needs a head the GRID allows for a RERA debit, to prove the condition
+        # is what the server re-checks against. Since 033 the RERA/DR column can
+        # legitimately be empty, and then there is no such head to send.
+        if not res["expected"]["DR"]:
+            note("skipped", "no head is on the RERA/DR grid to test against")
+        else:
+            target = judged[0]
+            grid_head = res["expected"]["DR"][0]["id"]
+            rr = await cl.post("/transactions/temp-trans/check-rules/apply",
+                               json={"account_type": "RERA",
+                                     "account_number": ACCOUNT,
+                                     "rows": [{"id": target["id"],
+                                               "head_id": grid_head}]})
+            check("refuses a grid head on a row the condition owns",
+                  rr.status_code, 400)
+            note("refusal", rr.json().get("detail", "")[:120])
 
         print("\n-- cleanup --")
         rr = await cl.delete(f"/rules/conditions/{cid}")
