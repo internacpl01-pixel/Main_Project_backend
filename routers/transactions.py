@@ -1294,9 +1294,9 @@ async def check_temp_rules(
     Reads only — nothing is changed until /check-rules/apply is called with
     the rows the user agreed to fix. Every row printed under the account is
     judged by its direction against the company's own `rule` table: a credit
-    must carry one of the heads marked CR (or BOTH) for this account type, a
-    debit one of those marked DR. Which heads those are is the user's answer,
-    entered on the Rules page, not anything written here.
+    must carry one of the heads marked CR for this account type, a debit one of
+    those marked DR. Which heads those are is the user's answer, entered on the
+    Rules page, not anything written here.
 
     A row with no CR/DR marker cannot be judged and is reported separately
     rather than counted on either side. Scoped like the list itself.

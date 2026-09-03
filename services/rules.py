@@ -8,9 +8,9 @@ Rules button on Imported Rows picks one account and judges its staged rows
 against the rows recorded for that account's type.
 
 One row of `rule` is one fact: this head, on this account type, means money in
-(CR), money out (DR), or either (BOTH). A head with no row for a type is simply
-not an answer there — which is how a blank cell on the Rules grid is stored, and
-why nothing here has to carry a list of what is "not allowed".
+(CR) or money out (DR). A head with no row for a type is simply not an answer
+there — which is how a blank cell on the Rules grid is stored, and why nothing
+here has to carry a list of what is "not allowed".
 
 This module used to hold the rule as a Python literal, with the heads named by
 spelling and matched against the company's master rows after folding. None of
@@ -38,13 +38,16 @@ TARGET = {
     "label": "RERA head",
 }
 
-# The directions a row can be judged in. BOTH is not one of them: it is an
-# answer a head can carry, meaning it satisfies either of these.
+# The directions a row can be judged in, and — since 029 dropped BOTH — the only
+# answers a cell of the grid can hold. A head means money in or money out; if it
+# genuinely means either, that is two rules on two account types, not one cell
+# saying nothing.
 DIRECTIONS = ("CR", "DR")
 
 
 class MissingRuleHeads(RuntimeError):
-    """This account type has no rule, or none its heads can still satisfy."""
+    """This account type has no rule, none its heads can satisfy, or one this
+    code cannot read."""
 
 
 async def allowed_heads(conn, account_type: str) -> dict[str, list[dict]]:
@@ -76,11 +79,16 @@ async def allowed_heads(conn, account_type: str) -> dict[str, list[dict]]:
 
     out: dict[str, list[dict]] = {d: [] for d in DIRECTIONS}
     for r in rows:
-        head = {"id": r["id"], "name": r["name"]}
-        # BOTH lands in both lists — that is the whole of what it means.
-        for d in (DIRECTIONS if r["direction"] == "BOTH" else (r["direction"],)):
-            if d in out:
-                out[d].append(head)
+        # The CHECK constraint on `rule` permits nothing but these, so anything
+        # else means the table was written around the API. Said out loud rather
+        # than skipped: a row quietly dropped here is a head that is no answer
+        # in either direction, which on screen looks like a rule nobody wrote.
+        if r["direction"] not in out:
+            raise MissingRuleHeads(
+                f"'{r['name']}' is stored against {account_type} with the "
+                f"direction {r['direction']!r}, which is not CR or DR. Open the "
+                f"Rules page and set that cell again.")
+        out[r["direction"]].append({"id": r["id"], "name": r["name"]})
 
     if not any(out.values()):
         raise MissingRuleHeads(

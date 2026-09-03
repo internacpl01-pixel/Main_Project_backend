@@ -2,9 +2,9 @@
 The rule grid: which heads are valid for which account type, in which direction.
 
 One screen backs this router — a table with one row per head and one column per
-account type, each cell holding CR, DR, Both or nothing. That grid is the whole
-rule now: Check Rules reads it to decide which staged rows are wrong AND which
-heads its Replace dropdown offers, so the two can never disagree.
+account type, each cell holding CR, DR or nothing. That grid is the whole rule
+now: Check Rules reads it to decide which staged rows are wrong AND which heads
+its Replace dropdown offers, so the two can never disagree.
 
 Both axes are read live and neither is written down anywhere:
 
@@ -35,10 +35,11 @@ router = APIRouter(prefix="/rules", tags=["rules"])
 # who may edit the heads themselves may say how they are used.
 require_manager = require_level(permissions.MANAGER)
 
-# What a cell may hold. '' is not one of them — clearing a cell deletes its row,
-# because "no rule" and "a rule saying nothing" are the same state and storing
-# both would let them drift.
-_DIRECTIONS = {"CR", "DR", "BOTH"}
+# What a cell may hold, and the same two the check judges by — one list, so the
+# grid cannot offer an answer the check would not recognise. '' is not one of
+# them: clearing a cell deletes its row, because "no rule" and "a rule saying
+# nothing" are the same state and storing both would let them drift.
+_DIRECTIONS = rules.DIRECTIONS
 
 
 @router.get("/matrix")
@@ -77,7 +78,7 @@ async def rule_matrix(user: dict = Depends(get_company_user)):
     return {
         "heads": [{"id": h["id"], "name": h["name"]} for h in heads],
         "account_types": [t["name"] for t in types],
-        "directions": sorted(_DIRECTIONS),
+        "directions": list(_DIRECTIONS),
         "cells": by_head,
         # What the grid is for, named by the same constants the check uses.
         "target": {"label": rules.TARGET["label"],
@@ -90,7 +91,7 @@ async def set_rule_cell(
     head_id: int = Body(..., description="A row in the RERA Head master."),
     account_type: str = Body(..., description="An active account type."),
     direction: str | None = Body(
-        None, description="CR, DR, BOTH — or null to clear the cell."),
+        None, description="CR or DR — or null to clear the cell."),
     user: dict = Depends(get_company_user),
 ):
     """Set or clear one cell of the grid.
@@ -112,7 +113,7 @@ async def set_rule_cell(
         direction = direction.strip().upper()
         if direction not in _DIRECTIONS:
             raise HTTPException(
-                400, f"Direction must be one of {', '.join(sorted(_DIRECTIONS))}, "
+                400, f"Direction must be {' or '.join(_DIRECTIONS)}, "
                      f"or empty to clear the cell.")
 
     async with company_connection(user["schema"]) as conn:
@@ -173,9 +174,9 @@ async def rule_summary(user: dict = Depends(get_company_user)):
         rows = await conn.fetch(
             f"""
             SELECT upper(btrim(r.account_type)) AS account_type,
-                   count(*) FILTER (WHERE r.direction IN ('CR', 'BOTH')) AS cr,
-                   count(*) FILTER (WHERE r.direction IN ('DR', 'BOTH')) AS dr,
-                   count(*)                                              AS total
+                   count(*) FILTER (WHERE r.direction = 'CR') AS cr,
+                   count(*) FILTER (WHERE r.direction = 'DR') AS dr,
+                   count(*)                                   AS total
               FROM rule r
               JOIN {rules.TARGET['master_table']} h ON h.id = r.head_id
              WHERE h.is_active = true
