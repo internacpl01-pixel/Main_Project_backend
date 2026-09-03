@@ -1211,13 +1211,13 @@ async def temp_trans_filter_options(user: dict = Depends(get_company_user)):
         return await _filter_options(conn, "temp_trans", where, params)
 
 
-async def _rule_context(conn, account_type: str, account_number: str):
+async def _rule_context(conn, account_type: str, account_number: str) -> dict:
     """Resolve everything a rule check and a rule fix share, or 400 saying why.
 
-    Returns (target, digits, account_col, bank, expected, allowed_ids), where
-    `target` names the column being judged, `expected` maps each direction to
-    the heads the `rule` table accepts for this account type, and `allowed_ids`
-    is the same thing as id sets.
+    Returns the account it resolved, the grid's heads per direction (`expected`,
+    and the same thing as id sets in `allowed_ids`), and the account type's
+    conditions with the columns they test — everything needed to decide any one
+    row, and nothing that depends on which row.
 
     Checked here, identically, on both endpoints — the fix must never trust
     the browser's copy of a check that may be minutes old, and since the rule
@@ -1263,12 +1263,35 @@ async def _rule_context(conn, account_type: str, account_number: str):
                  f"{'a ' + actual if actual else 'an untyped'} account in the "
                  f"Bank master, not {wanted}.")
 
+    # The target master is decided by the account type, not by what the user
+    # typed (the bank-master check above has already settled that they are the
+    # same string).  An unknown account type falls back to RERA, which is the
+    # same default the Rules grid uses.
+    target = rules.TARGET_BY_TYPE.get(wanted, rules.TARGET)
+
     # Read after the account has been confirmed to be of this type, so a type
     # with no rule is only reported once the account itself checks out — being
     # told "no rule for MASTER" about an account that is actually RERA would
     # send someone to the Rules page to fix the wrong thing.
+    #
+    # Conditions first, because whether the grid is allowed to be blank for this
+    # type depends on whether the user wrote any: a type judged entirely by
+    # conditions is a rule, and refusing to run it would be refusing to run the
+    # only thing the user did write.
+    columns = await custom_fields.data_columns(conn)
     try:
-        expected = await rules.allowed_heads(conn, wanted)
+        conditions = await rules.load_conditions(
+            conn, wanted, {c["name"] for c in columns})
+    except rules.MissingRuleHeads as e:
+        # Its own 400, without the "rules are set for" tail below: this is not
+        # a type with no rule, it is a rule that exists and cannot run, and the
+        # sentence already names it and says where to repair it.
+        raise HTTPException(400, str(e))
+
+    try:
+        expected = await rules.allowed_heads(
+            conn, wanted, allow_empty=bool(conditions),
+            master_table=target["master_table"])
     except rules.MissingRuleHeads as e:
         supported = await rules.supported_types(conn)
         extra = (f" Rules are set for: {', '.join(supported)}." if supported
@@ -1276,7 +1299,19 @@ async def _rule_context(conn, account_type: str, account_number: str):
         raise HTTPException(400, str(e) + extra)
 
     allowed_ids = {d: {h["id"] for h in heads} for d, heads in expected.items()}
-    return rules.TARGET, digits, account_col, bank, expected, allowed_ids
+    return {
+        "target": target,
+        "digits": digits,
+        "account_col": account_col,
+        "bank": bank,
+        "expected": expected,
+        "allowed_ids": allowed_ids,
+        "conditions": conditions,
+        # The columns those conditions test, resolved once: the row queries
+        # below select exactly these and nothing else user-named.
+        "fields": rules.subject_fields(conditions),
+        "columns": columns,
+    }
 
 
 @router.post("/temp-trans/check-rules")
@@ -1300,10 +1335,17 @@ async def check_temp_rules(
 
     A row with no CR/DR marker cannot be judged and is reported separately
     rather than counted on either side. Scoped like the list itself.
+
+    Conditions outrank the grid. A row the first matching condition describes is
+    judged by that condition alone and carries its id, so the dialog can say
+    which sentence decided it and offer that sentence's heads rather than the
+    column's general ones.
     """
     async with company_connection(user["schema"]) as conn:
-        rule, digits, account_col, bank, expected, allowed_ids = \
-            await _rule_context(conn, account_type, account_number)
+        ctx = await _rule_context(conn, account_type, account_number)
+        rule, digits, account_col = ctx["target"], ctx["digits"], ctx["account_col"]
+        bank, expected, allowed_ids = ctx["bank"], ctx["expected"], ctx["allowed_ids"]
+        conditions, fields = ctx["conditions"], ctx["fields"]
 
         filters = ["1=1"]
         params: list = []
@@ -1323,7 +1365,7 @@ async def check_temp_rules(
 
         # Date and amount ride along so the dialog can say which rows it
         # means — a conflict list of bare ids cannot be reviewed.
-        columns = await custom_fields.data_columns(conn)
+        columns = ctx["columns"]
         date_col = await custom_fields.date_column(conn)
         date_sel = (f"{_date_expr(date_col, columns)} AS txn_date,"
                     if date_col else "NULL::date AS txn_date,")
@@ -1336,9 +1378,16 @@ async def check_temp_rules(
                    t.amount,
                    {date_sel}
                    t.{field} AS current_id,
-                   m.name AS current_name
+                   CASE WHEN hm.id IS NOT NULL THEN 'head'
+                        WHEN rm.id IS NOT NULL THEN 'rera_head'
+                        WHEN im.id IS NOT NULL THEN 'idw_head'
+                   END AS current_master_kind,
+                   COALESCE(hm.name, rm.name, im.name) AS current_name
+                   {rules.subject_sql(fields)}
               FROM temp_trans t
-              LEFT JOIN {rule['master_table']} m ON m.id = t.{field}
+              LEFT JOIN head_master hm      ON hm.id      = t.head_id
+              LEFT JOIN rera_head_master rm ON rm.id      = t.rera_head_id
+              LEFT JOIN idw_head_master im  ON im.id      = t.idw_head_id
              WHERE {' AND '.join(filters)}
              ORDER BY t.batch_id, t.row_number
             """,
@@ -1351,8 +1400,18 @@ async def check_temp_rules(
             row = dict(r)
             direction = row["direction"] or None
             row["direction"] = direction
-            status = rules.judge(direction, row["current_id"], allowed_ids)
+            # Popped, not read: the columns the conditions test were fetched for
+            # this decision, and shipping them back under s0/s1 would put raw
+            # statement text on the wire under names nothing can explain.
+            subjects = rules.take_subjects(row, fields)
+            _heads, ids, cond = rules.resolve(
+                direction, subjects, conditions, expected, allowed_ids)
+            status = rules.judge(ids, row["current_id"])
             row["status"] = status
+            # Which sentence judged this row — null when the grid did. The
+            # dialog reads its heads from the same place, so what it offers as
+            # a replacement is always what the check just used.
+            row["rule_id"] = cond["id"] if cond else None
             if status == "ok":
                 ok += 1
             elif status == "conflict":
@@ -1368,6 +1427,9 @@ async def check_temp_rules(
         # language, not this file's.
         ecols = await _editable_columns(conn)
         target_label = (ecols.get(rule["mirrors"]) or {}).get("label") or rule["label"]
+        # The fieldmap's word for each column, so a condition reads as "when a
+        # debit's Narration contains..." rather than naming the raw column.
+        labels = {c["name"]: c["displayname"] for c in columns}
 
     wanted = (account_type or "").strip().upper()
     return {
@@ -1382,7 +1444,17 @@ async def check_temp_rules(
         "expected": expected,
         # Written from the rule that just ran, so the sentence on screen can
         # never describe a rule other than the one that judged these rows.
-        "why": rules.explain(wanted, expected),
+        "why": rules.explain(wanted, expected, conditions),
+        # Keyed by id, because that is how a row refers to the one that judged
+        # it. Sent once rather than repeated on every row it decided.
+        "conditions": {
+            str(c["id"]): {
+                "sentence": rules.describe(c, labels.get(c["subject_field"])),
+                "direction": c["direction"],
+                "heads": c["heads"],
+            }
+            for c in conditions
+        },
         "rows": checked,
         "summary": {
             "total": len(checked),
@@ -1406,9 +1478,13 @@ async def apply_temp_rules(
     """Replace the heads the rule found wrong, as chosen in the dialog.
 
     Applies the rule rather than trusting the request: every target head is
-    re-checked against what the rule allows for that row's direction, on the
-    row's current state — this is not a bulk edit endpoint wearing a rule's
-    name. Locked rows are skipped and counted, the same standing the padlock
+    re-checked against what the rule allows for that row in particular — its
+    direction, and any condition that describes it — on the row's current
+    state. This is not a bulk edit endpoint wearing a rule's name, and it is
+    the one place that matters, since a condition can admit a head the grid
+    leaves blank and must not admit it anywhere else.
+
+    Locked rows are skipped and counted, the same standing the padlock
     has everywhere else; rows that no longer match the account or the caller's
     scope are skipped too, because they are no longer what the user saw.
 
@@ -1425,8 +1501,10 @@ async def apply_temp_rules(
             raise HTTPException(400, "Each row needs an id and a head_id.")
 
     async with company_connection(user["schema"]) as conn:
-        rule, digits, account_col, bank, expected, allowed_ids = \
-            await _rule_context(conn, account_type, account_number)
+        ctx = await _rule_context(conn, account_type, account_number)
+        rule, digits, account_col = ctx["target"], ctx["digits"], ctx["account_col"]
+        expected, allowed_ids = ctx["expected"], ctx["allowed_ids"]
+        conditions, fields = ctx["conditions"], ctx["fields"]
 
         filters = ["t.id = ANY($1::bigint[])"]
         params: list = [list(wanted_rows)]
@@ -1454,6 +1532,7 @@ async def apply_temp_rules(
             f"""
             SELECT t.id, t.is_locked,
                    upper(btrim(coalesce(t.credit_debit, ''))) AS direction
+                   {rules.subject_sql(fields)}
               FROM temp_trans t
              WHERE {' AND '.join(filters)}
              FOR UPDATE
@@ -1462,6 +1541,8 @@ async def apply_temp_rules(
         )
 
         names = {h["id"]: h["name"] for heads in expected.values() for h in heads}
+        names.update({h["id"]: h["name"]
+                      for c in conditions for h in c["heads"]})
         by_head: dict[int, list[int]] = {}
         skipped_locked = 0
         found_ids: set[int] = set()
@@ -1469,13 +1550,22 @@ async def apply_temp_rules(
             found_ids.add(r["id"])
             chosen = wanted_rows[r["id"]]
             direction = r["direction"] or None
-            if direction not in allowed_ids or chosen not in allowed_ids[direction]:
+            # Re-decided per row, not per request: since a condition can give
+            # two rows on the same side different answers, "what this row is
+            # allowed to be" is a question about the row. Same call the check
+            # made, on the row as it stands now.
+            _heads, ids, cond = rules.resolve(
+                direction, rules.subject_values(r, fields),
+                conditions, expected, allowed_ids)
+            if ids is None or chosen not in ids:
                 raise HTTPException(
                     400,
-                    f"Head {chosen} is not one the "
+                    f"'{names.get(chosen, chosen)}' is not one the "
                     f"{(account_type or '').strip().upper()} rule allows for a "
-                    f"{direction or 'directionless'} row. The rows may have "
-                    f"changed since the check — run Check Rules again.",
+                    f"{direction or 'directionless'} row"
+                    + (f" matching “{rules.phrase(cond)}”" if cond else "")
+                    + ". The rows may have changed since the check — run Check "
+                      "Rules again.",
                 )
             if r["is_locked"]:
                 skipped_locked += 1
