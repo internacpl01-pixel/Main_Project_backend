@@ -6,22 +6,21 @@ account type, each cell holding CR, DR or nothing. That grid is the whole rule
 now: Check Rules reads it to decide which staged rows are wrong AND which heads
 its Replace dropdown offers, so the two can never disagree.
 
-One master table backs every row: MASTER and FREE accounts draw their heads
-from head_master, RERA accounts from rera_head_master, and IDW/TCP accounts
-from idw_head_master.  The grid shows all three masters together because a
-condition for any account type may point at any master, but the check that
-judges a row resolves the right master from the account type and reads only
-the rows that belong there.
+Both axes are read live and neither is written down anywhere:
 
-Neither axis is written down here. The rows come from whichever master the
-account type's column targets, and the columns come from account_type_master,
-both read live, so adding either on the Master Data page changes this grid
-with nothing to deploy.
+  rows    -> rera_head_master, the master Check Rules writes its answer into
+  columns -> account_type_master, the same list the Bank master types accounts
+             from
 
-The grid itself reads from rule_v (a union of rule_head, rule_rera_head and
-rule_idw_head), so a cell set under MASTER is visible the moment it is saved
-and a cell set under RERA is visible the moment it is saved, with no code
-path distinguishing the two.
+so adding a head or an account type on the Master Data page changes this grid
+with no migration and no code change here.
+
+Conditions sit under the grid: "a RERA debit whose narration mentions REFUND is
+a Cust Cancellation". Same two axes, plus one test on one column of the
+statement, and the heads that are the answer when it passes.
+
+See company/028_rule_table.sql, company/030_rule_condition.sql and
+company/032_rule_single_master.sql.
 """
 from __future__ import annotations
 
@@ -50,14 +49,6 @@ require_manager = require_level(permissions.MANAGER)
 # nothing" are the same state and storing both would let them drift.
 _DIRECTIONS = rules.DIRECTIONS
 
-# All master tables that can appear on the grid, keyed by the master_kind
-# string rule_v carries.
-_GRID_MASTERS = {
-    "head":        {"table": "head_master",      "label": "Head"},
-    "rera_head":   {"table": "rera_head_master", "label": "RERA head"},
-    "idw_head":    {"table": "idw_head_master",  "label": "TCP head"},
-}
-
 
 @router.get("/matrix")
 async def rule_matrix(user: dict = Depends(get_company_user)):
@@ -70,56 +61,42 @@ async def rule_matrix(user: dict = Depends(get_company_user)):
     Inactive heads and inactive account types are left out. They cannot be
     picked in Master Data either, and offering a rule about a head nobody can
     choose would be a rule that reads as broken the moment anyone runs it.
-
-    The grid spans all three masters, because conditions may point at any of
-    them regardless of the account type.  The response groups heads by
-    master_kind so the frontend can render the correct table for each group.
     """
     async with company_connection(user["schema"]) as conn:
-        heads_by_kind: dict[str, list[dict]] = {}
-        for kind, info in _GRID_MASTERS.items():
-            rows = await conn.fetch(
-                f"SELECT id, name FROM {info['table']} "
-                f"WHERE is_active = true ORDER BY name, id"
-            )
-            heads_by_kind[kind] = [
-                {"id": r["id"], "name": r["name"], "master_kind": kind}
-                for r in rows
-            ]
-
+        heads = await conn.fetch(
+            f"SELECT id, name FROM {rules.TARGET['master_table']} "
+            f"WHERE is_active = true ORDER BY name, id"
+        )
         types = await conn.fetch(
             "SELECT upper(btrim(name)) AS name FROM account_type_master "
             "WHERE is_active = true AND btrim(name) <> '' "
             "GROUP BY 1 ORDER BY 1"
         )
         cells = await conn.fetch(
-            "SELECT head_id, master_kind, upper(btrim(account_type)) AS account_type, "
-            "direction FROM rule_v"
+            "SELECT head_id, upper(btrim(account_type)) AS account_type, direction "
+            "FROM rule"
         )
 
     # Keyed by head then type, which is how the grid is drawn — the browser
     # should not have to index a flat list to paint a cell.
     by_head: dict[str, dict[str, str]] = {}
     for c in cells:
-        key = f"{c['master_kind']}:{c['head_id']}"
-        by_head.setdefault(key, {})[c["account_type"]] = c["direction"]
+        by_head.setdefault(str(c["head_id"]), {})[c["account_type"]] = c["direction"]
 
     return {
-        "heads_by_kind": heads_by_kind,
+        "heads": [{"id": h["id"], "name": h["name"]} for h in heads],
         "account_types": [t["name"] for t in types],
         "directions": list(_DIRECTIONS),
         "cells": by_head,
-        "target": {"label": "Head",
-                   "master_tables": {k: v["table"]
-                                     for k, v in _GRID_MASTERS.items()}},
+        # What the grid is for, named by the same constants the check uses.
+        "target": {"label": rules.TARGET["label"],
+                   "master_table": rules.TARGET["master_table"]},
     }
 
 
 @router.put("/cell", dependencies=[Depends(require_manager)])
 async def set_rule_cell(
-    head_id: int = Body(..., description="A row in one of the head masters."),
-    master_kind: str = Body(..., description="Which master the head comes from "
-                                             "(head, rera_head, idw_head)."),
+    head_id: int = Body(..., description="A row in the RERA Head master."),
     account_type: str = Body(..., description="An active account type."),
     direction: str | None = Body(
         None, description="CR or DR — or null to clear the cell."),
@@ -147,23 +124,14 @@ async def set_rule_cell(
                 400, f"Direction must be {' or '.join(_DIRECTIONS)}, "
                      f"or empty to clear the cell.")
 
-    master_info = _GRID_MASTERS.get(master_kind)
-    if not master_info:
-        raise HTTPException(
-            400, f"master_kind must be one of {', '.join(_GRID_MASTERS)}.")
-
-    table = master_info["table"]
-    label = master_info["label"]
-    rule_table_name = rules.rule_table(wanted_type)
-
     async with company_connection(user["schema"]) as conn:
         head = await conn.fetchrow(
-            f"SELECT id, name, is_active FROM {table} "
+            f"SELECT id, name, is_active FROM {rules.TARGET['master_table']} "
             f"WHERE id = $1", head_id,
         )
         if head is None:
             raise HTTPException(
-                400, f"There is no {label} with id {head_id}.")
+                400, f"There is no {rules.TARGET['label']} with id {head_id}.")
         if not head["is_active"]:
             raise HTTPException(
                 400, f"'{head['name']}' is switched off in Master Data, so it "
@@ -181,14 +149,14 @@ async def set_rule_cell(
 
         if direction is None:
             await conn.execute(
-                f"DELETE FROM {rule_table_name} WHERE head_id = $1 "
+                "DELETE FROM rule WHERE head_id = $1 "
                 "AND upper(btrim(account_type)) = $2",
                 head_id, wanted_type,
             )
         else:
             await conn.execute(
-                f"""
-                INSERT INTO {rule_table_name} (head_id, account_type, direction)
+                """
+                INSERT INTO rule (head_id, account_type, direction)
                 VALUES ($1, $2, $3)
                 ON CONFLICT (head_id, account_type)
                 DO UPDATE SET direction = EXCLUDED.direction, updated_at = now()
@@ -196,10 +164,9 @@ async def set_rule_cell(
                 head_id, wanted_type, direction,
             )
 
-    logger.info("[rules] %s: %s / %s -> %s by %s (via %s)",
-                user["schema"], head["name"], wanted_type,
-                direction or "cleared", user.get("username"), rule_table_name)
-    return {"status": "saved", "head_id": head_id, "master_kind": master_kind,
+    logger.info("[rules] %s: %s / %s -> %s by %s", user["schema"], head["name"],
+                wanted_type, direction or "cleared", user.get("username"))
+    return {"status": "saved", "head_id": head_id,
             "account_type": wanted_type, "direction": direction}
 
 
@@ -223,15 +190,6 @@ async def _subject_columns(conn) -> dict[str, dict]:
     }
 
 
-async def _master_lookup(conn, master_kind: str, head_id: int):
-    """One head from the right master, or None."""
-    table = _GRID_MASTERS.get(master_kind, {}).get("table")
-    if not table:
-        return None
-    return await conn.fetchrow(
-        f"SELECT id, name, is_active FROM {table} WHERE id = $1", head_id)
-
-
 async def _fetch_conditions(conn, where: str = "", *params) -> list[dict]:
     """Every condition, active or not, with its heads and its own labels.
 
@@ -241,24 +199,17 @@ async def _fetch_conditions(conn, where: str = "", *params) -> list[dict]:
     one so you can fix it.
     """
     rows = await conn.fetch(
-        """
+        f"""
         SELECT c.*,
                coalesce(json_agg(json_build_object(
                             'id', h.id, 'name', h.name,
-                            'master_kind', ch.master_kind,
                             'is_active', h.is_active)
                         ORDER BY ch.sort_order, h.name, h.id)
                         FILTER (WHERE h.id IS NOT NULL), '[]'::json) AS heads
           FROM rule_condition c
           LEFT JOIN rule_condition_head ch ON ch.condition_id = c.id
-          LEFT JOIN (
-              SELECT id, name, is_active, 'head' AS mk FROM head_master
-              UNION ALL
-              SELECT id, name, is_active, 'rera_head' FROM rera_head_master
-              UNION ALL
-              SELECT id, name, is_active, 'idw_head' FROM idw_head_master
-          ) h ON h.id = ch.head_id AND h.mk = ch.master_kind
-        """ + where + """
+          LEFT JOIN {rules.TARGET['master_table']} h ON h.id = ch.head_id
+        {where}
          GROUP BY c.id
          ORDER BY c.account_type, c.direction, c.sort_order, c.id
         """,
@@ -303,26 +254,14 @@ async def list_conditions(user: dict = Depends(get_company_user)):
     builder rendered without the operator list would have to carry its own copy
     of what the check implements — which is exactly the drift this feature
     exists to remove.
-
-    Conditions may point at heads from any master, so the heads dropdown spans
-    all three.  Each head carries its master_kind so the save endpoint knows
-    where to write it.
     """
     async with company_connection(user["schema"]) as conn:
         conditions = await _fetch_conditions(conn)
         columns = await _subject_columns(conn)
-
-        heads_by_kind: dict[str, list[dict]] = {}
-        for kind, info in _GRID_MASTERS.items():
-            rows = await conn.fetch(
-                f"SELECT id, name FROM {info['table']} "
-                f"WHERE is_active = true ORDER BY name, id"
-            )
-            heads_by_kind[kind] = [
-                {"id": r["id"], "name": r["name"], "master_kind": kind}
-                for r in rows
-            ]
-
+        heads = await conn.fetch(
+            f"SELECT id, name FROM {rules.TARGET['master_table']} "
+            f"WHERE is_active = true ORDER BY name, id"
+        )
         types = await conn.fetch(
             "SELECT upper(btrim(name)) AS name FROM account_type_master "
             "WHERE is_active = true AND btrim(name) <> '' "
@@ -333,22 +272,17 @@ async def list_conditions(user: dict = Depends(get_company_user)):
         "conditions": conditions,
         "columns": list(columns.values()),
         "operators": rules.operator_catalog(),
-        "heads_by_kind": heads_by_kind,
+        "heads": [{"id": h["id"], "name": h["name"]} for h in heads],
         "account_types": [t["name"] for t in types],
         "directions": list(_DIRECTIONS),
-        "target": {"label": "Head",
-                   "master_tables": {k: v["table"]
-                                     for k, v in _GRID_MASTERS.items()}},
+        "target": {"label": rules.TARGET["label"],
+                   "master_table": rules.TARGET["master_table"]},
     }
 
 
 async def _clean(conn, account_type, direction, subject_field, operator,
-                 value1, value2, head_entries, require_heads: bool = True) -> dict:
+                 value1, value2, head_ids, require_heads: bool = True) -> dict:
     """Check a condition against the live masters and columns, or 400 saying why.
-
-    head_entries is a list of {"id": int, "master_kind": str} dicts, one per
-    head the condition points at.  This is the multi-master replacement for the
-    flat list of ints the old _clean accepted.
 
     Everything a condition names is checked here rather than trusted, because
     every one of them is a name that can stop existing: an account type can be
@@ -410,68 +344,48 @@ async def _clean(conn, account_type, direction, subject_field, operator,
     # answer should be is still the user's decision at that point, and demanding
     # one before they can see how many rows the test describes gets the two
     # halves the wrong way round.
-    cleaned_heads: list[dict] = []
+    ids: list[int] = []
     if require_heads:
-        if not head_entries:
+        for raw in head_ids or []:
+            try:
+                ids.append(int(raw))
+            except (TypeError, ValueError):
+                raise HTTPException(400, "Each head must be an id.")
+        # Order matters: the first is what Replace preselects, the same standing
+        # the grid's first head has. dict.fromkeys de-duplicates without losing it.
+        ids = list(dict.fromkeys(ids))
+        if not ids:
             raise HTTPException(
                 400, "A condition needs at least one head to point at — it is "
                      "the answer when the test passes.")
 
-        # Validate each head against its own master, in one query per master.
-        by_kind: dict[str, list[int]] = {}
-        for entry in head_entries:
-            try:
-                hid = int(entry["id"])
-            except (TypeError, ValueError):
-                raise HTTPException(400, "Each head must be an id.")
-            mk = entry.get("master_kind") or "rera_head"
-            by_kind.setdefault(mk, []).append(hid)
-
-        # Order matters: the first is what Replace preselects, the same standing
-        # the grid's first head has. dict.fromkeys de-duplicates without losing it.
-        seen: set[tuple[str, int]] = set()
-        for mk, ids in by_kind.items():
-            info = _GRID_MASTERS.get(mk)
-            if not info:
-                raise HTTPException(400, f"Unknown master kind: {mk}")
-            table = info["table"]
-            label = info["label"]
-            found = {r["id"]: r for r in await conn.fetch(
-                f"SELECT id, name, is_active FROM {table} "
-                f"WHERE id = ANY($1::bigint[])", ids)}
-            for hid in ids:
-                pair = (mk, hid)
-                if pair in seen:
-                    continue
-                seen.add(pair)
-                row = found.get(hid)
-                if row is None:
-                    raise HTTPException(
-                        400, f"There is no {label} with id {hid}.")
-                if not row["is_active"]:
-                    raise HTTPException(
-                        400, f"'{row['name']}' is switched off in Master Data, "
-                             f"so a condition cannot point at it. Reactivate it "
-                             f"first.")
-                cleaned_heads.append({"id": hid, "master_kind": mk})
+        found = {r["id"]: r for r in await conn.fetch(
+            f"SELECT id, name, is_active FROM {rules.TARGET['master_table']} "
+            f"WHERE id = ANY($1::bigint[])", ids)}
+        for head_id in ids:
+            row = found.get(head_id)
+            if row is None:
+                raise HTTPException(
+                    400, f"There is no {rules.TARGET['label']} with id {head_id}.")
+            if not row["is_active"]:
+                raise HTTPException(
+                    400, f"'{row['name']}' is switched off in Master Data, so a "
+                         f"condition cannot point at it. Reactivate it first.")
 
     return {"account_type": wanted_type, "direction": wanted_dir,
             "subject_field": field, "operator": (operator or "").strip(),
-            "value1": v1, "value2": v2, "head_entries": cleaned_heads,
+            "value1": v1, "value2": v2, "head_ids": ids,
             "column": col, "operator_def": op}
 
 
-async def _write_heads(conn, condition_id: int,
-                       head_entries: list[dict]) -> None:
+async def _write_heads(conn, condition_id: int, head_ids: list[int]) -> None:
     """Replace a condition's heads with exactly this list, in this order."""
     await conn.execute(
         "DELETE FROM rule_condition_head WHERE condition_id = $1", condition_id)
-    for i, entry in enumerate(head_entries):
+    for i, head_id in enumerate(head_ids):
         await conn.execute(
-            "INSERT INTO rule_condition_head "
-            "(condition_id, head_id, master_kind, sort_order) "
-            "VALUES ($1, $2, $3, $4)",
-            condition_id, entry["id"], entry["master_kind"], i)
+            "INSERT INTO rule_condition_head (condition_id, head_id, sort_order) "
+            "VALUES ($1, $2, $3)", condition_id, head_id, i)
 
 
 @router.post("/conditions", dependencies=[Depends(require_manager)])
@@ -482,9 +396,9 @@ async def create_condition(
     operator: str = Body(..., description="One of the tests from /rules/conditions."),
     value1: str | None = Body(None),
     value2: str | None = Body(None, description="Only 'between' uses this."),
-    head_entries: list[dict] = Body(..., description="The answer when the test "
-                                          "passes; the first is what Replace "
-                                          "preselects. Each is {id, master_kind}."),
+    head_ids: list[int] = Body(..., description="The answer when the test "
+                                                "passes; the first is what "
+                                                "Replace preselects."),
     is_active: bool = Body(True),
     user: dict = Depends(get_company_user),
 ):
@@ -496,7 +410,7 @@ async def create_condition(
     """
     async with company_connection(user["schema"]) as conn:
         clean = await _clean(conn, account_type, direction, subject_field,
-                             operator, value1, value2, head_entries)
+                             operator, value1, value2, head_ids)
         nxt = await conn.fetchval(
             "SELECT coalesce(max(sort_order), -1) + 1 FROM rule_condition "
             "WHERE account_type = $1 AND direction = $2",
@@ -513,7 +427,7 @@ async def create_condition(
             clean["operator"], clean["value1"], clean["value2"], nxt,
             bool(is_active),
         )
-        await _write_heads(conn, new_id, clean["head_entries"])
+        await _write_heads(conn, new_id, clean["head_ids"])
         saved = await _fetch_conditions(conn, "WHERE c.id = $1", new_id)
 
     logger.info("[rules] %s: condition %s added by %s", user["schema"], new_id,
@@ -530,7 +444,7 @@ async def update_condition(
     operator: str = Body(...),
     value1: str | None = Body(None),
     value2: str | None = Body(None),
-    head_entries: list[dict] = Body(...),
+    head_ids: list[int] = Body(...),
     is_active: bool = Body(True),
     user: dict = Depends(get_company_user),
 ):
@@ -555,7 +469,7 @@ async def update_condition(
             raise HTTPException(404, "That condition no longer exists.")
 
         clean = await _clean(conn, account_type, direction, subject_field,
-                             operator, value1, value2, head_entries)
+                             operator, value1, value2, head_ids)
         moved = (current["account_type"] != clean["account_type"]
                  or current["direction"] != clean["direction"])
         order = await conn.fetchval(
@@ -576,7 +490,7 @@ async def update_condition(
             clean["subject_field"], clean["operator"], clean["value1"],
             clean["value2"], bool(is_active), order,
         )
-        await _write_heads(conn, condition_id, clean["head_entries"])
+        await _write_heads(conn, condition_id, clean["head_ids"])
         saved = await _fetch_conditions(conn, "WHERE c.id = $1", condition_id)
 
     logger.info("[rules] %s: condition %s edited by %s", user["schema"],
@@ -750,26 +664,17 @@ async def rule_summary(user: dict = Depends(get_company_user)):
     What the Rules page shows above the grid and what the Check Rules dialog
     uses to say whether a type has a rule at all — so a user picking a type with
     no rule learns it before running a check rather than from a 400 afterwards.
-
-    Reads from rule_v and joins to each master table separately, since rule_v
-    rows can come from any of the three.
     """
     async with company_connection(user["schema"]) as conn:
         rows = await conn.fetch(
-            """
-            WITH active_heads AS (
-                SELECT id, 'head'        AS mk FROM head_master      WHERE is_active = true
-                UNION ALL
-                SELECT id, 'rera_head'   AS mk FROM rera_head_master WHERE is_active = true
-                UNION ALL
-                SELECT id, 'idw_head'    AS mk FROM idw_head_master  WHERE is_active = true
-            )
+            f"""
             SELECT upper(btrim(r.account_type)) AS account_type,
                    count(*) FILTER (WHERE r.direction = 'CR') AS cr,
                    count(*) FILTER (WHERE r.direction = 'DR') AS dr,
                    count(*)                                   AS total
-              FROM rule_v r
-              JOIN active_heads h ON h.id = r.head_id AND h.mk = r.master_kind
+              FROM rule r
+              JOIN {rules.TARGET['master_table']} h ON h.id = r.head_id
+             WHERE h.is_active = true
              GROUP BY 1
              ORDER BY 1
             """

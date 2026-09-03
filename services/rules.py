@@ -33,7 +33,7 @@ compared here, in Python; the operator is a lookup in OPERATORS below and an
 unknown one makes the rule refuse to run rather than fall through.
 
 See company/028_rule_table.sql, company/030_rule_condition.sql and
-company/031_rule_multi_master.sql.
+company/032_rule_single_master.sql.
 """
 from __future__ import annotations
 
@@ -41,135 +41,35 @@ import json
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
-# =============================================================================
-# Multi-master target resolution
-# =============================================================================
-
 # What every rule judges and writes.
 #
-# Most of this file used to assume one master only (rera_head_master), because
-# rera_head_id was the only column Check Rules ever wrote.  That is no longer
-# true: MASTER accounts carry head_id, RERA accounts carry rera_head_id, and
-# IDW/TCP accounts carry idw_head_id.  The grid on the Rules page shows all
-# three masters together, and a rule row names the master it came from by
-# pointing at it.
+# Fixed, and honestly so: the heads on the Rules grid come from
+# rera_head_master because rera_head_id is the column Check Rules puts its
+# answer into. A head offered from any other master could be shown in the
+# dropdown and then not saved, which is worse than not offering it.
 #
-# TARGET_BY_TYPE is the answer to "which master does this account type use?".
-# It is keyed on the upper-cased account type, because that is how every
-# comparison in this module and in the routers is written.  An account type
-# not listed here — one added on the Master Data page that nobody has given a
-# rule to yet — is treated as the RERA master for the grid display, because
-# the grid must show something; writes and checks both validate the head
-# against the live master, so a mismatch is rejected rather than stored.
-TARGET_BY_TYPE: dict[str, dict] = {
-    "MASTER": {
-        "field": "head_id",
-        "mirrors": "head",
-        "master_table": "head_master",
-        "label": "Head",
-    },
-    "RERA": {
-        "field": "rera_head_id",
-        "mirrors": "rera_head",
-        "master_table": "rera_head_master",
-        "label": "RERA head",
-    },
-    "IDW": {
-        "field": "idw_head_id",
-        "mirrors": "idw_head",
-        "master_table": "idw_head_master",
-        "label": "TCP head",
-    },
-    "TCP": {
-        "field": "idw_head_id",
-        "mirrors": "idw_head",
-        "master_table": "idw_head_master",
-        "label": "TCP head",
-    },
-    "FREE": {
-        "field": "head_id",
-        "mirrors": "head",
-        "master_table": "head_master",
-        "label": "Head",
-    },
+# 031 tried to lift this by splitting the rule table one-per-master and picking
+# between them with a dict keyed on the words MASTER, RERA, IDW, TCP and FREE.
+# That is the one thing this project does not do: account types are each
+# company's own rows in account_type_master, so a name-keyed map silently gives
+# the wrong master to every type nobody thought to list. 032 put it back.
+#
+# If a second master does earn rules, the shape is a per-rule target column —
+# one table, one more field, resolved from the fieldmap the same way
+# _editable_columns already resolves which pickers a row has. The rest of this
+# module already treats TARGET as data, so that change lands here and nowhere
+# else.
+TARGET = {
+    "field": "rera_head_id",
+    "mirrors": "rera_head",
+    "master_table": "rera_head_master",
+    "label": "RERA head",
 }
 
-# The single target this process was built around.  Kept for routers that
-# have not yet been updated to resolve per-account-type — it is the same
-# object as TARGET_BY_TYPE["RERA"], so writing it here does not duplicate
-# anything.
-TARGET = TARGET_BY_TYPE["RERA"]
-
-
-# The rule table that backs an account type.  Returns the literal table name
-# from the live mapping; RERA accounts land on rule_rera_head, IDW on
-# rule_idw_head, MASTER/FREE on rule_head.  An unknown account type falls back
-# to rule_rera_head so that a brand-new account type the user has not yet
-# configured still produces a usable grid.
-def rule_table(account_type: str) -> str:
-    """The rule_* table this account type stores its grid in.
-
-    The grid on the Rules page reads from rule_v (the union view), so this
-    table is only used by write paths — set_rule_cell and the apply endpoint.
-    Reads continue to query rule_v directly.
-
-    An account type that has no entry in TARGET_BY_TYPE falls back to RERA's
-    table: the grid still renders, the heads are still validated against the
-    master_table listed in TARGET_BY_TYPE[fallback], and writes still produce
-    a row that can be looked up via the same view.
-    """
-    return _RULE_TABLES_BY_TYPE.get(
-        (account_type or "").strip().upper(),
-        "rule_rera_head",
-    )
-
-
-# Built once.  The whole mapping is determined by TARGET_BY_TYPE above; if a
-# second master is added, both dicts grow together.
-_RULE_TABLES_BY_TYPE = {
-    "MASTER": "rule_head",
-    "RERA":   "rule_rera_head",
-    "IDW":    "rule_idw_head",
-    "TCP":    "rule_idw_head",
-    "FREE":   "rule_head",
-}
-
-# Which master_kind string each master table carries on rule_v and on
-# rule_condition_head.  Three lookups, built once, used by every query that
-# has to join rule_v to a specific master.
-_MASTER_KIND_BY_TABLE = {
-    "head_master":      "head",
-    "rera_head_master": "rera_head",
-    "idw_head_master":  "idw_head",
-}
-_MASTER_KIND = {v: k for k, v in _MASTER_KIND_BY_TABLE.items()}
-
-
-def _resolve_target(account_type: str,
-                    master_table: str | None = None) -> dict:
-    """The TARGET dict for an account type, from the mapping or the caller.
-
-    The callers in transactions.py pass the master_table they already resolved
-    (it is in the rule context), so this just looks it up.  Routers/rules.py
-    does not have a per-type context, so it passes nothing and we look it up
-    here.
-    """
-    if master_table:
-        return next(
-            (t for t in TARGET_BY_TYPE.values() if t["master_table"] == master_table),
-            TARGET,
-        )
-    return TARGET_BY_TYPE.get(
-        (account_type or "").strip().upper(), TARGET)
-
-
-# =============================================================================
 # The directions a row can be judged in, and — since 029 dropped BOTH — the only
 # answers a cell of the grid can hold. A head means money in or money out; if it
 # genuinely means either, that is two rules on two account types, not one cell
 # saying nothing.
-# =============================================================================
-
 DIRECTIONS = ("CR", "DR")
 
 
@@ -183,8 +83,7 @@ class MissingRuleHeads(RuntimeError):
 # =============================================================================
 
 async def allowed_heads(conn, account_type: str,
-                        allow_empty: bool = False,
-                        master_table: str | None = None) -> dict[str, list[dict]]:
+                        allow_empty: bool = False) -> dict[str, list[dict]]:
     """The heads each direction accepts for an account type, from the grid.
 
     Returns {"CR": [{"id", "name"}, ...], "DR": [...]}, ordered by name so the
@@ -195,34 +94,32 @@ async def allowed_heads(conn, account_type: str,
     anyone should be offered, and leaving it in would let the fix write a value
     the row editor would not.
 
-    master_table is resolved from account_type via TARGET_BY_TYPE when not
-    passed explicitly — the callers in transactions.py already have it in the
-    rule context, and the one in routers/rules.py is reading a single company's
-    rules so it can pick the right table per column if it wants.
+    Raises MissingRuleHeads when nothing is recorded, rather than returning two
+    empty lists: "0 conflicts" from a rule that accepts nothing reads as a clean
+    bill of health, and it is the opposite.
+
+    allow_empty=True is passed when the type has conditions but a blank grid
+    column — that type does have a rule, just not a general one, and refusing to
+    run would be refusing to run the conditions the user did write.
     """
-    target = _resolve_target(account_type, master_table)
-    master_kind = _MASTER_KIND_BY_TABLE[target["master_table"]]
     rows = await conn.fetch(
         f"""
         SELECT r.direction, h.id, h.name
-          FROM rule_v r
-          JOIN {target['master_table']} h ON h.id = r.head_id
+          FROM rule r
+          JOIN {TARGET['master_table']} h ON h.id = r.head_id
          WHERE upper(btrim(r.account_type)) = $1
-           AND r.master_kind = $2
            AND h.is_active = true
          ORDER BY h.name, h.id
         """,
         (account_type or "").strip().upper(),
-        master_kind,
     )
 
     out: dict[str, list[dict]] = {d: [] for d in DIRECTIONS}
     for r in rows:
-        # The CHECK constraint on each rule_* table permits nothing but CR/DR,
-        # so anything else means the table was written around the API.  Said out
-        # loud rather than skipped: a row quietly dropped here is a head that is
-        # no answer in either direction, which on screen looks like a rule
-        # nobody wrote.
+        # The CHECK constraint on `rule` permits nothing but these, so anything
+        # else means the table was written around the API. Said out loud rather
+        # than skipped: a row quietly dropped here is a head that is no answer
+        # in either direction, which on screen looks like a rule nobody wrote.
         if r["direction"] not in out:
             raise MissingRuleHeads(
                 f"'{r['name']}' is stored against {account_type} with the "
@@ -246,35 +143,20 @@ async def supported_types(conn) -> list[str]:
     find anyway. A type with no grid cells but an active condition counts: the
     user did write a rule for it, and telling them otherwise would send them to
     fill in a grid they deliberately left blank.
-
-    Reads from rule_v (the union view) so every account type that has a row in
-    any of the three typed tables is counted.
     """
     rows = await conn.fetch(
-        """
+        f"""
         SELECT DISTINCT upper(btrim(r.account_type)) AS account_type
-          FROM rule_v r
-          JOIN (
-              SELECT id, is_active, 'head' AS mk FROM head_master
-              UNION ALL
-              SELECT id, is_active, 'rera_head' FROM rera_head_master
-              UNION ALL
-              SELECT id, is_active, 'idw_head' FROM idw_head_master
-          ) h ON h.id = r.head_id AND h.mk = r.master_kind
+          FROM rule r
+          JOIN {TARGET['master_table']} h ON h.id = r.head_id
          WHERE h.is_active = true
         UNION
         SELECT DISTINCT upper(btrim(c.account_type))
           FROM rule_condition c
           JOIN rule_condition_head ch ON ch.condition_id = c.id
-          JOIN (
-              SELECT id, is_active, 'head' AS mk FROM head_master
-              UNION ALL
-              SELECT id, is_active, 'rera_head' FROM rera_head_master
-              UNION ALL
-              SELECT id, is_active, 'idw_head' FROM idw_head_master
-          ) h ON h.id = ch.head_id AND h.mk = ch.master_kind
+          JOIN {TARGET['master_table']} h ON h.id = ch.head_id
          WHERE c.is_active = true AND h.is_active = true
-        ORDER BY 1
+         ORDER BY 1
         """
     )
     return [r["account_type"] for r in rows]
@@ -535,16 +417,6 @@ def describe(condition: dict, column_label: str | None = None) -> str:
     return f"{said[:1].upper()}{said[1:]} is {_listed(names)}."
 
 
-# All masters in one place, so the UNION ALL below is written once.
-_MASTER_UNION = (
-    "SELECT id, is_active, 'head' AS mk FROM head_master "
-    "UNION ALL "
-    "SELECT id, is_active, 'rera_head' FROM rera_head_master "
-    "UNION ALL "
-    "SELECT id, is_active, 'idw_head' FROM idw_head_master"
-)
-
-
 async def load_conditions(conn, account_type: str,
                           columns: set[str] | None = None) -> list[dict]:
     """The active conditions for an account type, in the order they decide.
@@ -573,10 +445,8 @@ async def load_conditions(conn, account_type: str,
                         FILTER (WHERE h.id IS NOT NULL), '[]'::json) AS heads
           FROM rule_condition c
           LEFT JOIN rule_condition_head ch ON ch.condition_id = c.id
-          LEFT JOIN ({_MASTER_UNION}) h
-                 ON h.id = ch.head_id
-                AND h.mk = ch.master_kind
-                AND h.is_active = true
+          LEFT JOIN {TARGET['master_table']} h
+                 ON h.id = ch.head_id AND h.is_active = true
          WHERE upper(btrim(c.account_type)) = $1
            AND c.is_active = true
          GROUP BY c.id

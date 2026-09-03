@@ -1263,12 +1263,6 @@ async def _rule_context(conn, account_type: str, account_number: str) -> dict:
                  f"{'a ' + actual if actual else 'an untyped'} account in the "
                  f"Bank master, not {wanted}.")
 
-    # The target master is decided by the account type, not by what the user
-    # typed (the bank-master check above has already settled that they are the
-    # same string).  An unknown account type falls back to RERA, which is the
-    # same default the Rules grid uses.
-    target = rules.TARGET_BY_TYPE.get(wanted, rules.TARGET)
-
     # Read after the account has been confirmed to be of this type, so a type
     # with no rule is only reported once the account itself checks out — being
     # told "no rule for MASTER" about an account that is actually RERA would
@@ -1290,8 +1284,7 @@ async def _rule_context(conn, account_type: str, account_number: str) -> dict:
 
     try:
         expected = await rules.allowed_heads(
-            conn, wanted, allow_empty=bool(conditions),
-            master_table=target["master_table"])
+            conn, wanted, allow_empty=bool(conditions))
     except rules.MissingRuleHeads as e:
         supported = await rules.supported_types(conn)
         extra = (f" Rules are set for: {', '.join(supported)}." if supported
@@ -1300,7 +1293,7 @@ async def _rule_context(conn, account_type: str, account_number: str) -> dict:
 
     allowed_ids = {d: {h["id"] for h in heads} for d, heads in expected.items()}
     return {
-        "target": target,
+        "target": rules.TARGET,
         "digits": digits,
         "account_col": account_col,
         "bank": bank,
@@ -1378,16 +1371,10 @@ async def check_temp_rules(
                    t.amount,
                    {date_sel}
                    t.{field} AS current_id,
-                   CASE WHEN hm.id IS NOT NULL THEN 'head'
-                        WHEN rm.id IS NOT NULL THEN 'rera_head'
-                        WHEN im.id IS NOT NULL THEN 'idw_head'
-                   END AS current_master_kind,
-                   COALESCE(hm.name, rm.name, im.name) AS current_name
+                   m.name AS current_name
                    {rules.subject_sql(fields)}
               FROM temp_trans t
-              LEFT JOIN head_master hm      ON hm.id      = t.head_id
-              LEFT JOIN rera_head_master rm ON rm.id      = t.rera_head_id
-              LEFT JOIN idw_head_master im  ON im.id      = t.idw_head_id
+              LEFT JOIN {rule['master_table']} m ON m.id = t.{field}
              WHERE {' AND '.join(filters)}
              ORDER BY t.batch_id, t.row_number
             """,
