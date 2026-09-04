@@ -120,6 +120,50 @@ async def main() -> None:
         note("expected CR", [h["name"] for h in res["expected"]["CR"]])
         note("expected DR", [h["name"] for h in res["expected"]["DR"]])
 
+        print("\n-- the columns the dialog can show --")
+        offered = {c["name"] for c in res["columns"]}
+        note("columns offered", len(offered))
+        check("no alias leaks to the client",
+              ('"d0"' in r.text) or ('"s0"' in r.text), False)
+        check("the defaults are all on offer",
+              set(res["default_columns"]) <= offered, True)
+        check("every condition's subject column is offered by default",
+              all(c["subject_field"] in res["default_columns"]
+                  for c in res["conditions"].values()), True)
+        flagged = [row for row in res["rows"] if row["status"] == "conflict"]
+        check("conflicting rows carry their statement columns",
+              all(set(row["values"]) == offered for row in flagged), True)
+        check("rows the dialog does not draw carry none",
+              any("values" in row for row in res["rows"]
+                  if row["status"] != "conflict"), False)
+        by_name = {c["name"]: c for c in res["columns"]}
+        note("default columns",
+             [by_name[n]["label"] for n in res["default_columns"]])
+
+        print("\n-- the staging table can show only the flagged rows --")
+        want_ids = {row["id"] for row in flagged}
+        rr = await cl.get("/transactions/temp-trans",
+                          params={"rule_conflicts": f"RERA:{ACCOUNT}",
+                                  "limit": 200})
+        check("filtered list is 200", rr.status_code, 200)
+        listed = rr.json()
+        check("it lists exactly what the check calls a conflict",
+              {row["id"] for row in listed["rows"]}, want_ids)
+        check("and counts them", listed["total"], len(want_ids))
+        for bad, frag in [
+            ("RERA", 'must be written "TYPE:ACCOUNT"'),
+            ("NOPE:1", "not in the Bank master"),
+            # Nothing typed reaches SQL: both halves go through _rule_context,
+            # which looks them up rather than interpolating them.
+            ("RERA:'; DROP TABLE temp_trans; --", "no digits in it"),
+        ]:
+            rr = await cl.get("/transactions/temp-trans",
+                              params={"rule_conflicts": bad})
+            ok = rr.status_code == 400 and frag in rr.json().get("detail", "")
+            check(f"rejects rule_conflicts={bad[:24]!r}", ok, True)
+        rr = await cl.get("/transactions/temp-trans", params={"limit": 200})
+        check("the unfiltered list still works", rr.status_code, 200)
+
         print("\n-- conditions --")
         ops = {o["name"] for o in opts["operators"]}
         check("contains is offered", "contains" in ops, True)

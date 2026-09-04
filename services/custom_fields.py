@@ -415,6 +415,35 @@ async def date_column(conn) -> str | None:
     return name if name in live else None
 
 
+async def description_column(conn) -> str | None:
+    """The column holding what the bank printed against the transaction.
+
+    The same fieldmap category the parser fills -- parsers._CATEGORY_VOCABULARY
+    maps description / desc / particulars / narration / remarks onto it -- so
+    this is the column carrying "NEFT Cr-ICIC0SF0002-POONAM KAUR-...", the one
+    thing that tells two transfers of the same amount on the same day apart.
+
+    Deliberately NOT staging.narration_column, which resolves the free-text
+    field the row editor types INTO and is empty on an imported row. The two
+    are easy to confuse and answering with the wrong one gives a column of
+    blanks; company_028 has both, DESC and NARRATION.
+
+    Resolved through the category rather than by display name so it follows a
+    renamed field, and checked against the live table so a column dropped from
+    the Field Mapping page reports None instead of breaking a SELECT.
+    """
+    from import_helpers import fields_by_category
+
+    rows = [dict(r) for r in await conn.fetch(
+        "SELECT fieldname, displayname, mapfields FROM fieldmap WHERE is_active = true"
+    )]
+    name = fields_by_category(rows).get("description")
+    if not name:
+        return None
+    live = {c["column_name"] for c in await table_structure(conn)}
+    return name if name in live else None
+
+
 async def list_custom_fields(conn) -> list[dict]:
     """Every fieldmap row, annotated with its real column type.
 

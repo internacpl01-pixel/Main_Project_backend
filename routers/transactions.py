@@ -1010,6 +1010,12 @@ async def list_temp_trans(
         description='Company the row belongs to. Pass "__none__" for rows with '
                     'no company set.',
     ),
+    rule_conflicts: str = Query(
+        None,
+        description='"TYPE:ACCOUNT" — show only the rows that break the rule '
+                    'for that account. Re-judged on every request, so a row '
+                    'fixed since the last check drops out on its own.',
+    ),
     sort: str = Query(None, description="Column to sort by; unknown names are ignored."),
     dir: str = Query("asc", description="asc or desc."),
     search: str = Query(
@@ -1041,6 +1047,11 @@ async def list_temp_trans(
                     with spaces, or copied from a sheet that dropped the
                     leading zero, still finds its rows
       company     — company abbreviation, matched case-insensitively
+      rule_conflicts
+                  — "TYPE:ACCOUNT". Narrows the list to the rows Check Rules
+                    finds wrong on that account, so they can be reviewed with
+                    every column, sorted and searched, instead of hunted for
+                    page by page. Combines with every other filter here
       sort, dir   — order by any data column or joined master name. An
                     unrecognised name falls back to batch/row order and the
                     response reports what was applied.
@@ -1102,6 +1113,34 @@ async def list_temp_trans(
             if clause:
                 filters.append(clause)
                 params.extend(sp)
+
+        # Only the rows the rule flags, for the staging table's "flagged rows
+        # only" toggle.
+        #
+        # Judged here rather than filtered by a list of ids sent from the
+        # browser, for two reasons. A few thousand ids do not fit in a query
+        # string. And a list built from ids captured minutes ago keeps showing
+        # rows that have since been fixed — the filter would lie about its own
+        # subject. Re-judging also means "conflict" is decided by exactly one
+        # code path, the same _judged_rows the dialog runs, so the toggle and
+        # the dialog cannot disagree about which rows they mean.
+        #
+        # Nothing typed reaches SQL: both halves go into _rule_context, which
+        # looks the type up in account_type_master and the account in
+        # bank_master and 400s on either miss, and the ids come back as a bound
+        # bigint array.
+        if rule_conflicts:
+            wanted_type, sep, wanted_account = rule_conflicts.partition(":")
+            if not sep:
+                raise HTTPException(
+                    400, 'rule_conflicts must be written "TYPE:ACCOUNT" — the '
+                         'account type and the account number the check ran on.')
+            rule_ctx = await _rule_context(conn, wanted_type, wanted_account)
+            flagged = [r["id"] for r in await _judged_rows(conn, user, rule_ctx)
+                       if r["status"] == "conflict"]
+            filters.append(f"t.id = ANY(${idx}::bigint[])")
+            params.append(flagged)
+            idx += 1
 
         where = " AND ".join(filters)
 
@@ -1307,6 +1346,93 @@ async def _rule_context(conn, account_type: str, account_number: str) -> dict:
     }
 
 
+async def _judged_rows(conn, user: dict, ctx: dict) -> list[dict]:
+    """Every staged row printed under this account, with the rule's verdict.
+
+    One reader for two callers — the Check Rules dialog, and the staging
+    table's "flagged rows only" filter — so a row cannot be a conflict in one
+    place and clean in the other. Scoped like the list itself.
+
+    Each row carries `status` (ok / conflict / no_direction) and `rule_id`: the
+    condition that decided it, or None when the grid did. A conflicting row
+    also carries `values`, the statement columns under their own names, for the
+    dialog to draw. Only conflicts, because those are the only rows it draws,
+    and every narration on the account is a payload nobody reads.
+    """
+    rule, digits, account_col = ctx["target"], ctx["digits"], ctx["account_col"]
+    expected, allowed_ids = ctx["expected"], ctx["allowed_ids"]
+    conditions, fields, columns = ctx["conditions"], ctx["fields"], ctx["columns"]
+
+    filters = ["1=1"]
+    params: list = []
+    idx = 1
+
+    scope = await scoping.visible_project_ids(conn, user)
+    clause, scope_params, idx = scoping.project_filter(scope, "t.project_id", idx)
+    if clause:
+        filters.append(clause)
+        params.extend(scope_params)
+    elif scoping.scope_is_empty(scope):
+        filters.append("t.project_id IS NULL")
+
+    filters.append(f"{staging.account_digits(f't.{account_col}')} = ${idx}")
+    params.append(digits)
+    idx += 1
+
+    # Date and amount ride along so the dialog can say which rows it means — a
+    # conflict list of bare ids cannot be reviewed.
+    date_col = await custom_fields.date_column(conn)
+    date_sel = (f"{_date_expr(date_col, columns)} AS txn_date,"
+                if date_col else "NULL::date AS txn_date,")
+
+    # Every statement column, for the dialog's Columns menu. Under its own
+    # alias prefix: a condition testing DESC while DESC is also on screen is the
+    # ordinary case, and one set's numbering must not renumber the other's.
+    display = [c["name"] for c in columns]
+
+    field = rule["field"]
+    rows = await conn.fetch(
+        f"""
+        SELECT t.id, t.batch_id, t.row_number, t.is_locked,
+               upper(btrim(coalesce(t.credit_debit, ''))) AS direction,
+               t.amount,
+               {date_sel}
+               t.{field} AS current_id,
+               m.name AS current_name
+               {rules.subject_sql(fields)}
+               {rules.subject_sql(display, prefix="d")}
+          FROM temp_trans t
+          LEFT JOIN {rule['master_table']} m ON m.id = t.{field}
+         WHERE {' AND '.join(filters)}
+         ORDER BY t.batch_id, t.row_number
+        """,
+        *params,
+    )
+
+    out: list[dict] = []
+    for r in rows:
+        row = dict(r)
+        direction = row["direction"] or None
+        row["direction"] = direction
+        # Popped, not read: these were fetched for this decision and for the
+        # dialog, and shipping them back under s0/d1 would put raw statement
+        # text on the wire under names nothing can explain. Popped on every row
+        # whether or not the values are kept, so no alias can reach the client.
+        subjects = rules.take_subjects(row, fields)
+        values = rules.take_subjects(row, display, prefix="d")
+        _heads, ids, cond = rules.resolve(
+            direction, subjects, conditions, expected, allowed_ids)
+        row["status"] = rules.judge(ids, row["current_id"])
+        # Which sentence judged this row — null when the grid did. The dialog
+        # reads its heads from the same place, so what it offers as a
+        # replacement is always what the check just used.
+        row["rule_id"] = cond["id"] if cond else None
+        if row["status"] == "conflict":
+            row["values"] = values
+        out.append(row)
+    return out
+
+
 @router.post("/temp-trans/check-rules")
 async def check_temp_rules(
     account_type: str = Body(..., description="The type the Bank master gives "
@@ -1336,78 +1462,15 @@ async def check_temp_rules(
     """
     async with company_connection(user["schema"]) as conn:
         ctx = await _rule_context(conn, account_type, account_number)
-        rule, digits, account_col = ctx["target"], ctx["digits"], ctx["account_col"]
-        bank, expected, allowed_ids = ctx["bank"], ctx["expected"], ctx["allowed_ids"]
-        conditions, fields = ctx["conditions"], ctx["fields"]
+        rule, bank, expected = ctx["target"], ctx["bank"], ctx["expected"]
+        conditions, columns = ctx["conditions"], ctx["columns"]
 
-        filters = ["1=1"]
-        params: list = []
-        idx = 1
-
-        scope = await scoping.visible_project_ids(conn, user)
-        clause, scope_params, idx = scoping.project_filter(scope, "t.project_id", idx)
-        if clause:
-            filters.append(clause)
-            params.extend(scope_params)
-        elif scoping.scope_is_empty(scope):
-            filters.append("t.project_id IS NULL")
-
-        filters.append(f"{staging.account_digits(f't.{account_col}')} = ${idx}")
-        params.append(digits)
-        idx += 1
-
-        # Date and amount ride along so the dialog can say which rows it
-        # means — a conflict list of bare ids cannot be reviewed.
-        columns = ctx["columns"]
-        date_col = await custom_fields.date_column(conn)
-        date_sel = (f"{_date_expr(date_col, columns)} AS txn_date,"
-                    if date_col else "NULL::date AS txn_date,")
-
-        field = rule["field"]
-        rows = await conn.fetch(
-            f"""
-            SELECT t.id, t.batch_id, t.row_number, t.is_locked,
-                   upper(btrim(coalesce(t.credit_debit, ''))) AS direction,
-                   t.amount,
-                   {date_sel}
-                   t.{field} AS current_id,
-                   m.name AS current_name
-                   {rules.subject_sql(fields)}
-              FROM temp_trans t
-              LEFT JOIN {rule['master_table']} m ON m.id = t.{field}
-             WHERE {' AND '.join(filters)}
-             ORDER BY t.batch_id, t.row_number
-            """,
-            *params,
-        )
-
-        checked: list[dict] = []
-        ok = conflicts = locked_conflicts = no_direction = 0
-        for r in rows:
-            row = dict(r)
-            direction = row["direction"] or None
-            row["direction"] = direction
-            # Popped, not read: the columns the conditions test were fetched for
-            # this decision, and shipping them back under s0/s1 would put raw
-            # statement text on the wire under names nothing can explain.
-            subjects = rules.take_subjects(row, fields)
-            _heads, ids, cond = rules.resolve(
-                direction, subjects, conditions, expected, allowed_ids)
-            status = rules.judge(ids, row["current_id"])
-            row["status"] = status
-            # Which sentence judged this row — null when the grid did. The
-            # dialog reads its heads from the same place, so what it offers as
-            # a replacement is always what the check just used.
-            row["rule_id"] = cond["id"] if cond else None
-            if status == "ok":
-                ok += 1
-            elif status == "conflict":
-                conflicts += 1
-                if row["is_locked"]:
-                    locked_conflicts += 1
-            else:
-                no_direction += 1
-            checked.append(row)
+        checked = await _judged_rows(conn, user, ctx)
+        ok = sum(1 for r in checked if r["status"] == "ok")
+        conflicts = sum(1 for r in checked if r["status"] == "conflict")
+        locked_conflicts = sum(1 for r in checked
+                               if r["status"] == "conflict" and r["is_locked"])
+        no_direction = sum(1 for r in checked if r["status"] == "no_direction")
 
         # The company's own name for the column being judged, when a fieldmap
         # row mirrors this master — the dialog should speak the fieldmap's
@@ -1417,6 +1480,23 @@ async def check_temp_rules(
         # The fieldmap's word for each column, so a condition reads as "when a
         # debit's Narration contains..." rather than naming the raw column.
         labels = {c["name"]: c["displayname"] for c in columns}
+        described = await custom_fields.description_column(conn)
+
+    # Which columns the dialog shows before anyone has chosen: what the bank
+    # printed against the transaction, plus whatever column a condition tested —
+    # a row marked "by condition" should show the evidence for it. Decided here
+    # rather than in the browser for the reason every other list on this screen
+    # is: the page does not know which column this company calls its DESC.
+    #
+    # description_column, not staging.narration_column: the latter is the field
+    # the row editor types into and is blank on an imported row, so defaulting
+    # to it gave a column of nothing.
+    known = {c["name"] for c in columns}
+    default_columns = [
+        name for name in dict.fromkeys(
+            [described, *(c["subject_field"] for c in conditions)])
+        if name and name in known
+    ]
 
     wanted = (account_type or "").strip().upper()
     return {
@@ -1427,8 +1507,17 @@ async def check_temp_rules(
                                     bank["account_type"]),
             "bank_name": bank["bank_name"],
         },
-        "target": {"field": field, "label": target_label},
+        "target": {"field": rule["field"], "label": target_label},
         "expected": expected,
+        # Every statement column, under the fieldmap's own names, so the dialog
+        # can offer them in its Columns menu. The values ride on each
+        # conflicting row in `values`, keyed by `name`. `kind` is the same
+        # text/number/date the Rules page uses to pick operators — here it only
+        # decides alignment, but deriving it twice is how the two drift.
+        "columns": [{"name": c["name"], "label": c["displayname"],
+                     "kind": rules.column_kind(c["type"])}
+                    for c in columns],
+        "default_columns": default_columns,
         # Written from the rule that just ran, so the sentence on screen can
         # never describe a rule other than the one that judged these rows.
         "why": rules.explain(wanted, expected, conditions),
@@ -1439,6 +1528,9 @@ async def check_temp_rules(
                 "sentence": rules.describe(c, labels.get(c["subject_field"])),
                 "direction": c["direction"],
                 "heads": c["heads"],
+                # So the dialog can offer the column a sentence tested — the
+                # evidence for a "by condition" verdict is in that column.
+                "subject_field": c["subject_field"],
             }
             for c in conditions
         },

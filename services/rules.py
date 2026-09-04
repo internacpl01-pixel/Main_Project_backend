@@ -490,7 +490,7 @@ def subject_fields(conditions: list[dict]) -> list[str]:
     return sorted({c["subject_field"] for c in conditions})
 
 
-def subject_sql(fields: list[str], alias: str = "t") -> str:
+def subject_sql(fields: list[str], alias: str = "t", prefix: str = "s") -> str:
     """The extra SELECT list for those columns, aliased s0, s1, ...
 
     Positional aliases rather than each column's own name, because a subject
@@ -502,24 +502,32 @@ def subject_sql(fields: list[str], alias: str = "t") -> str:
     the live column list before they were stored and again when they were
     loaded: "somebody upstream validated this" is not a property this line can
     verify, and quoting costs nothing.
+
+    `prefix` lets one query carry two independent sets of columns. The check
+    fetches the columns its conditions test AND the columns the dialog displays,
+    and those two lists overlap freely — a condition on DESC while DESC is also
+    on screen is the normal case, not an edge one. Under a single prefix the
+    second set would renumber the first. The engine keeps "s"; anything else
+    passes its own.
     """
     return "".join(
-        f', {alias}."{f.replace(chr(34), chr(34) * 2)}" AS s{i}'
+        f', {alias}."{f.replace(chr(34), chr(34) * 2)}" AS {prefix}{i}'
         for i, f in enumerate(fields))
 
 
-def subject_values(record, fields: list[str]) -> dict:
+def subject_values(record, fields: list[str], prefix: str = "s") -> dict:
     """{column name: value} for one fetched row, undoing subject_sql's aliases."""
-    return {f: record[f"s{i}"] for i, f in enumerate(fields)}
+    return {f: record[f"{prefix}{i}"] for i, f in enumerate(fields)}
 
 
-def take_subjects(row: dict, fields: list[str]) -> dict:
+def take_subjects(row: dict, fields: list[str], prefix: str = "s") -> dict:
     """subject_values, lifting the aliases out of the row dict on the way.
 
-    The check hands its rows straight to the browser; s0 and s1 are this
-    module's plumbing, not columns anybody asked to see.
+    The check hands its rows straight to the browser; s0 and d1 are this
+    module's plumbing, not columns anybody asked to see. Every alias is popped
+    whether or not its value is kept, so none can reach the wire.
     """
-    return {f: row.pop(f"s{i}") for i, f in enumerate(fields)}
+    return {f: row.pop(f"{prefix}{i}") for i, f in enumerate(fields)}
 
 
 def match(condition: dict, subjects: dict) -> bool:
