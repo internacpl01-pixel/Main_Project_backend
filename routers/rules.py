@@ -505,6 +505,23 @@ async def _clean(conn, t, account_type, direction, subject_field, operator,
                     400, f"'{row['name']}' is switched off in Master Data, so a "
                          f"condition cannot point at it. Reactivate it first.")
 
+        # A condition outranks the grid, but a head the grid has never marked
+        # for anything is a head nobody has told this company how to treat at
+        # all — writing a condition around it first, with the grid still blank,
+        # is how a head ends up defined only in a sentence nobody else can find.
+        on_grid = {r[t["column"]] for r in await conn.fetch(
+            f'SELECT DISTINCT "{t["column"]}" FROM rule '
+            f'WHERE target = $1 AND "{t["column"]}" = ANY($2::bigint[])',
+            t["target"], ids)}
+        missing = [found[i]["name"] for i in ids if i not in on_grid]
+        if missing:
+            raise HTTPException(
+                400, f"{', '.join(missing)} "
+                     f"{'is' if len(missing) == 1 else 'are'} not set on the "
+                     f"grid for any account type yet. Give "
+                     f"{'it' if len(missing) == 1 else 'them'} a CR or DR "
+                     f"there first, then write the condition.")
+
     return {"account_type": wanted_type, "direction": wanted_dir,
             "subject_field": field, "operator": (operator or "").strip(),
             "value1": v1, "value2": v2, "head_ids": ids,
