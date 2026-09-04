@@ -217,8 +217,14 @@ async def main() -> None:
         check("preview is 200", rr.status_code, 200)
         pv = rr.json()
         note("preview", f'{pv["matched"]} of {pv["scanned"]} scanned')
-        check("preview finds the two 'master to free' debits",
-              pv["matched"], 2)
+        # Not pinned to a count: which rows carry "master to free" in their
+        # narration is live staged data, not something this file put there, and
+        # it has already drifted once since this assertion was written. What
+        # matters is that the preview finds AT LEAST what it will judge below,
+        # and the two are compared to each other a few lines down instead.
+        check("preview finds at least one 'master to free' debit",
+              pv["matched"] >= 1, True)
+        expect_judged = pv["matched"]
         note("preview phrase", pv["phrase"])
 
         rr = await cl.post("/rules/conditions",
@@ -242,7 +248,8 @@ async def main() -> None:
                                 "account_number": ACCOUNT})
         res2 = r.json()
         judged = [row for row in res2["rows"] if row["rule_id"] == cid]
-        check("two rows judged by the condition", len(judged), 2)
+        check("as many rows judged by the condition as the preview found",
+              len(judged), expect_judged)
         check("its heads are offered instead of the grid's",
               [h["name"] for h in res2["conditions"][str(cid)]["heads"]],
               [off_grid_name])
