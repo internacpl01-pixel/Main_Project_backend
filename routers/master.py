@@ -325,36 +325,6 @@ def _check_formats(cfg: dict, values: dict) -> None:
             raise HTTPException(400, rule['message'])
 
 
-async def _check_unique(conn, cfg: dict, values: dict) -> None:
-    """Reject a create that repeats an existing row's unique fields.
-
-    Exists because the database constraint alone is not enough here: Postgres
-    never considers one NULL equal to another, so a compound UNIQUE like
-    head_master's (name, category) does not fire when category is left blank
-    on both rows — two "Contractor" heads with no category insert cleanly. This
-    checks the same fields the constraint names, but treats a blank the way
-    _normalise already treats it elsewhere: as one value, not as "different
-    every time".
-    """
-    fields = cfg.get('unique') or []
-    if not fields:
-        return
-    clauses, params = [], []
-    for i, f in enumerate(fields, start=1):
-        clauses.append(f"COALESCE({f}, '') = COALESCE(${i}, '')")
-        params.append(values.get(f))
-    exists = await conn.fetchval(
-        f"SELECT 1 FROM {cfg['table']} WHERE {' AND '.join(clauses)} LIMIT 1",
-        *params,
-    )
-    if exists:
-        shown = values.get(fields[0])
-        raise HTTPException(
-            400, f'{cfg["labels"].get(fields[0], fields[0])} "{shown}" is '
-                 f'already used by another {cfg["label"].lower()}.'
-        )
-
-
 def _check_distinct_groups(cfg: dict, values: dict) -> None:
     """Reject a group of fields that are meant to differ but do not.
 
@@ -633,7 +603,6 @@ async def create_master(
     vals = [clean[f] for f in fields]
 
     async with company_connection(schema) as conn:
-        await _check_unique(conn, cfg, clean)
         try:
             row = await conn.fetchrow(
                 f"INSERT INTO {cfg['table']} ({cols}) VALUES ({placeholders}) RETURNING {', '.join(cfg['columns'])}",
