@@ -21,6 +21,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 
 import permissions
 from database import company_connection
+from routers import master
 from routers.auth import get_company_user, get_current_schema, require_level
 from services import custom_fields, rules, scoping, staging
 
@@ -1078,12 +1079,19 @@ async def _temp_filters(
     # the type up in account_type_master and the account in bank_master and
     # 400s on either miss, and the ids come back as a bound bigint array.
     if rule_conflicts:
-        wanted_type, sep, wanted_account = rule_conflicts.partition(":")
+        wanted_type, sep, rest = rule_conflicts.partition(":")
         if not sep:
             raise HTTPException(
-                400, 'rule_conflicts must be written "TYPE:ACCOUNT" — the '
-                     'account type and the account number the check ran on.')
-        rule_ctx = await _rule_context(conn, wanted_type, wanted_account)
+                400, 'rule_conflicts must be written "TYPE:ACCOUNT" or '
+                     '"TYPE:ACCOUNT:HEADTYPE" — the account type and the '
+                     'account number the check ran on.')
+        # The head type is the optional third part rather than its own query
+        # parameter, so the three pieces that must agree travel as one value: a
+        # filter carrying last run's account with this run's head type would
+        # quietly show the conflicts of a check nobody made.
+        wanted_account, _, wanted_target = rest.partition(":")
+        rule_ctx = await _rule_context(conn, wanted_type, wanted_account,
+                                       wanted_target or rules.DEFAULT_TARGET)
         flagged = [r["id"] for r in await _judged_rows(conn, user, rule_ctx)
                    if r["status"] == "conflict"]
         filters.append(f"t.id = ANY(${idx}::bigint[])")
@@ -1113,9 +1121,11 @@ async def list_temp_trans(
     ),
     rule_conflicts: str = Query(
         None,
-        description='"TYPE:ACCOUNT" — show only the rows that break the rule '
-                    'for that account. Re-judged on every request, so a row '
-                    'fixed since the last check drops out on its own.',
+        description='"TYPE:ACCOUNT" or "TYPE:ACCOUNT:HEADTYPE" — show only the '
+                    'rows that break the rule for that account. HEADTYPE is '
+                    'head, rera_head or idw_head and defaults to rera_head. '
+                    'Re-judged on every request, so a row fixed since the last '
+                    'check drops out on its own.',
     ),
     sort: str = Query(None, description="Column to sort by; unknown names are ignored."),
     dir: str = Query("asc", description="asc or desc."),
@@ -1274,7 +1284,8 @@ async def temp_trans_filter_options(user: dict = Depends(get_company_user)):
         return await _filter_options(conn, "temp_trans", where, params)
 
 
-async def _rule_context(conn, account_type: str, account_number: str) -> dict:
+async def _rule_context(conn, account_type: str, account_number: str,
+                        target: str = rules.DEFAULT_TARGET) -> dict:
     """Resolve everything a rule check and a rule fix share, or 400 saying why.
 
     Returns the account it resolved, the grid's heads per direction (`expected`,
@@ -1286,7 +1297,16 @@ async def _rule_context(conn, account_type: str, account_number: str) -> dict:
     the browser's copy of a check that may be minutes old, and since the rule
     is now editable from the Rules page it can genuinely have changed between
     the check and the fix.
+
+    `target` is which of the three head masters this run is about. It is
+    resolved here rather than taken apart by each caller, so the check, the fix
+    and the staging filter cannot end up judging one column and writing another.
     """
+    try:
+        rule = rules.target_def(target)
+    except rules.UnknownTarget as e:
+        raise HTTPException(400, str(e))
+
     wanted = (account_type or "").strip().upper()
     digits = staging.normalise_account(account_number)
     if not digits:
@@ -1338,7 +1358,7 @@ async def _rule_context(conn, account_type: str, account_number: str) -> dict:
     columns = await custom_fields.data_columns(conn)
     try:
         conditions = await rules.load_conditions(
-            conn, wanted, {c["name"] for c in columns})
+            conn, wanted, rule["target"], {c["name"] for c in columns})
     except rules.MissingRuleHeads as e:
         # Its own 400, without the "rules are set for" tail below: this is not
         # a type with no rule, it is a rule that exists and cannot run, and the
@@ -1347,16 +1367,22 @@ async def _rule_context(conn, account_type: str, account_number: str) -> dict:
 
     try:
         expected = await rules.allowed_heads(
-            conn, wanted, allow_empty=bool(conditions))
+            conn, wanted, rule["target"], allow_empty=bool(conditions))
     except rules.MissingRuleHeads as e:
-        supported = await rules.supported_types(conn)
-        extra = (f" Rules are set for: {', '.join(supported)}." if supported
-                 else " No account type has a rule yet.")
+        # Both halves of the tail are per head type. "Rules are set for: RERA"
+        # while the user is looking at the Internal Head grid would send them to
+        # a column that is genuinely blank.
+        supported = await rules.supported_types(conn, rule["target"])
+        label = master.TABLE_LABELS.get(rule["master_table"], "head")
+        extra = (f" {label} rules are set for: {', '.join(supported)}."
+                 if supported else f" No account type has a {label} rule yet.")
         raise HTTPException(400, str(e) + extra)
 
     allowed_ids = {d: {h["id"] for h in heads} for d, heads in expected.items()}
     return {
-        "target": rules.TARGET,
+        "target": {**rule,
+                   "label": master.TABLE_LABELS.get(rule["master_table"],
+                                                    "head")},
         "digits": digits,
         "account_col": account_col,
         "bank": bank,
@@ -1465,6 +1491,9 @@ async def check_temp_rules(
     account_number: str = Body(..., description="The account whose staged rows "
                                                 "to check, matched on digits "
                                                 "only."),
+    target: str = Body(rules.DEFAULT_TARGET,
+                       description="Which head this run judges: head, "
+                                   "rera_head or idw_head. One column per run."),
     user: dict = Depends(get_company_user),
 ):
     """Check one account's staged rows against its account-type rule.
@@ -1483,9 +1512,14 @@ async def check_temp_rules(
     judged by that condition alone and carries its id, so the dialog can say
     which sentence decided it and offer that sentence's heads rather than the
     column's general ones.
+
+    One head per run. A row carries three — Internal Head, RERA Head and TCP
+    Head — and each has its own grid; judging all three at once would report a
+    row as wrong three ways and leave the dialog unable to say which dropdown to
+    change. The caller picks, the same way it picks the account type.
     """
     async with company_connection(user["schema"]) as conn:
-        ctx = await _rule_context(conn, account_type, account_number)
+        ctx = await _rule_context(conn, account_type, account_number, target)
         rule, bank, expected = ctx["target"], ctx["bank"], ctx["expected"]
         conditions, columns = ctx["conditions"], ctx["columns"]
 
@@ -1531,7 +1565,12 @@ async def check_temp_rules(
                                     bank["account_type"]),
             "bank_name": bank["bank_name"],
         },
-        "target": {"field": rule["field"], "label": target_label},
+        # `target` is the key the browser sends back on apply and on the staging
+        # filter, so all three keep meaning the same column. `label` is what the
+        # user is shown: the fieldmap's own name for it when this company
+        # mirrors the master, and Master Data's label when it does not.
+        "target": {"target": rule["target"], "field": rule["field"],
+                   "label": target_label},
         "expected": expected,
         # Every statement column, under the fieldmap's own names, so the dialog
         # can offer them in its Columns menu. The values ride on each
@@ -1544,7 +1583,7 @@ async def check_temp_rules(
         "default_columns": default_columns,
         # Written from the rule that just ran, so the sentence on screen can
         # never describe a rule other than the one that judged these rows.
-        "why": rules.explain(wanted, expected, conditions),
+        "why": rules.explain(wanted, expected, conditions, target_label),
         # Keyed by id, because that is how a row refers to the one that judged
         # it. Sent once rather than repeated on every row it decided.
         "conditions": {
@@ -1576,6 +1615,10 @@ async def apply_temp_rules(
     rows: list[dict] = Body(..., description="[{id, head_id}] — the conflicting "
                                              "rows and the rule head chosen for "
                                              "each."),
+    target: str = Body(rules.DEFAULT_TARGET,
+                       description="The head type the check ran on. Must be the "
+                                   "same one, or this writes a different column "
+                                   "from the one that was judged."),
     user: dict = Depends(get_company_user),
 ):
     """Replace the heads the rule found wrong, as chosen in the dialog.
@@ -1604,7 +1647,7 @@ async def apply_temp_rules(
             raise HTTPException(400, "Each row needs an id and a head_id.")
 
     async with company_connection(user["schema"]) as conn:
-        ctx = await _rule_context(conn, account_type, account_number)
+        ctx = await _rule_context(conn, account_type, account_number, target)
         rule, digits, account_col = ctx["target"], ctx["digits"], ctx["account_col"]
         expected, allowed_ids = ctx["expected"], ctx["allowed_ids"]
         conditions, fields = ctx["conditions"], ctx["fields"]

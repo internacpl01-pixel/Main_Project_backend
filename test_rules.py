@@ -293,6 +293,151 @@ async def main() -> None:
         r = await cl.get("/rules/matrix")
         check("grid unchanged by the whole run", r.json()["cells"], m["cells"])
 
+        print("\n-- all three head masters, not just RERA --")
+        # 034. Everything above ran without naming a head type and got the RERA
+        # grid, which is the compatibility this section does not re-test. What
+        # it does test is that the other two are real, separate grids and that
+        # writing one cannot touch another.
+        rr = await cl.get("/rules/matrix", params={"target": "head"})
+        check("matrix?target=head is 200", rr.status_code, 200)
+        internal = rr.json()
+        check("it is the Internal Head master",
+              internal["target"]["master_table"], "head_master")
+        check("its heads are not the RERA ones",
+              {h["id"] for h in internal["heads"]} == head_ids, False)
+        note("Internal Heads offered", len(internal["heads"]))
+        check("all three head types are offered",
+              [t["target"] for t in internal["targets"]],
+              ["head", "rera_head", "idw_head"])
+        check("each one is labelled",
+              all(t["label"] for t in internal["targets"]), True)
+        check("exactly one is marked selected",
+              [t["target"] for t in internal["targets"] if t["selected"]],
+              ["head"])
+        # This company mirrors all three on its Field Mapping page, so all three
+        # are usable. Derived, not asserted as a constant: a company that
+        # mirrors none would legitimately report none.
+        note("head types this company can actually write",
+             [t["target"] for t in internal["targets"] if t["used"]])
+
+        # A head type nobody has is a 400 with a readable message, not a 500 and
+        # not a silent fall back to RERA — the fall back is what 031 did.
+        for bad in ("rera_head_master", "project", "", "'; DROP TABLE rule; --"):
+            rr = await cl.get("/rules/matrix", params={"target": bad})
+            check(f"matrix refuses target={bad[:20]!r}",
+                  rr.status_code, 200 if bad == "" else 400)
+        rr = await cl.get("/rules/matrix", params={"target": "nope"})
+        check("and says what the head types are",
+              "rera_head" in rr.json()["detail"], True)
+
+        # Writing the Internal Head grid. Picked off the live master and put
+        # back at the end, so this leaves the company exactly as it found it.
+        probe_head = internal["heads"][0]
+        # RERA when this company has it, because that is the type the rest of
+        # this file checks against — writing the cell there is what lets the
+        # head-type run below actually judge rows instead of reporting no rule.
+        probe_type = ("RERA" if "RERA" in internal["account_types"]
+                      else internal["account_types"][0])
+        note("writing", f"{probe_head['name']} / {probe_type} / DR")
+        rr = await cl.put("/rules/cell",
+                          json={"head_id": probe_head["id"],
+                                "account_type": probe_type,
+                                "direction": "DR", "target": "head"})
+        check("writing an Internal Head cell is 200", rr.status_code, 200)
+        rr = await cl.get("/rules/matrix", params={"target": "head"})
+        check("it comes back on the Internal Head grid",
+              rr.json()["cells"].get(str(probe_head["id"]), {}).get(probe_type),
+              "DR")
+
+        # The property the whole shape was chosen for.
+        rr = await cl.get("/rules/matrix")
+        check("and the RERA grid is untouched", rr.json()["cells"], m["cells"])
+
+        # A head id that belongs to another master is not a head here. Refused
+        # by name rather than stored as a rule about a head this grid lacks.
+        stranger = next(h for h in m["heads"]
+                        if h["id"] not in {x["id"] for x in internal["heads"]})
+        rr = await cl.put("/rules/cell",
+                          json={"head_id": stranger["id"],
+                                "account_type": probe_type,
+                                "direction": "DR", "target": "head"})
+        check("a RERA head cannot be written to the Internal Head grid",
+              rr.status_code, 400)
+
+        # A check run on this head type judges head_id, not rera_head_id.
+        rr = await cl.post("/transactions/temp-trans/check-rules",
+                           json={"account_type": "RERA",
+                                 "account_number": ACCOUNT, "target": "head"})
+        if rr.status_code == 200:
+            head_run = rr.json()
+            check("a head-type run judges the head column",
+                  head_run["target"]["field"], "head_id")
+            check("and says which head type it was",
+                  head_run["target"]["target"], "head")
+            check("its sentence names that head type",
+                  any(head_run["target"]["label"] in s
+                      for s in head_run["why"].values()), True)
+            check("the flagged-rows filter accepts the head type too",
+                  (await cl.get("/transactions/temp-trans",
+                                params={"limit": 200,
+                                        "rule_conflicts":
+                                            f"RERA:{ACCOUNT}:head"})
+                   ).status_code, 200)
+        else:
+            # Only legal if RERA has no Internal Head rule, which is the honest
+            # state until somebody writes one — and the message must say so.
+            note("no Internal Head rule for RERA yet", rr.json()["detail"][:70])
+            check("the refusal names the head type, not just 'head'",
+                  "Internal Head" in rr.json()["detail"], True)
+
+        rr = await cl.get("/transactions/temp-trans",
+                          params={"limit": 5,
+                                  "rule_conflicts": f"RERA:{ACCOUNT}:nope"})
+        check("an unknown head type on the filter is a 400", rr.status_code, 400)
+
+        # A condition on a different master. Its heads must come from that
+        # master, and it must not appear on another head type's list.
+        rr = await cl.post("/rules/conditions",
+                           json={"account_type": "RERA", "direction": "DR",
+                                 "subject_field": desc["name"],
+                                 "operator": "is_not_empty",
+                                 "head_ids": [probe_head["id"]],
+                                 "target": "head"})
+        check("a condition can be written on another head type",
+              rr.status_code, 200)
+        head_cond = rr.json()
+        check("its head is the Internal Head one",
+              [h["id"] for h in head_cond["heads"]], [probe_head["id"]])
+        rr = await cl.get("/rules/conditions", params={"target": "head"})
+        check("it is listed under its own head type",
+              head_cond["id"] in {c["id"] for c in rr.json()["conditions"]}, True)
+        rr = await cl.get("/rules/conditions")
+        check("and not under the RERA one",
+              head_cond["id"] in {c["id"] for c in rr.json()["conditions"]}, False)
+
+        # A head from the wrong master is refused on conditions too — the same
+        # rule the database's composite key enforces underneath.
+        rr = await cl.post("/rules/conditions",
+                           json={"account_type": "RERA", "direction": "DR",
+                                 "subject_field": desc["name"],
+                                 "operator": "is_not_empty",
+                                 "head_ids": [stranger["id"]],
+                                 "target": "head"})
+        check("a condition cannot mix masters", rr.status_code, 400)
+
+        rr = await cl.delete(f"/rules/conditions/{head_cond['id']}")
+        check("that condition deleted", rr.status_code, 200)
+        rr = await cl.put("/rules/cell",
+                          json={"head_id": probe_head["id"],
+                                "account_type": probe_type,
+                                "direction": None, "target": "head"})
+        check("that cell cleared", rr.status_code, 200)
+        rr = await cl.get("/rules/matrix", params={"target": "head"})
+        check("the Internal Head grid is back as it was",
+              rr.json()["cells"], internal["cells"])
+        rr = await cl.get("/rules/summary", params={"target": "head"})
+        check("and its summary is 200 either way", rr.status_code, 200)
+
         print("\n-- lock all / unlock all --")
         # Last, and it puts back exactly what it found: locking a row makes the
         # apply endpoint skip it, so anything above would start failing for a

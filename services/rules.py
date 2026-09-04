@@ -32,8 +32,13 @@ is checked against the live column list before it is stored; the value is
 compared here, in Python; the operator is a lookup in OPERATORS below and an
 unknown one makes the rule refuse to run rather than fall through.
 
-See company/028_rule_table.sql, company/030_rule_condition.sql and
-company/032_rule_single_master.sql.
+Since 034 a rule also names WHICH head it is about — Internal Head, RERA Head or
+TCP Head, the three masters a staged row carries a column for. One run of the
+check judges one of them, so everything below takes a `target` and reads only
+the rules written for it.
+
+See company/028_rule_table.sql, company/030_rule_condition.sql,
+company/032_rule_single_master.sql and company/034_rule_all_heads.sql.
 """
 from __future__ import annotations
 
@@ -41,30 +46,74 @@ import json
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
-# What every rule judges and writes.
+# What a rule can judge and write — one entry per head master, keyed by the
+# same word `fieldmap.mirrors` stores and `_EDITABLE_PICKERS` maps to.
 #
-# Fixed, and honestly so: the heads on the Rules grid come from
-# rera_head_master because rera_head_id is the column Check Rules puts its
-# answer into. A head offered from any other master could be shown in the
-# dropdown and then not saved, which is worse than not offering it.
+# A staged row carries three heads, each written by its own dropdown into its
+# own column, and since 034 a rule names which of the three it is about. The
+# whole of that choice is here: `column` is the column on `rule` and on
+# `rule_condition_head` that holds the id, `field` is the column on temp_trans
+# the check writes, and `master_table` is where the heads come from.
 #
-# 031 tried to lift this by splitting the rule table one-per-master and picking
-# between them with a dict keyed on the words MASTER, RERA, IDW, TCP and FREE.
-# That is the one thing this project does not do: account types are each
-# company's own rows in account_type_master, so a name-keyed map silently gives
-# the wrong master to every type nobody thought to list. 032 put it back.
+# This is a fixed set on purpose, and it is not the thing 031 got wrong. 031
+# keyed its masters on the words MASTER / RERA / IDW / TCP / FREE — account TYPE
+# names, which are each company's own rows in account_type_master, so every type
+# nobody thought to list silently fell back to the RERA master. These three are
+# tables in the schema every company shares; the same three `_MIRROR_TABLES` and
+# `_MASTER_SCHEMA` already name. What stays live is which of them a given
+# company actually uses — that is the fieldmap's answer, read per request — and
+# the heads themselves, which are always that company's own rows.
 #
-# If a second master does earn rules, the shape is a per-rule target column —
-# one table, one more field, resolved from the fieldmap the same way
-# _editable_columns already resolves which pickers a row has. The rest of this
-# module already treats TARGET as data, so that change lands here and nowhere
-# else.
-TARGET = {
-    "field": "rera_head_id",
-    "mirrors": "rera_head",
-    "master_table": "rera_head_master",
-    "label": "RERA head",
+# `label` is deliberately absent. It belongs to Master Data, which is where it
+# is edited ('idw_head' has been shown as "TCP Head" since a rename that touched
+# nothing else), so routers/rules.py reads it from there rather than keeping a
+# second copy here to fall out of step.
+TARGETS: dict[str, dict] = {
+    "head": {
+        "column": "head_id",
+        "field": "head_id",
+        "mirrors": "head",
+        "master_table": "head_master",
+    },
+    "rera_head": {
+        "column": "rera_head_id",
+        "field": "rera_head_id",
+        "mirrors": "rera_head",
+        "master_table": "rera_head_master",
+    },
+    "idw_head": {
+        "column": "idw_head_id",
+        "field": "idw_head_id",
+        "mirrors": "idw_head",
+        "master_table": "idw_head_master",
+    },
 }
+
+# Which one a request means when it does not say. Every rule written before 034
+# is one of these, and every caller that has not been taught to ask still gets
+# the grid it has always got.
+DEFAULT_TARGET = "rera_head"
+
+
+class UnknownTarget(ValueError):
+    """A head type that is not one of TARGETS."""
+
+
+def target_def(target: str | None) -> dict:
+    """One entry of TARGETS, or UnknownTarget.
+
+    Every table and column name this module interpolates into SQL comes back
+    through here. The names themselves are module constants — nothing a request
+    carries is ever formatted into a statement — and this is the gate that keeps
+    it that way: a caller passes the KEY, and only a key already in TARGETS
+    yields anything to interpolate.
+    """
+    key = (target or DEFAULT_TARGET).strip()
+    if key not in TARGETS:
+        raise UnknownTarget(
+            f"'{target}' is not a head type. It must be one of "
+            f"{', '.join(TARGETS)}.")
+    return {**TARGETS[key], "target": key}
 
 # The directions a row can be judged in, and — since 029 dropped BOTH — the only
 # answers a cell of the grid can hold. A head means money in or money out; if it
@@ -83,6 +132,7 @@ class MissingRuleHeads(RuntimeError):
 # =============================================================================
 
 async def allowed_heads(conn, account_type: str,
+                        target: str = DEFAULT_TARGET,
                         allow_empty: bool = False) -> dict[str, list[dict]]:
     """The heads each direction accepts for an account type, from the grid.
 
@@ -101,17 +151,23 @@ async def allowed_heads(conn, account_type: str,
     allow_empty=True is passed when the type has conditions but a blank grid
     column — that type does have a rule, just not a general one, and refusing to
     run would be refusing to run the conditions the user did write.
+
+    `target` names which head master this is about. The rules for the other two
+    are not consulted at all: a run judges one column of the row, so mixing in a
+    head it will not write could only produce a conflict nothing can fix.
     """
+    t = target_def(target)
     rows = await conn.fetch(
         f"""
         SELECT r.direction, h.id, h.name
           FROM rule r
-          JOIN {TARGET['master_table']} h ON h.id = r.head_id
-         WHERE upper(btrim(r.account_type)) = $1
+          JOIN {t['master_table']} h ON h.id = r."{t['column']}"
+         WHERE r.target = $2
+           AND upper(btrim(r.account_type)) = $1
            AND h.is_active = true
          ORDER BY h.name, h.id
         """,
-        (account_type or "").strip().upper(),
+        (account_type or "").strip().upper(), t["target"],
     )
 
     out: dict[str, list[dict]] = {d: [] for d in DIRECTIONS}
@@ -135,29 +191,36 @@ async def allowed_heads(conn, account_type: str,
     return out
 
 
-async def supported_types(conn) -> list[str]:
-    """The account types that have at least one usable rule.
+async def supported_types(conn, target: str = DEFAULT_TARGET) -> list[str]:
+    """The account types that have at least one usable rule for this head type.
 
     Counts only rows whose head is still active, so a type whose every head was
     switched off is reported as having no rule — which is what running it would
     find anyway. A type with no grid cells but an active condition counts: the
     user did write a rule for it, and telling them otherwise would send them to
     fill in a grid they deliberately left blank.
+
+    Per target, because "MASTER has a rule" is only ever true of one head type
+    at a time — a company can easily have written its Internal Head column and
+    left the TCP one blank, and offering the second because the first exists is
+    how somebody runs a check that can find nothing.
     """
+    t = target_def(target)
     rows = await conn.fetch(
         f"""
         SELECT DISTINCT upper(btrim(r.account_type)) AS account_type
           FROM rule r
-          JOIN {TARGET['master_table']} h ON h.id = r.head_id
-         WHERE h.is_active = true
+          JOIN {t['master_table']} h ON h.id = r."{t['column']}"
+         WHERE r.target = $1 AND h.is_active = true
         UNION
         SELECT DISTINCT upper(btrim(c.account_type))
           FROM rule_condition c
           JOIN rule_condition_head ch ON ch.condition_id = c.id
-          JOIN {TARGET['master_table']} h ON h.id = ch.head_id
-         WHERE c.is_active = true AND h.is_active = true
+          JOIN {t['master_table']} h ON h.id = ch."{t['column']}"
+         WHERE c.target = $1 AND c.is_active = true AND h.is_active = true
          ORDER BY 1
-        """
+        """,
+        t["target"],
     )
     return [r["account_type"] for r in rows]
 
@@ -176,7 +239,8 @@ def _listed(names: list[str]) -> str:
 
 
 def explain(account_type: str, expected: dict[str, list[dict]],
-            conditions: list[dict] | None = None) -> dict[str, str]:
+            conditions: list[dict] | None = None,
+            target_label: str = "head") -> dict[str, str]:
     """The sentence shown under each direction, built from the rule itself.
 
     Written from the data rather than stored beside it, so it can never drift
@@ -187,6 +251,10 @@ def explain(account_type: str, expected: dict[str, list[dict]],
     It is not one when conditions cover that direction: the user chose to say
     only the specific thing, and the sentence should report that rather than
     claim nothing can be classified.
+
+    `target_label` names the head type in the sentence, because since 034 the
+    same account type can be judged three different ways and a sentence that
+    only said "no head is marked CR" would be read as a verdict on all three.
     """
     kind = (account_type or "").strip().upper() or "this"
     words = {"CR": "coming into", "DR": "leaving"}
@@ -197,14 +265,14 @@ def explain(account_type: str, expected: dict[str, list[dict]],
             covered = sum(1 for c in (conditions or []) if c["direction"] == d)
             side = "credit" if d == "CR" else "debit"
             out[d] = (
-                f"No head is marked {d} for {kind} accounts, so a {side} here is "
-                f"judged only by the {covered} condition"
+                f"No {target_label} is marked {d} for {kind} accounts, so a "
+                f"{side} here is judged only by the {covered} condition"
                 f"{'' if covered == 1 else 's'} below."
                 if covered else
-                f"No head is marked {d} for {kind} accounts, so a {side} here "
-                f"cannot be classified under this rule.")
+                f"No {target_label} is marked {d} for {kind} accounts, so a "
+                f"{side} here cannot be classified under this rule.")
             continue
-        out[d] = (f"Money {words[d]} a {kind} account is recorded as "
+        out[d] = (f"Money {words[d]} a {kind} account takes the {target_label} "
                   f"{_listed([h['name'] for h in heads])}.")
     return out
 
@@ -418,6 +486,7 @@ def describe(condition: dict, column_label: str | None = None) -> str:
 
 
 async def load_conditions(conn, account_type: str,
+                          target: str = DEFAULT_TARGET,
                           columns: set[str] | None = None) -> list[dict]:
     """The active conditions for an account type, in the order they decide.
 
@@ -435,7 +504,12 @@ async def load_conditions(conn, account_type: str,
     A skipped condition is worse than a refusal in every one of them: the rows
     it should have judged fall through to the grid and come back green, which
     is a clean bill of health nobody asked for.
+
+    Filtered to one `target` for the same reason the grid is: a check writes one
+    column, and a condition about a different head could only ever produce an
+    answer this run cannot save.
     """
+    t = target_def(target)
     rows = await conn.fetch(
         f"""
         SELECT c.id, c.direction, c.subject_field, c.operator,
@@ -445,14 +519,15 @@ async def load_conditions(conn, account_type: str,
                         FILTER (WHERE h.id IS NOT NULL), '[]'::json) AS heads
           FROM rule_condition c
           LEFT JOIN rule_condition_head ch ON ch.condition_id = c.id
-          LEFT JOIN {TARGET['master_table']} h
-                 ON h.id = ch.head_id AND h.is_active = true
+          LEFT JOIN {t['master_table']} h
+                 ON h.id = ch."{t['column']}" AND h.is_active = true
          WHERE upper(btrim(c.account_type)) = $1
+           AND c.target = $2
            AND c.is_active = true
          GROUP BY c.id
          ORDER BY c.sort_order, c.id
         """,
-        (account_type or "").strip().upper(),
+        (account_type or "").strip().upper(), t["target"],
     )
 
     out: list[dict] = []
