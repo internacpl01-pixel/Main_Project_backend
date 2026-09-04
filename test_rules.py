@@ -116,6 +116,7 @@ async def main() -> None:
         # further down: "nothing else changed hands" is the invariant, and a
         # count cannot tell a swap from a no-op.
         owner = {row["id"]: row["rule_id"] for row in res["rows"]}
+        verdict = {row["id"]: row["status"] for row in res["rows"]}
         base_conflicts = res["summary"]["conflicts"]
         note("expected CR", [h["name"] for h in res["expected"]["CR"]])
         note("expected DR", [h["name"] for h in res["expected"]["DR"]])
@@ -251,8 +252,17 @@ async def main() -> None:
               {row["id"] for row in res2["rows"]
                if row["rule_id"] != owner.get(row["id"])},
               {row["id"] for row in judged})
-        check("conflict count unchanged (heads are still unset)",
-              res2["summary"]["conflicts"], base_conflicts)
+        # NOT "the conflict count is unchanged". It was, back when every head on
+        # this account was unset; once heads are filled in, a row the condition
+        # takes over can legitimately flip — the condition allows one head where
+        # the grid allowed three. The invariant is narrower and truer: a row the
+        # condition does not describe cannot have changed its mind.
+        check("no row outside the condition changed verdict",
+              {row["id"] for row in res2["rows"]
+               if row["rule_id"] != cid and row["status"] != verdict.get(row["id"])},
+              set())
+        note("conflicts", f"{base_conflicts} before, "
+                          f"{res2['summary']['conflicts']} with the condition")
 
         print("\n-- apply is re-checked server side --")
         # Needs a head the GRID allows for a RERA debit, to prove the condition
@@ -282,6 +292,48 @@ async def main() -> None:
               r.json()["summary"], res["summary"])
         r = await cl.get("/rules/matrix")
         check("grid unchanged by the whole run", r.json()["cells"], m["cells"])
+
+        print("\n-- lock all / unlock all --")
+        # Last, and it puts back exactly what it found: locking a row makes the
+        # apply endpoint skip it, so anything above would start failing for a
+        # reason that has nothing to do with rules.
+        async def rows_now(**params):
+            rr = await cl.get("/transactions/temp-trans",
+                              params={"limit": 200, **params})
+            return rr.json()["rows"]
+
+        was_locked = {row["id"] for row in await rows_now() if row["is_locked"]}
+        note("locked before", len(was_locked))
+        conflict_ids = {row["id"] for row in await rows_now(
+            rule_conflicts=f"RERA:{ACCOUNT}")}
+
+        rr = await cl.post("/transactions/temp-trans/lock-all",
+                           params={"rule_conflicts": f"RERA:{ACCOUNT}"},
+                           json={"locked": True})
+        check("lock-all is 200", rr.status_code, 200)
+        check("it matched exactly the filtered rows",
+              rr.json()["matched"], len(conflict_ids))
+        check("locking locked exactly those rows",
+              {row["id"] for row in await rows_now() if row["is_locked"]},
+              was_locked | conflict_ids)
+
+        rr = await cl.post("/transactions/temp-trans/lock-all",
+                           params={"rule_conflicts": f"RERA:{ACCOUNT}"},
+                           json={"locked": True})
+        check("locking twice changes nothing", rr.json()["changed"], 0)
+
+        rr = await cl.post("/transactions/temp-trans/lock-all",
+                           params={"rule_conflicts": f"RERA:{ACCOUNT}"},
+                           json={"locked": False})
+        check("unlock-all is 200", rr.status_code, 200)
+
+        # Put back anything this suite unlocked that was locked when it started.
+        for row_id in was_locked:
+            await cl.post(f"/transactions/temp-trans/{row_id}/lock",
+                          json={"locked": True})
+        check("lock state restored",
+              {row["id"] for row in await rows_now() if row["is_locked"]},
+              was_locked)
 
     await database.close_pool()
     print(f"\n{PASS} passed, {FAIL} failed")

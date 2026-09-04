@@ -992,6 +992,107 @@ async def delete_all_transactions(user: dict = Depends(get_company_user)):
 
 # ---------- Temp Import (raw rows before finalization) -----------------------
 
+# The joins resolve each id to the name the user picked in the master tables, so
+# the staging screen can show "Site Materials" rather than "head_id: 4" without
+# the browser holding a copy of every master list. One constant, because the
+# search reaches into these names and every query that honours the search has to
+# join the same things or match a different set of rows.
+_TEMP_JOINS = """
+    FROM temp_trans t
+    LEFT JOIN projects            p  ON p.id  = t.project_id
+    LEFT JOIN head_master         h  ON h.id  = t.head_id
+    LEFT JOIN rera_head_master    rh ON rh.id = t.rera_head_id
+    LEFT JOIN idw_head_master     ih ON ih.id = t.idw_head_id
+    LEFT JOIN beneficiary_master  bn ON bn.id = t.beneficiary_id
+"""
+
+
+async def _temp_filters(
+    conn, user: dict, *, batch_id=None, classified=None, date_from=None,
+    date_to=None, account=None, company=None, search: str = "",
+    rule_conflicts: str | None = None,
+) -> tuple[str, list, list, str, int]:
+    """The WHERE the staging list is looking at, and what went into building it.
+
+    Shared by the list and by Lock/Unlock all, so "all" means exactly the rows
+    the table is showing — every page of them, not just the one on screen. Two
+    filter builders would drift the first time one grew a filter, and the
+    symptom would be a bulk action touching rows the user never saw.
+
+    Returns (where, params, columns, search_term, next_placeholder). The last is
+    the number the caller's own LIMIT/OFFSET continues from.
+    """
+    filters = ["1=1"]
+    params: list = []
+    idx = 1
+
+    if batch_id is not None:
+        filters.append(f"t.batch_id = ${idx}")
+        params.append(batch_id)
+        idx += 1
+    if classified is not None:
+        filters.append(f"t.is_classified = ${idx}")
+        params.append(classified)
+        idx += 1
+
+    scope = await scoping.visible_project_ids(conn, user)
+    clause, scope_params, idx = scoping.project_filter(scope, "t.project_id", idx)
+    if clause:
+        filters.append(clause)
+        params.extend(scope_params)
+    elif scoping.scope_is_empty(scope):
+        # Scoped to nothing, but unfiled rows are still everyone's to claim.
+        filters.append("t.project_id IS NULL")
+
+    columns = await custom_fields.data_columns(conn)
+
+    # Date, account number and company. Resolved from the fieldmap, so the
+    # Account Number filter means the same column the Company fill reads.
+    idx = await _facet_filters(
+        conn, columns=columns, filters=filters, params=params, idx=idx,
+        date_from=date_from, date_to=date_to, account=account, company=company,
+    )
+
+    term = (search or "").strip()
+    if term:
+        clause, sp, idx = _search_filter(
+            term, columns,
+            ("p.name", "p.code", "h.name", "rh.name", "ih.name", "bn.name"), idx
+        )
+        if clause:
+            filters.append(clause)
+            params.extend(sp)
+
+    # Only the rows the rule flags, for the staging table's "flagged rows only"
+    # toggle.
+    #
+    # Judged here rather than filtered by a list of ids sent from the browser,
+    # for two reasons. A few thousand ids do not fit in a query string. And a
+    # list built from ids captured minutes ago keeps showing rows that have
+    # since been fixed — the filter would lie about its own subject. Re-judging
+    # also means "conflict" is decided by exactly one code path, the same
+    # _judged_rows the dialog runs, so the toggle and the dialog cannot
+    # disagree about which rows they mean.
+    #
+    # Nothing typed reaches SQL: both halves go into _rule_context, which looks
+    # the type up in account_type_master and the account in bank_master and
+    # 400s on either miss, and the ids come back as a bound bigint array.
+    if rule_conflicts:
+        wanted_type, sep, wanted_account = rule_conflicts.partition(":")
+        if not sep:
+            raise HTTPException(
+                400, 'rule_conflicts must be written "TYPE:ACCOUNT" — the '
+                     'account type and the account number the check ran on.')
+        rule_ctx = await _rule_context(conn, wanted_type, wanted_account)
+        flagged = [r["id"] for r in await _judged_rows(conn, user, rule_ctx)
+                   if r["status"] == "conflict"]
+        filters.append(f"t.id = ANY(${idx}::bigint[])")
+        params.append(flagged)
+        idx += 1
+
+    return " AND ".join(filters), params, columns, term, idx
+
+
 @router.get("/temp-trans")
 async def list_temp_trans(
     batch_id: int = None,
@@ -1066,96 +1167,19 @@ async def list_temp_trans(
     button has to say how much it will delete, which is everything staged, not
     what the current tab and search happen to show.
     """
-    filters = ["1=1"]
-    params = []
-    idx = 1
-
-    if batch_id is not None:
-        filters.append(f"t.batch_id = ${idx}")
-        params.append(batch_id)
-        idx += 1
-    if classified is not None:
-        filters.append(f"t.is_classified = ${idx}")
-        params.append(classified)
-        idx += 1
-
     async with company_connection(user["schema"]) as conn:
-        scope = await scoping.visible_project_ids(conn, user)
-        clause, scope_params, idx = scoping.project_filter(scope, "t.project_id", idx)
-        if clause:
-            filters.append(clause)
-            params.extend(scope_params)
-        elif scoping.scope_is_empty(scope):
-            # Scoped to nothing, but unfiled rows are still everyone's to claim.
-            filters.append("t.project_id IS NULL")
-
+        where, params, columns, term, idx = await _temp_filters(
+            conn, user, batch_id=batch_id, classified=classified,
+            date_from=date_from, date_to=date_to, account=account,
+            company=company, search=search, rule_conflicts=rule_conflicts,
+        )
         # The data columns are read from the live table, not written out here.
         # A custom field is a real column on temp_trans, and a fixed SELECT is
         # why one could be created, matched during parsing and stored, and still
         # never appear on this screen. Same approach as DPL's get_master_rows:
         # the server decides the column set, the client renders what it is sent.
-        columns = await custom_fields.data_columns(conn)
         data_cols = ", ".join(f"t.{c['name']}" for c in columns)
-
-        # Date, account number and company. Resolved from the fieldmap, so the
-        # Account Number filter means the same column the Company fill reads.
-        idx = await _facet_filters(
-            conn, columns=columns, filters=filters, params=params, idx=idx,
-            date_from=date_from, date_to=date_to, account=account, company=company,
-        )
-
-        term = (search or "").strip()
-        if term:
-            clause, sp, idx = _search_filter(
-                term, columns,
-                ("p.name", "p.code", "h.name", "rh.name", "ih.name", "bn.name"), idx
-            )
-            if clause:
-                filters.append(clause)
-                params.extend(sp)
-
-        # Only the rows the rule flags, for the staging table's "flagged rows
-        # only" toggle.
-        #
-        # Judged here rather than filtered by a list of ids sent from the
-        # browser, for two reasons. A few thousand ids do not fit in a query
-        # string. And a list built from ids captured minutes ago keeps showing
-        # rows that have since been fixed — the filter would lie about its own
-        # subject. Re-judging also means "conflict" is decided by exactly one
-        # code path, the same _judged_rows the dialog runs, so the toggle and
-        # the dialog cannot disagree about which rows they mean.
-        #
-        # Nothing typed reaches SQL: both halves go into _rule_context, which
-        # looks the type up in account_type_master and the account in
-        # bank_master and 400s on either miss, and the ids come back as a bound
-        # bigint array.
-        if rule_conflicts:
-            wanted_type, sep, wanted_account = rule_conflicts.partition(":")
-            if not sep:
-                raise HTTPException(
-                    400, 'rule_conflicts must be written "TYPE:ACCOUNT" — the '
-                         'account type and the account number the check ran on.')
-            rule_ctx = await _rule_context(conn, wanted_type, wanted_account)
-            flagged = [r["id"] for r in await _judged_rows(conn, user, rule_ctx)
-                       if r["status"] == "conflict"]
-            filters.append(f"t.id = ANY(${idx}::bigint[])")
-            params.append(flagged)
-            idx += 1
-
-        where = " AND ".join(filters)
-
-        # The joins resolve each id to the name the user picked in the master
-        # tables, so the staging screen can show "Site Materials" rather than
-        # "head_id: 4" without the browser holding a copy of every master list.
-        # Repeated in the count query because the search reaches into them.
-        joins = """
-            FROM temp_trans t
-            LEFT JOIN projects            p  ON p.id  = t.project_id
-            LEFT JOIN head_master         h  ON h.id  = t.head_id
-            LEFT JOIN rera_head_master    rh ON rh.id = t.rera_head_id
-            LEFT JOIN idw_head_master     ih ON ih.id = t.idw_head_id
-            LEFT JOIN beneficiary_master  bn ON bn.id = t.beneficiary_id
-        """
+        joins = _TEMP_JOINS
 
         total = await conn.fetchval(f"SELECT count(*) {joins} WHERE {where}", *params)
 
@@ -1999,6 +2023,72 @@ async def edit_temp_row(
     if updated is None:
         raise HTTPException(404, "Staged row not found.")
     return {"status": "updated", "row_id": row_id, "changed": sorted(payload)}
+
+
+@router.post("/temp-trans/lock-all")
+async def set_temp_rows_lock(
+    locked: bool = Body(..., embed=True,
+                        description="true to lock, false to unlock."),
+    batch_id: int = None,
+    classified: bool = None,
+    date_from: str = Query(None),
+    date_to: str = Query(None),
+    account: str = Query(None),
+    company: str = Query(None),
+    rule_conflicts: str = Query(None),
+    search: str = Query(""),
+    user: dict = Depends(get_company_user),
+):
+    """Lock or unlock every row the staging table is currently showing.
+
+    Takes the SAME filter parameters as GET /temp-trans and builds its WHERE
+    with the same _temp_filters, so "all" means exactly the rows on screen —
+    every page of them, not just the one being looked at. That is the point of
+    sharing the builder: a bulk action that used its own filters would sooner
+    or later lock rows the table never showed, and nothing on screen would say
+    so.
+
+    With no filters set that is genuinely every staged row, which is the
+    ordinary use — finish a statement, lock the lot. With the search box or the
+    flagged-rows toggle on it is that subset, which is the useful one.
+
+    Same access as the single-row lock and for the same reason: the padlock
+    protects a row from accident, not from colleagues, and anyone trusted to
+    edit a row is trusted to say it is finished. Scope-checked through
+    _temp_filters, so rows filed under a project the caller cannot see are not
+    among the ones it can lock.
+
+    Reports `matched` and `changed` separately. They differ when some rows were
+    already in the state asked for, and "1,200 rows matched, 3 changed" is the
+    difference between a no-op and a surprise.
+    """
+    async with company_connection(user["schema"]) as conn:
+        where, params, _cols, _term, idx = await _temp_filters(
+            conn, user, batch_id=batch_id, classified=classified,
+            date_from=date_from, date_to=date_to, account=account,
+            company=company, search=search, rule_conflicts=rule_conflicts,
+        )
+
+        matched = await conn.fetchval(
+            f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
+
+        # The joins live in a subquery because the search reaches into the
+        # master names, and an UPDATE cannot carry LEFT JOINs the way a SELECT
+        # can. Same rows either way.
+        changed = await conn.execute(
+            f"""
+            UPDATE temp_trans SET is_locked = ${idx}
+             WHERE is_locked IS DISTINCT FROM ${idx}
+               AND id IN (SELECT t.id {_TEMP_JOINS} WHERE {where})
+            """,
+            *params, locked,
+        )
+
+    # asyncpg returns the tag, e.g. 'UPDATE 12'.
+    return {"status": "locked" if locked else "unlocked",
+            "is_locked": locked,
+            "matched": matched,
+            "changed": int(changed.split()[-1]) if changed else 0}
 
 
 @router.post("/temp-trans/{row_id}/lock")
