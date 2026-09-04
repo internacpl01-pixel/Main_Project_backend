@@ -505,20 +505,23 @@ async def _clean(conn, t, account_type, direction, subject_field, operator,
                     400, f"'{row['name']}' is switched off in Master Data, so a "
                          f"condition cannot point at it. Reactivate it first.")
 
-        # A condition outranks the grid, but a head the grid has never marked
-        # for anything is a head nobody has told this company how to treat at
-        # all — writing a condition around it first, with the grid still blank,
-        # is how a head ends up defined only in a sentence nobody else can find.
+        # Checked against the SAME account type the condition is being written
+        # for, not the grid as a whole — a head the grid marks for MASTER but
+        # leaves blank for RERA is exactly the gap a RERA condition about it is
+        # meant to fill, and refusing that would undo the one thing conditions
+        # are for. Any direction counts: this asks whether the grid has an
+        # opinion on this head for this account type at all, not which one.
         on_grid = {r[t["column"]] for r in await conn.fetch(
             f'SELECT DISTINCT "{t["column"]}" FROM rule '
-            f'WHERE target = $1 AND "{t["column"]}" = ANY($2::bigint[])',
-            t["target"], ids)}
+            f'WHERE target = $1 AND account_type = $2 '
+            f'AND "{t["column"]}" = ANY($3::bigint[])',
+            t["target"], wanted_type, ids)}
         missing = [found[i]["name"] for i in ids if i not in on_grid]
         if missing:
             raise HTTPException(
                 400, f"{', '.join(missing)} "
                      f"{'is' if len(missing) == 1 else 'are'} not set on the "
-                     f"grid for any account type yet. Give "
+                     f"grid for {wanted_type} accounts yet. Give "
                      f"{'it' if len(missing) == 1 else 'them'} a CR or DR "
                      f"there first, then write the condition.")
 
