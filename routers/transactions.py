@@ -1552,7 +1552,8 @@ async def check_temp_rules(
     known = {c["name"] for c in columns}
     default_columns = [
         name for name in dict.fromkeys(
-            [described, *(c["subject_field"] for c in conditions)])
+            [described, *(test["subject_field"]
+                         for c in conditions for test in c["tests"])])
         if name and name in known
     ]
 
@@ -1588,12 +1589,12 @@ async def check_temp_rules(
         # it. Sent once rather than repeated on every row it decided.
         "conditions": {
             str(c["id"]): {
-                "sentence": rules.describe(c, labels.get(c["subject_field"])),
+                "sentence": rules.describe(c, labels),
                 "direction": c["direction"],
                 "heads": c["heads"],
-                # So the dialog can offer the column a sentence tested — the
-                # evidence for a "by condition" verdict is in that column.
-                "subject_field": c["subject_field"],
+                # So the dialog can offer the columns a sentence tested — the
+                # evidence for a "by condition" verdict is in those columns.
+                "subject_fields": [test["subject_field"] for test in c["tests"]],
             }
             for c in conditions
         },
@@ -1713,7 +1714,7 @@ async def apply_temp_rules(
                     f"'{names.get(chosen, chosen)}' is not one the "
                     f"{(account_type or '').strip().upper()} rule allows for a "
                     f"{direction or 'directionless'} row"
-                    + (f" matching “{rules.phrase(cond, labels.get(cond['subject_field']))}”"
+                    + (f" matching “{rules.phrase(cond, labels)}”"
                        if cond else "")
                     + ". The rows may have changed since the check — run Check "
                       "Rules again.",

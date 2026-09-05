@@ -448,30 +448,49 @@ def operator_catalog() -> list[dict]:
             for name, op in OPERATORS.items()]
 
 
-def phrase(condition: dict, column_label: str | None = None) -> str:
+def _test_clause(test: dict, column_labels: dict[str, str] | None = None) -> str:
+    """One test as `Narration contains "REFUND"`, with no side or joiner."""
+    op = OPERATORS.get(test["operator"])
+    subject = (column_labels or {}).get(test["subject_field"], test["subject_field"])
+    label = op["label"] if op else f"[unknown test {test['operator']!r}]"
+    values = op["values"] if op else 1
+
+    if values == 0:
+        return f"{subject} {label}"
+    if values == 1:
+        return f'{subject} {label} "{_text(test["value1"])}"'
+    return (f'{subject} {label} "{_text(test["value1"])}" '
+            f'and "{_text(test["value2"])}"')
+
+
+def phrase(condition: dict, column_labels: dict[str, str] | None = None) -> str:
     """The IF half of a condition: `a debit whose Narration contains "REFUND"`.
 
     Separate from the whole sentence because it is also what the errors below
     say, and a condition with no head left to name cannot be described by a
     sentence that ends in one.
+
+    One or more tests, joined the way they are stored: the first said plainly,
+    every one after it introduced by its own combinator. `column_labels` maps a
+    subject_field to what the company calls it, because with more than one test
+    two different columns can be in play at once — a single label, as this took
+    before conditions could carry more than one test, would be the wrong one on
+    every test but the first.
     """
-    op = OPERATORS.get(condition["operator"])
     side = "credit" if condition["direction"] == "CR" else "debit"
-    subject = column_label or condition["subject_field"]
-    label = op["label"] if op else f"[unknown test {condition['operator']!r}]"
-    values = op["values"] if op else 1
-
-    if values == 0:
-        test = f"{subject} {label}"
-    elif values == 1:
-        test = f'{subject} {label} "{_text(condition["value1"])}"'
-    else:
-        test = (f'{subject} {label} "{_text(condition["value1"])}" '
-                f'and "{_text(condition["value2"])}"')
-    return f"a {side} whose {test}"
+    tests = condition.get("tests") or [condition]
+    parts = []
+    for i, test in enumerate(tests):
+        clause = _test_clause(test, column_labels)
+        if i == 0:
+            parts.append(clause)
+        else:
+            joiner = "and" if test.get("combinator") == "AND" else "or"
+            parts.append(f"{joiner} {clause}")
+    return f"a {side} whose {' '.join(parts)}"
 
 
-def describe(condition: dict, column_label: str | None = None) -> str:
+def describe(condition: dict, column_labels: dict[str, str] | None = None) -> str:
     """One condition as the sentence shown on screen and in the check result.
 
     Generated from the stored row every time it is read, for the same reason
@@ -481,7 +500,7 @@ def describe(condition: dict, column_label: str | None = None) -> str:
     names = [h["name"] for h in condition.get("heads") or []]
     # Only the first letter — str.capitalize() would lower-case the rest, and
     # the rest is the company's own column name and the user's own search text.
-    said = phrase(condition, column_label)
+    said = phrase(condition, column_labels)
     return f"{said[:1].upper()}{said[1:]} is {_listed(names)}."
 
 
@@ -512,8 +531,7 @@ async def load_conditions(conn, account_type: str,
     t = target_def(target)
     rows = await conn.fetch(
         f"""
-        SELECT c.id, c.direction, c.subject_field, c.operator,
-               c.value1, c.value2, c.sort_order,
+        SELECT c.id, c.direction, c.sort_order,
                coalesce(json_agg(json_build_object('id', h.id, 'name', h.name)
                                  ORDER BY ch.sort_order, h.name, h.id)
                         FILTER (WHERE h.id IS NOT NULL), '[]'::json) AS heads
@@ -530,27 +548,52 @@ async def load_conditions(conn, account_type: str,
         (account_type or "").strip().upper(), t["target"],
     )
 
+    # Fetched separately from the join above rather than folded into it: a
+    # second json_agg alongside rule_condition_head's would join heads by
+    # tests and hand back one row per (head, test) pair, not per condition.
+    ids = [r["id"] for r in rows]
+    test_rows = await conn.fetch(
+        """
+        SELECT condition_id, sort_order, combinator, subject_field,
+               operator, value1, value2
+          FROM rule_condition_test
+         WHERE condition_id = ANY($1::bigint[])
+         ORDER BY condition_id, sort_order
+        """,
+        ids,
+    ) if ids else []
+    tests_by_condition: dict[int, list[dict]] = {}
+    for r in test_rows:
+        tests_by_condition.setdefault(r["condition_id"], []).append(dict(r))
+
     out: list[dict] = []
     for r in rows:
         c = dict(r)
         c["heads"] = json.loads(c["heads"])
-        if c["operator"] not in OPERATORS:
+        c["tests"] = tests_by_condition.get(c["id"], [])
+        wanted = (account_type or "").strip().upper()
+        if not c["tests"]:
             raise MissingRuleHeads(
-                f"A condition on {(account_type or '').strip().upper()} uses "
-                f"the test {c['operator']!r}, which this version does not know. "
-                f"Open the Rules page and set that condition again.")
+                f"A condition on {wanted} has no test left. Open the Rules "
+                f"page and set one.")
+        for test in c["tests"]:
+            if test["operator"] not in OPERATORS:
+                raise MissingRuleHeads(
+                    f"A condition on {wanted} uses the test "
+                    f"{test['operator']!r}, which this version does not know. "
+                    f"Open the Rules page and set that condition again.")
+            if columns is not None and test["subject_field"] not in columns:
+                raise MissingRuleHeads(
+                    f"A condition on {wanted} tests the column "
+                    f"'{test['subject_field']}', which no longer exists on "
+                    f"the imported rows. Open the Rules page and point it at "
+                    f"a column that does, or switch the condition off.")
         if not c["heads"]:
             raise MissingRuleHeads(
                 f"The condition for {phrase(c)} has no head left to point at — "
                 f"the ones it named were deleted or switched off in Master "
                 f"Data. Open the Rules page and give it a head, or switch the "
                 f"condition off.")
-        if columns is not None and c["subject_field"] not in columns:
-            raise MissingRuleHeads(
-                f"A condition on {(account_type or '').strip().upper()} tests "
-                f"the column '{c['subject_field']}', which no longer exists on "
-                f"the imported rows. Open the Rules page and point it at a "
-                f"column that does, or switch the condition off.")
         c["ids"] = {h["id"] for h in c["heads"]}
         out.append(c)
     return out
@@ -562,7 +605,7 @@ def subject_fields(conditions: list[dict]) -> list[str]:
     Fetched once and read per row. Ordered so the SELECT this builds is stable
     between the check and the fix, which have to agree row for row.
     """
-    return sorted({c["subject_field"] for c in conditions})
+    return sorted({test["subject_field"] for c in conditions for test in c["tests"]})
 
 
 def subject_sql(fields: list[str], alias: str = "t", prefix: str = "s") -> str:
@@ -605,17 +648,33 @@ def take_subjects(row: dict, fields: list[str], prefix: str = "s") -> dict:
     return {f: row.pop(f"{prefix}{i}") for i, f in enumerate(fields)}
 
 
+def _test_passes(test: dict, subjects: dict) -> bool:
+    op = OPERATORS[test["operator"]]
+    return bool(op["fn"](subjects.get(test["subject_field"]),
+                         test["value1"], test["value2"]))
+
+
 def match(condition: dict, subjects: dict) -> bool:
-    """Does this condition's test pass for this row?
+    """Does this condition's tests pass for this row?
 
     `subjects` is {column name: value} for the columns the loaded conditions
     actually test — read out of a row that was already fetched. This is the
-    whole of the user-entered logic, and it is a dict lookup and a function
-    call: no expression is built, parsed or executed.
+    whole of the user-entered logic, and each test is a dict lookup and a
+    function call: no expression is built, parsed or executed.
+
+    One or more tests, joined with AND binding tighter than OR: split them into
+    runs at each OR (the first test always starts a run, since it has no
+    combinator), require every test within a run to pass, and accept if ANY run
+    does. That is the plain reading of "A and B or C and D" with no brackets,
+    and it is the shape the user asked for rather than an explicit group
+    picker.
     """
-    op = OPERATORS[condition["operator"]]
-    return bool(op["fn"](subjects.get(condition["subject_field"]),
-                         condition["value1"], condition["value2"]))
+    runs: list[list[dict]] = [[]]
+    for test in condition["tests"]:
+        if test.get("combinator") == "OR":
+            runs.append([])
+        runs[-1].append(test)
+    return any(all(_test_passes(t, subjects) for t in run) for run in runs)
 
 
 def resolve(direction: str | None, subjects: dict, conditions: list[dict],

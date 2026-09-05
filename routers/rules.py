@@ -333,30 +333,54 @@ async def _fetch_conditions(conn, t: dict, where: str = "",
         *params, t["target"],
     )
     columns = await _subject_columns(conn)
+    labels = {name: col["label"] for name, col in columns.items()}
+
+    # Fetched separately rather than joined alongside rule_condition_head: two
+    # json_aggs off the same GROUP BY would cross the heads with the tests and
+    # hand back one row per (head, test) pair instead of one per condition.
+    ids = [r["id"] for r in rows]
+    test_rows = await conn.fetch(
+        """
+        SELECT condition_id, sort_order, combinator, subject_field,
+               operator, value1, value2
+          FROM rule_condition_test
+         WHERE condition_id = ANY($1::bigint[])
+         ORDER BY condition_id, sort_order
+        """,
+        ids,
+    ) if ids else []
+    tests_by_condition: dict[int, list[dict]] = {}
+    for r in test_rows:
+        tests_by_condition.setdefault(r["condition_id"], []).append(dict(r))
 
     out = []
     for r in rows:
         c = dict(r)
         c["heads"] = json.loads(c["heads"])
-        col = columns.get(c["subject_field"])
-        c["subject_label"] = col["label"] if col else c["subject_field"]
-        # The same three refusals load_conditions makes, said here as a note on
-        # the row instead of as an error — this screen is where they get fixed,
-        # and a condition you cannot see is a condition you cannot repair.
+        c["tests"] = tests_by_condition.get(c["id"], [])
+        # The same refusals load_conditions makes, said here as a note on the
+        # row instead of as an error — this screen is where they get fixed, and
+        # a condition you cannot see is a condition you cannot repair.
         live = [h for h in c["heads"] if h["is_active"]]
-        if c["operator"] not in rules.OPERATORS:
-            c["problem"] = (f"This uses a test ({c['operator']}) that no longer "
-                            f"exists. Set it again.")
+        bad_op = next((tt for tt in c["tests"]
+                      if tt["operator"] not in rules.OPERATORS), None)
+        bad_col = next((tt for tt in c["tests"]
+                       if tt["subject_field"] not in columns), None)
+        if not c["tests"]:
+            c["problem"] = "This condition has no test left. Set one."
+        elif bad_op is not None:
+            c["problem"] = (f"This uses a test ({bad_op['operator']}) that no "
+                            f"longer exists. Set it again.")
         elif not live:
             c["problem"] = ("Every head this points at has been deleted or "
                             "switched off in Master Data.")
-        elif col is None:
-            c["problem"] = (f"The column it tests ({c['subject_field']}) is no "
-                            f"longer on the imported rows.")
+        elif bad_col is not None:
+            c["problem"] = (f"The column it tests ({bad_col['subject_field']}) "
+                            f"is no longer on the imported rows.")
         else:
             c["problem"] = None
         c["sentence"] = rules.describe(
-            {**c, "heads": live or c["heads"]}, c["subject_label"])
+            {**c, "heads": live or c["heads"]}, labels)
         out.append(c)
     return out
 
@@ -408,8 +432,8 @@ async def list_conditions(
     }
 
 
-async def _clean(conn, t, account_type, direction, subject_field, operator,
-                 value1, value2, head_ids, require_heads: bool = True) -> dict:
+async def _clean(conn, t, account_type, direction, tests, head_ids,
+                 require_heads: bool = True) -> dict:
     """Check a condition against the live masters and columns, or 400 saying why.
 
     Everything a condition names is checked here rather than trusted, because
@@ -418,9 +442,12 @@ async def _clean(conn, t, account_type, direction, subject_field, operator,
     off in Master Data. A condition that stored one of those anyway would be a
     sentence that reads fine on this screen and refuses to run on the next one.
 
-    The operator is checked against the column's KIND too — "more than" on a
-    narration is not a rule anyone can satisfy, and offering it and then storing
-    it would be this file agreeing to something rules.py cannot answer.
+    `tests` is one or more {subject_field, operator, value1, value2,
+    combinator}. Each operator is checked against its own column's KIND too —
+    "more than" on a narration is not a rule anyone can satisfy, and offering
+    it and then storing it would be this file agreeing to something rules.py
+    cannot answer. The first test's combinator is ignored (there is nothing
+    before it to join to); every test after it must say AND or OR.
     """
     wanted_type = (account_type or "").strip().upper()
     if not wanted_type:
@@ -439,34 +466,55 @@ async def _clean(conn, t, account_type, direction, subject_field, operator,
             400, f"Direction must be {' or '.join(_DIRECTIONS)}.")
 
     columns = await _subject_columns(conn)
-    field = (subject_field or "").strip()
-    col = columns.get(field)
-    if col is None:
+    if not tests:
         raise HTTPException(
-            400, f"'{field or '(nothing)'}' is not a column on the imported "
-                 f"rows. Pick one of the fields shown on Imported Rows.")
+            400, "A condition needs at least one test — the column, "
+                 "comparison and value that decide whether it applies.")
 
-    op = rules.OPERATORS.get((operator or "").strip())
-    if op is None:
-        raise HTTPException(400, f"'{operator}' is not a test this can make.")
-    if col["kind"] not in op["kinds"]:
-        raise HTTPException(
-            400, f"'{op['label']}' cannot be asked of {col['label']}, which "
-                 f"holds {col['kind']} values.")
+    clean_tests: list[dict] = []
+    for i, raw in enumerate(tests or []):
+        field = (raw.get("subject_field") or "").strip()
+        col = columns.get(field)
+        if col is None:
+            raise HTTPException(
+                400, f"'{field or '(nothing)'}' is not a column on the imported "
+                     f"rows. Pick one of the fields shown on Imported Rows.")
 
-    v1 = (value1 or "").strip() or None
-    v2 = (value2 or "").strip() or None
-    if op["values"] >= 1 and v1 is None:
-        raise HTTPException(400, f"'{op['label']}' needs a value to compare to.")
-    if op["values"] == 2 and v2 is None:
-        raise HTTPException(400, f"'{op['label']}' needs both values.")
-    if op["values"] == 0:
-        # Kept out rather than kept around: a value stored beside an operator
-        # that ignores it is a value the sentence on screen would not mention
-        # and nobody could explain later.
-        v1 = v2 = None
-    elif op["values"] == 1:
-        v2 = None
+        operator = (raw.get("operator") or "").strip()
+        op = rules.OPERATORS.get(operator)
+        if op is None:
+            raise HTTPException(400, f"'{operator}' is not a test this can make.")
+        if col["kind"] not in op["kinds"]:
+            raise HTTPException(
+                400, f"'{op['label']}' cannot be asked of {col['label']}, which "
+                     f"holds {col['kind']} values.")
+
+        v1 = (raw.get("value1") or "").strip() or None
+        v2 = (raw.get("value2") or "").strip() or None
+        if op["values"] >= 1 and v1 is None:
+            raise HTTPException(400, f"'{op['label']}' needs a value to compare to.")
+        if op["values"] == 2 and v2 is None:
+            raise HTTPException(400, f"'{op['label']}' needs both values.")
+        if op["values"] == 0:
+            # Kept out rather than kept around: a value stored beside an
+            # operator that ignores it is a value the sentence on screen would
+            # not mention and nobody could explain later.
+            v1 = v2 = None
+        elif op["values"] == 1:
+            v2 = None
+
+        combinator = (raw.get("combinator") or "").strip().upper() or None
+        if i == 0:
+            combinator = None
+        elif combinator not in ("AND", "OR"):
+            raise HTTPException(
+                400, "Every test after the first needs AND or OR against the "
+                     "one before it.")
+
+        clean_tests.append({
+            "subject_field": field, "operator": operator,
+            "value1": v1, "value2": v2, "combinator": combinator,
+        })
 
     # require_heads=False is the preview, which asks only the IF half: what the
     # answer should be is still the user's decision at that point, and demanding
@@ -526,9 +574,8 @@ async def _clean(conn, t, account_type, direction, subject_field, operator,
                      f"there first, then write the condition.")
 
     return {"account_type": wanted_type, "direction": wanted_dir,
-            "subject_field": field, "operator": (operator or "").strip(),
-            "value1": v1, "value2": v2, "head_ids": ids,
-            "target": t["target"], "column": col, "operator_def": op}
+            "tests": clean_tests, "head_ids": ids,
+            "target": t["target"], "columns": columns}
 
 
 async def _write_heads(conn, t: dict, condition_id: int,
@@ -548,14 +595,38 @@ async def _write_heads(conn, t: dict, condition_id: int,
             f"sort_order) VALUES ($1, $2, $3)", condition_id, head_id, i)
 
 
+async def _write_tests(conn, condition_id: int, tests: list[dict]) -> None:
+    """Replace a condition's tests with exactly this list, in this order.
+
+    Same replace-the-whole-list shape _write_heads uses, for the same reason:
+    the builder always saves the whole sentence, so there is never a single
+    test to patch in isolation.
+    """
+    await conn.execute(
+        "DELETE FROM rule_condition_test WHERE condition_id = $1", condition_id)
+    for i, test in enumerate(tests):
+        await conn.execute(
+            """
+            INSERT INTO rule_condition_test
+                (condition_id, sort_order, combinator, subject_field,
+                 operator, value1, value2)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """,
+            condition_id, i, test["combinator"], test["subject_field"],
+            test["operator"], test["value1"], test["value2"],
+        )
+
+
 @router.post("/conditions", dependencies=[Depends(require_manager)])
 async def create_condition(
     account_type: str = Body(..., description="An active account type."),
     direction: str = Body(..., description="CR or DR."),
-    subject_field: str = Body(..., description="A column of the imported rows."),
-    operator: str = Body(..., description="One of the tests from /rules/conditions."),
-    value1: str | None = Body(None),
-    value2: str | None = Body(None, description="Only 'between' uses this."),
+    tests: list[dict] = Body(..., description="One or more {subject_field, "
+                                              "operator, value1, value2, "
+                                              "combinator}. The first test's "
+                                              "combinator is ignored; every "
+                                              "test after it must say AND or "
+                                              "OR against the one before it."),
     head_ids: list[int] = Body(..., description="The answer when the test "
                                                 "passes; the first is what "
                                                 "Replace preselects."),
@@ -576,24 +647,22 @@ async def create_condition(
     """
     t = _target(target)
     async with company_connection(user["schema"]) as conn:
-        clean = await _clean(conn, t, account_type, direction, subject_field,
-                             operator, value1, value2, head_ids)
+        clean = await _clean(conn, t, account_type, direction, tests, head_ids)
         nxt = await conn.fetchval(
             "SELECT coalesce(max(sort_order), -1) + 1 FROM rule_condition "
             "WHERE account_type = $1 AND direction = $2 AND target = $3",
             clean["account_type"], clean["direction"], t["target"])
         new_id = await conn.fetchval(
             """
-            INSERT INTO rule_condition (account_type, direction, subject_field,
-                                        operator, value1, value2, sort_order,
+            INSERT INTO rule_condition (account_type, direction, sort_order,
                                         is_active, target)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING id
             """,
-            clean["account_type"], clean["direction"], clean["subject_field"],
-            clean["operator"], clean["value1"], clean["value2"], nxt,
+            clean["account_type"], clean["direction"], nxt,
             bool(is_active), t["target"],
         )
+        await _write_tests(conn, new_id, clean["tests"])
         await _write_heads(conn, t, new_id, clean["head_ids"])
         saved = await _fetch_conditions(conn, t, "c.id = $1", new_id)
 
@@ -607,10 +676,7 @@ async def update_condition(
     condition_id: int,
     account_type: str = Body(...),
     direction: str = Body(...),
-    subject_field: str = Body(...),
-    operator: str = Body(...),
-    value1: str | None = Body(None),
-    value2: str | None = Body(None),
+    tests: list[dict] = Body(...),
     head_ids: list[int] = Body(...),
     target: str = Body(rules.DEFAULT_TARGET),
     is_active: bool = Body(True),
@@ -640,8 +706,7 @@ async def update_condition(
         if current is None:
             raise HTTPException(404, "That condition no longer exists.")
 
-        clean = await _clean(conn, t, account_type, direction, subject_field,
-                             operator, value1, value2, head_ids)
+        clean = await _clean(conn, t, account_type, direction, tests, head_ids)
         moved = (current["account_type"] != clean["account_type"]
                  or current["direction"] != clean["direction"]
                  or current["target"] != t["target"])
@@ -663,16 +728,15 @@ async def update_condition(
         await conn.execute(
             """
             UPDATE rule_condition
-               SET account_type = $2, direction = $3, subject_field = $4,
-                   operator = $5, value1 = $6, value2 = $7, is_active = $8,
-                   sort_order = coalesce($9, sort_order), target = $10,
+               SET account_type = $2, direction = $3, is_active = $4,
+                   sort_order = coalesce($5, sort_order), target = $6,
                    updated_at = now()
              WHERE id = $1
             """,
             condition_id, clean["account_type"], clean["direction"],
-            clean["subject_field"], clean["operator"], clean["value1"],
-            clean["value2"], bool(is_active), order, t["target"],
+            bool(is_active), order, t["target"],
         )
+        await _write_tests(conn, condition_id, clean["tests"])
         await _write_heads(conn, t, condition_id, clean["head_ids"])
         saved = await _fetch_conditions(conn, t, "c.id = $1", condition_id)
 
@@ -750,14 +814,11 @@ async def reorder_conditions(
 async def preview_condition(
     account_type: str = Body(...),
     direction: str = Body(...),
-    subject_field: str = Body(...),
-    operator: str = Body(...),
-    value1: str | None = Body(None),
-    value2: str | None = Body(None),
+    tests: list[dict] = Body(...),
     target: str = Body(rules.DEFAULT_TARGET),
     user: dict = Depends(get_company_user),
 ):
-    """Run an unsaved test against the rows that are actually staged.
+    """Run an unsaved set of tests against the rows that are actually staged.
 
     The one thing that stops somebody saving a sentence they have misread. It
     answers the only question that matters before saving — "how many of my rows
@@ -770,8 +831,8 @@ async def preview_condition(
     """
     t = _target(target)
     async with company_connection(user["schema"]) as conn:
-        clean = await _clean(conn, t, account_type, direction, subject_field,
-                             operator, value1, value2, None, require_heads=False)
+        clean = await _clean(conn, t, account_type, direction, tests, None,
+                             require_heads=False)
 
         account_col = await staging.account_column(conn)
         if not account_col:
@@ -803,12 +864,12 @@ async def preview_condition(
         elif scoping.scope_is_empty(scope):
             filters.append("t.project_id IS NULL")
 
-        fields = [clean["subject_field"]]
-        # The head this condition would decide, and only that one. Before 034
-        # this had to join all three masters and coalesce, because a condition
-        # did not say which head it was about; now it does, and showing the
-        # Internal Head beside a RERA condition would be showing the column the
-        # user is not editing.
+        # Every column any of this draft's tests reads, and only those. Before
+        # 034 this had to join all three masters and coalesce, because a
+        # condition did not say which head it was about; now it does, and
+        # showing the Internal Head beside a RERA condition would be showing
+        # the column the user is not editing.
+        fields = rules.subject_fields([{"tests": clean["tests"]}])
         rows = await conn.fetch(
             f"""
             SELECT t.id, t.amount, m.name AS current_name
@@ -821,22 +882,25 @@ async def preview_condition(
             *params,
         )
 
-    draft = {"direction": clean["direction"], "operator": clean["operator"],
-             "subject_field": clean["subject_field"],
-             "value1": clean["value1"], "value2": clean["value2"]}
+    draft = {"direction": clean["direction"], "tests": clean["tests"]}
     matched = []
     for r in rows:
         if rules.match(draft, rules.subject_values(r, fields)):
             matched.append(r)
 
+    labels = {name: col["label"] for name, col in clean["columns"].items()}
     return {
         "scanned": len(rows),
         "matched": len(matched),
-        "phrase": rules.phrase(draft, clean["column"]["label"]),
+        "phrase": rules.phrase(draft, labels),
         "examples": [
             {"id": r["id"], "amount": r["amount"],
-             "value": None if r["s0"] is None else str(r["s0"]),
-             "current_name": r["current_name"]}
+             "current_name": r["current_name"],
+             # Keyed by column, not a single "value": more than one test can
+             # read more than one column, and there is no longer one obvious
+             # field to single out.
+             "values": {f: (None if r[f"s{i}"] is None else str(r[f"s{i}"]))
+                       for i, f in enumerate(fields)}}
             for r in matched[:5]
         ],
     }

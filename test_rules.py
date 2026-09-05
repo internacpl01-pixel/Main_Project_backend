@@ -20,9 +20,9 @@ import httpx
 import database
 from main import app
 from routers.auth import get_current_user
+from services import custom_fields, staging
 
 SCHEMA = "company_028"
-ACCOUNT = "045563200000264"
 
 PASS = 0
 FAIL = 0
@@ -48,6 +48,44 @@ async def main() -> None:
         "id": 1, "username": "probe", "role": "company_admin",
         "level": 0, "company_id": 28, "schema": SCHEMA,
     }
+
+    # Read off bank_master rather than pinned: which account is RERA-typed is
+    # this company's own data and can change from the Master Data page (as it
+    # did once already, silently failing this file's old hardcoded number). A
+    # test that names an account outright is a test that stops proving
+    # anything the moment somebody reclassifies it.
+    #
+    # Among the RERA accounts, prefer one that actually has a staged debit
+    # whose narration says "master to free" -- the phrase the preview/create
+    # section below tests against -- so that section is exercised for real
+    # rather than skipped. Falls back to the first RERA account otherwise.
+    async with database.company_connection(SCHEMA) as conn:
+        rera_accounts = [r["account_number"] for r in await conn.fetch(
+            "SELECT account_number FROM bank_master "
+            "WHERE upper(btrim(account_type)) = 'RERA' AND is_active = true "
+            "ORDER BY id")]
+        desc_col = await custom_fields.description_column(conn)
+        account_col = await staging.account_column(conn)
+        with_narration = None
+        if desc_col and account_col and rera_accounts:
+            with_narration = await conn.fetchval(
+                f"""
+                SELECT b.account_number FROM bank_master b
+                 WHERE b.account_number = ANY($1::text[])
+                   AND EXISTS (
+                       SELECT 1 FROM temp_trans t
+                        WHERE {staging.account_digits(f't.{account_col}')}
+                              = {staging.account_digits('b.account_number')}
+                          AND upper(btrim(coalesce(t.credit_debit, ''))) = 'DR'
+                          AND t."{desc_col}" ILIKE '%master to free%')
+                 ORDER BY b.id LIMIT 1
+                """, rera_accounts)
+    if not rera_accounts:
+        print("No active RERA account in bank_master — nothing to check "
+              "against. Add one on Master Data first.")
+        return
+    ACCOUNT = with_narration or rera_accounts[0]
+
     transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport,
                                  base_url="http://t") as cl:
@@ -128,9 +166,10 @@ async def main() -> None:
               ('"d0"' in r.text) or ('"s0"' in r.text), False)
         check("the defaults are all on offer",
               set(res["default_columns"]) <= offered, True)
-        check("every condition's subject column is offered by default",
-              all(c["subject_field"] in res["default_columns"]
-                  for c in res["conditions"].values()), True)
+        check("every condition's subject columns are offered by default",
+              all(f in res["default_columns"]
+                  for c in res["conditions"].values()
+                  for f in c["subject_fields"]), True)
         flagged = [row for row in res["rows"] if row["status"] == "conflict"]
         check("conflicting rows carry their statement columns",
               all(set(row["values"]) == offered for row in flagged), True)
@@ -175,60 +214,119 @@ async def main() -> None:
         check("DESC is a text column", desc and desc["kind"], "text")
         heads = {h["name"]: h["id"] for h in opts["heads"]}
 
-        # A head deliberately NOT on the RERA/DR grid, to prove a condition can
-        # admit one the grid leaves blank -- the semantics chosen on 2026-09-03.
+        # A head the grid marks CR for RERA but never DR, to prove a condition
+        # can still give a RERA DEBIT a head the grid does not offer debits at
+        # all -- while itself being "active" on the RERA grid, since a
+        # condition can no longer name a head this company has never used for
+        # this account type in any direction (decided 2026-09-04, after 030's
+        # original semantics of admitting a head blank everywhere on the grid).
         # Chosen from what the grid actually says rather than named outright:
-        # since 033 the grid is the company's, and any head named here could be
-        # on it by the next run.
+        # since 033 the grid is the company's, and any head named here could
+        # be on it by the next run.
+        cr_ids = {h["id"] for h in res["expected"]["CR"]}
         dr_ids = {h["id"] for h in res["expected"]["DR"]}
-        off_grid_name = next(
-            (n for n in ("Master to Free",) if heads.get(n) not in dr_ids
-             and n in heads),
-            next(n for n, i in sorted(heads.items()) if i not in dr_ids))
-        off_grid = heads[off_grid_name]
-        check(f"'{off_grid_name}' is not a grid answer for a RERA debit",
-              off_grid in dr_ids, False)
+        on_cr_not_dr = cr_ids - dr_ids
+        # Falls back to any CR-or-DR head on the grid if none is CR-only —
+        # keeps the rest of this section running, just without the specific
+        # "not offered for debits either" property to assert.
+        if on_cr_not_dr:
+            off_grid = min(on_cr_not_dr)
+            off_grid_name = next(n for n, i in heads.items() if i == off_grid)
+            check(f"'{off_grid_name}' is a RERA CR answer but not a RERA DR one",
+                  off_grid in dr_ids, False)
+        else:
+            off_grid = min(cr_ids | dr_ids)
+            off_grid_name = next(n for n, i in heads.items() if i == off_grid)
+            note("no CR-only head on the RERA grid",
+                f"using '{off_grid_name}' instead")
 
         print("\n-- rejects bad input --")
         bad = {"account_type": "RERA", "direction": "DR",
-               "subject_field": desc["name"], "operator": "contains",
-               "value1": "x", "head_ids": [off_grid]}
-        for label, patch, frag in [
-            ("unknown column", {"subject_field": "no_such_col"}, "not a column"),
-            ("SQL in the column name",
-             {"subject_field": f'{desc["name"]}"; DROP TABLE temp_trans; --'},
+               "tests": [{"subject_field": desc["name"], "operator": "contains",
+                          "value1": "x"}],
+               "head_ids": [off_grid]}
+
+        def with_test(patch):
+            return {**bad, "tests": [{**bad["tests"][0], **patch}]}
+
+        for label, payload, frag in [
+            ("unknown column", with_test({"subject_field": "no_such_col"}),
              "not a column"),
-            ("numeric test on a text column", {"operator": "gt"},
+            ("SQL in the column name",
+             with_test({"subject_field":
+                       f'{desc["name"]}"; DROP TABLE temp_trans; --'}),
+             "not a column"),
+            ("numeric test on a text column", with_test({"operator": "gt"}),
              "cannot be asked of"),
-            ("unknown operator", {"operator": "nope"}, "not a test"),
-            ("no heads", {"head_ids": []}, "at least one head"),
-            ("bad direction", {"direction": "BOTH"}, "must be CR or DR"),
-            ("missing value", {"value1": ""}, "needs a value"),
+            ("unknown operator", with_test({"operator": "nope"}), "not a test"),
+            ("no heads", {**bad, "head_ids": []}, "at least one head"),
+            ("bad direction", {**bad, "direction": "BOTH"}, "must be CR or DR"),
+            ("missing value", with_test({"value1": ""}), "needs a value"),
+            ("no tests", {**bad, "tests": []}, "at least one test"),
+            ("second test with no AND/OR",
+             {**bad, "tests": [bad["tests"][0],
+                               {"subject_field": desc["name"],
+                                "operator": "contains", "value1": "y"}]},
+             "AND or OR"),
         ]:
-            rr = await cl.post("/rules/conditions", json={**bad, **patch})
+            rr = await cl.post("/rules/conditions", json=payload)
             ok = rr.status_code == 400 and frag in rr.json().get("detail", "")
             check(f"rejects {label}", ok, True)
 
         print("\n-- preview, then create --")
+        single_test = [{**bad["tests"][0], "value1": "master to free"}]
         rr = await cl.post("/rules/conditions/preview",
-                           json={k: v for k, v in bad.items()
-                                 if k != "head_ids"} |
-                                {"value1": "master to free"})
+                           json={"account_type": bad["account_type"],
+                                 "direction": bad["direction"],
+                                 "tests": single_test})
         check("preview is 200", rr.status_code, 200)
         pv = rr.json()
         note("preview", f'{pv["matched"]} of {pv["scanned"]} scanned')
         # Not pinned to a count: which rows carry "master to free" in their
         # narration is live staged data, not something this file put there, and
-        # it has already drifted once since this assertion was written. What
-        # matters is that the preview finds AT LEAST what it will judge below,
-        # and the two are compared to each other a few lines down instead.
-        check("preview finds at least one 'master to free' debit",
-              pv["matched"] >= 1, True)
+        # it has already drifted once since this assertion was written. The
+        # account above was picked specifically because it has such a row, so
+        # this should always hold; if it does not, no RERA account currently
+        # does and that is worth seeing rather than masking with a skip.
+        if with_narration is None:
+            note("skipped", "no RERA account currently has a staged debit "
+                            "mentioning 'master to free'")
+        else:
+            check("preview finds at least one 'master to free' debit",
+                  pv["matched"] >= 1, True)
         expect_judged = pv["matched"]
         note("preview phrase", pv["phrase"])
 
+        print("\n-- a second test, AND and OR --")
+        # An always-false second test ORed on must not lose what the first
+        # test alone found; ANDed on, it must lose all of it. If the two
+        # differ from each other this way, the AND/OR split — not just each
+        # operator on its own — is actually driving the verdict.
+        always_false = {"subject_field": "field_num_2", "operator": "eq",
+                        "value1": "-999999999"}
+        rr = await cl.post("/rules/conditions/preview",
+                           json={"account_type": bad["account_type"],
+                                 "direction": bad["direction"],
+                                 "tests": [single_test[0],
+                                          {**always_false, "combinator": "OR"}]})
+        check("preview with OR is 200", rr.status_code, 200)
+        or_pv = rr.json()
+        check("OR of an always-false test keeps the first test's matches",
+              or_pv["matched"], expect_judged)
+        check("the sentence joins the two tests with 'or'",
+              " or " in or_pv["phrase"], True)
+
+        rr = await cl.post("/rules/conditions/preview",
+                           json={"account_type": bad["account_type"],
+                                 "direction": bad["direction"],
+                                 "tests": [single_test[0],
+                                          {**always_false, "combinator": "AND"}]})
+        and_pv = rr.json()
+        check("AND with an always-false test matches nothing",
+              and_pv["matched"], 0)
+
         rr = await cl.post("/rules/conditions",
-                           json={**bad, "value1": "master to free"})
+                           json={**bad, "tests": single_test})
         check("create is 200", rr.status_code, 200)
         cond = rr.json()
         cid = cond["id"]
@@ -277,6 +375,8 @@ async def main() -> None:
         # legitimately be empty, and then there is no such head to send.
         if not res["expected"]["DR"]:
             note("skipped", "no head is on the RERA/DR grid to test against")
+        elif not judged:
+            note("skipped", "no staged row matched the condition to re-check")
         else:
             target = judged[0]
             grid_head = res["expected"]["DR"][0]["id"]
@@ -338,14 +438,20 @@ async def main() -> None:
               "rera_head" in rr.json()["detail"], True)
 
         # Writing the Internal Head grid. Picked off the live master and put
-        # back at the end, so this leaves the company exactly as it found it.
+        # back at the end, so this leaves the company exactly as it found it —
+        # which means recording whatever this cell already held, not assuming
+        # it was blank. internal["heads"][0] can easily already carry a real
+        # rule somebody wrote through the actual page, and blindly clearing it
+        # afterwards would delete that rule instead of restoring it.
         probe_head = internal["heads"][0]
         # RERA when this company has it, because that is the type the rest of
         # this file checks against — writing the cell there is what lets the
         # head-type run below actually judge rows instead of reporting no rule.
         probe_type = ("RERA" if "RERA" in internal["account_types"]
                       else internal["account_types"][0])
-        note("writing", f"{probe_head['name']} / {probe_type} / DR")
+        probe_prior = internal["cells"].get(str(probe_head["id"]), {}).get(probe_type)
+        note("writing", f"{probe_head['name']} / {probe_type} / DR "
+                        f"(was {probe_prior!r})")
         rr = await cl.put("/rules/cell",
                           json={"head_id": probe_head["id"],
                                 "account_type": probe_type,
@@ -406,8 +512,8 @@ async def main() -> None:
         # master, and it must not appear on another head type's list.
         rr = await cl.post("/rules/conditions",
                            json={"account_type": "RERA", "direction": "DR",
-                                 "subject_field": desc["name"],
-                                 "operator": "is_not_empty",
+                                 "tests": [{"subject_field": desc["name"],
+                                           "operator": "is_not_empty"}],
                                  "head_ids": [probe_head["id"]],
                                  "target": "head"})
         check("a condition can be written on another head type",
@@ -426,19 +532,22 @@ async def main() -> None:
         # rule the database's composite key enforces underneath.
         rr = await cl.post("/rules/conditions",
                            json={"account_type": "RERA", "direction": "DR",
-                                 "subject_field": desc["name"],
-                                 "operator": "is_not_empty",
+                                 "tests": [{"subject_field": desc["name"],
+                                           "operator": "is_not_empty"}],
                                  "head_ids": [stranger["id"]],
                                  "target": "head"})
         check("a condition cannot mix masters", rr.status_code, 400)
 
         rr = await cl.delete(f"/rules/conditions/{head_cond['id']}")
         check("that condition deleted", rr.status_code, 200)
+        # Restored to what it actually held before, not cleared outright — a
+        # cell that already carried CR or DR here must come back exactly as it
+        # was, not as blank.
         rr = await cl.put("/rules/cell",
                           json={"head_id": probe_head["id"],
                                 "account_type": probe_type,
-                                "direction": None, "target": "head"})
-        check("that cell cleared", rr.status_code, 200)
+                                "direction": probe_prior, "target": "head"})
+        check("that cell restored", rr.status_code, 200)
         rr = await cl.get("/rules/matrix", params={"target": "head"})
         check("the Internal Head grid is back as it was",
               rr.json()["cells"], internal["cells"])
