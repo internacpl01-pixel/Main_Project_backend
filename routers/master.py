@@ -701,3 +701,28 @@ async def delete_master(
     async with company_connection(schema) as conn:
         await conn.execute(f"DELETE FROM {cfg['table']} WHERE id = $1", item_id)
     return {"status": "deleted"}
+
+
+# ── Reactivate ───────────────────────────────────────────────────────
+
+@router.post("/{master_type}/{item_id}/activate", dependencies=[Depends(require_manager)])
+async def activate_master(
+    master_type: str,
+    item_id: int,
+    schema: str = Depends(get_current_schema),
+):
+    """The other half of archive — flip is_active back to true.
+
+    Kept as its own verb rather than folded into PATCH: PATCH only ever writes
+    cfg['fields'], and is_active is deliberately not one of them, so a stray
+    key in a form body can never flip a row's status by accident.
+    """
+    cfg = _get_config(master_type)
+    async with company_connection(schema) as conn:
+        row = await conn.fetchrow(
+            f"UPDATE {cfg['table']} SET is_active = true WHERE id = $1 AND is_active = false RETURNING id",
+            item_id,
+        )
+    if row is None:
+        raise HTTPException(400, "Already active or not found.")
+    return {"status": "activated"}
