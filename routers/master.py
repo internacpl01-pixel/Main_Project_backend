@@ -699,7 +699,23 @@ async def delete_master(
         return {"status": "archived"}
 
     async with company_connection(schema) as conn:
-        await conn.execute(f"DELETE FROM {cfg['table']} WHERE id = $1", item_id)
+        try:
+            tag = await conn.execute(f"DELETE FROM {cfg['table']} WHERE id = $1", item_id)
+        except Exception as e:
+            # Every table this router serves is referenced somewhere with
+            # ON DELETE RESTRICT -- transactions.bank_id, transactions.head_id,
+            # and so on -- exactly so a row a real ledger entry points at
+            # cannot vanish out from under it. That is a reason to deactivate,
+            # not an error to explain in Postgres's own words.
+            if "foreign key" in str(e).lower():
+                raise HTTPException(
+                    400,
+                    f"This {cfg['label'].lower()} is used by existing records "
+                    f"(transactions, staged rows, or a rule) and cannot be "
+                    f"permanently deleted. Switch it off instead.")
+            raise HTTPException(400, str(e))
+    if tag.split()[-1] == "0":
+        raise HTTPException(404, "Item not found.")
     return {"status": "deleted"}
 
 

@@ -352,7 +352,9 @@ async def _bank_check(conn, bank_id: int | None) -> None:
     """
     if bank_id is None:
         return
-    if await conn.fetchval("SELECT 1 FROM bank_master WHERE id = $1", bank_id):
+    if await conn.fetchval(
+        "SELECT 1 FROM bank_master WHERE id = $1 AND is_active = true", bank_id
+    ):
         return
 
     available = await conn.fetch(
@@ -361,10 +363,10 @@ async def _bank_check(conn, bank_id: int | None) -> None:
     if available:
         options = ", ".join(f"{r['id']} ({r['bank_name']})" for r in available)
         raise RuntimeError(
-            f"bank_id {bank_id} does not exist in bank_master. Available: {options}."
+            f"bank_id {bank_id} does not exist or is deactivated. Available: {options}."
         )
     raise RuntimeError(
-        f"bank_id {bank_id} does not exist: this company has no banks yet. "
+        f"bank_id {bank_id} does not exist: this company has no active banks yet. "
         f"Leave the bank empty, or add one on the Master Data page first."
     )
 

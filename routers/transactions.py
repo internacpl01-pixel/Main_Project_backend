@@ -536,11 +536,13 @@ async def _account_values(conn, table: str, column: str, where: str,
             SELECT b.company, b.account_type, b.bank_name
               FROM bank_master b
              WHERE b.account_number IS NOT NULL
+               AND b.is_active = true
                AND {bank_acct} <> ''
                AND {bank_acct} = {value_acct}
-             -- An archived Bank row still names the account, but a live one
-             -- describes it better, so it wins.
-             ORDER BY b.is_active DESC, b.id
+             -- A deactivated Bank row is invisible to every feature, this
+             -- dropdown included -- an account whose only match is archived
+             -- reads exactly like one with no Bank row at all.
+             ORDER BY b.id
              LIMIT 1
           ) b ON true
          ORDER BY 1
@@ -1320,17 +1322,19 @@ async def _rule_context(conn, account_type: str, account_number: str,
                  "Mapping page first.")
 
     # The account's type comes from the Bank master, matched on digits like
-    # everything else. A live row describes the account better than an
-    # archived one, so it wins — same preference the filter labels use.
+    # everything else. A deactivated bank row is invisible to every feature —
+    # same rule a dropdown follows — so an archived match does not count as
+    # the account having a type; it is treated exactly like no match at all.
     bank_acct = staging.account_digits("b.account_number")
     bank = await conn.fetchrow(
         f"""
         SELECT b.account_number, b.account_type, b.bank_name, b.company
           FROM bank_master b
          WHERE b.account_number IS NOT NULL
+           AND b.is_active = true
            AND {bank_acct} <> ''
            AND {bank_acct} = $1
-         ORDER BY b.is_active DESC, b.id
+         ORDER BY b.id
          LIMIT 1
         """,
         digits,
@@ -1338,7 +1342,8 @@ async def _rule_context(conn, account_type: str, account_number: str,
     if bank is None:
         raise HTTPException(
             400, f"Account {account_number} is not in the Bank master, so its "
-                 f"type is unknown. Add it under Master Data first.")
+                 f"type is unknown. Add it under Master Data first, or "
+                 f"reactivate it there if it was switched off.")
     actual = (bank["account_type"] or "").strip().upper()
     if actual != wanted:
         raise HTTPException(
