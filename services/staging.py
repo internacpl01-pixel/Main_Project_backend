@@ -293,6 +293,55 @@ async def fill_company_from_bank(conn, *, table: str = "temp_trans",
     }
 
 
+async def fill_account_from_bank(conn, *, bank_id: int, table: str = "temp_trans",
+                                 batch_id: int | None = None) -> dict:
+    """Set a row's account number from the bank picked on the import screen.
+
+    Only for rows the statement itself left blank there -- a bank statement
+    that never prints its own account number on each line is common enough
+    (see 'CR Coll' style sheets), and until now those rows simply had no
+    account number for fill_company_from_bank or the Account Number filter to
+    match on, even though the user had just told the import screen exactly
+    which account this file was.
+
+    Scoped to batch_id, not a backfill like the company/FY fills above: the
+    bank picked on this screen describes only the file being staged right now,
+    not every row ever staged without one.
+    """
+    account_col = await _resolve_field(conn, _ACCOUNT_ALIASES)
+    if not account_col:
+        logger.info("[account fill] skipped on %s: fieldmap has no account number column", table)
+        return {"updated": 0, "skipped": True,
+                "reason": "This company's fieldmap has no account number column."}
+
+    bank_acct = await conn.fetchval(
+        "SELECT account_number FROM bank_master WHERE id = $1", bank_id)
+    if not bank_acct:
+        logger.info("[account fill] skipped on %s: bank %s has no account number", table, bank_id)
+        return {"updated": 0, "skipped": True,
+                "reason": "The chosen bank has no account number in Master Data."}
+
+    params: list = [bank_acct]
+    where_batch = ""
+    if batch_id is not None:
+        params.append(batch_id)
+        where_batch = f" AND batch_id = ${len(params)}"
+
+    tag = await conn.execute(
+        f"""
+        UPDATE {table}
+           SET {account_col} = $1
+         WHERE (btrim(coalesce({account_col}, '')) = '')
+           {where_batch}
+        """,
+        *params,
+    )
+    updated = int(tag.split()[-1])
+
+    logger.info("[account fill] %s: %d rows set from bank %s", table, updated, bank_id)
+    return {"updated": updated, "skipped": False, "account_column": account_col}
+
+
 async def _bank_check(conn, bank_id: int | None) -> None:
     """Raise unless bank_id names a row in this company's bank_master.
 
@@ -403,6 +452,22 @@ async def stage_batch(
         inserted = await insert_temp_rows(conn, batch_id, normalized)
         duplicates = await count_duplicate_rows(conn, batch_id)
 
+        # A row whose statement never printed its own account number gets it
+        # from the bank picked on the import screen -- before the company fill
+        # below, so that fill can then match on it too. Only runs when a bank
+        # was actually chosen; "Not specified" leaves every row exactly as the
+        # statement wrote it.
+        #
+        # Not fatal, same as the two fills after it: a company whose fieldmap
+        # has no account number column still gets its statement staged.
+        acct_filled = {"updated": 0}
+        if bank_id is not None:
+            try:
+                acct_filled = await fill_account_from_bank(
+                    conn, bank_id=bank_id, batch_id=batch_id)
+            except Exception:
+                logger.exception("[stage] account fill failed for batch %s", batch_id)
+
         # Company follows from the account number the statement was printed
         # under, so it is filled here rather than left for someone to type on
         # every row. Scoped to this batch: the rest of the table has already had
@@ -427,13 +492,15 @@ async def stage_batch(
             logger.exception("[stage] FY fill failed for batch %s", batch_id)
             fy = {"updated": 0}
 
-    logger.info("[stage] batch %s: %d rows, %d duplicate rows, %d company set, %d FY set",
-                batch_id, inserted, duplicates,
+    logger.info("[stage] batch %s: %d rows, %d duplicate rows, %d account set, "
+                "%d company set, %d FY set",
+                batch_id, inserted, duplicates, acct_filled.get("updated", 0),
                 filled.get("updated", 0), fy.get("updated", 0))
     return {
         "batch_id": batch_id,
         "inserted": inserted,
         "duplicate_rows": duplicates,
+        "account_number_filled": acct_filled.get("updated", 0),
         "company_filled": filled.get("updated", 0),
         "financial_year_filled": fy.get("updated", 0),
     }
