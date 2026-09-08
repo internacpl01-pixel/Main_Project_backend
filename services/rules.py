@@ -682,17 +682,36 @@ def resolve(direction: str | None, subjects: dict, conditions: list[dict],
             allowed_ids: dict[str, set[int]]):
     """Which heads this one row must carry, and which sentence says so.
 
-    Returns (heads, ids, condition). The condition is None when the grid
-    decided, and all three are None when the row has no CR/DR marker and so
-    cannot be judged at all.
+    Returns (heads, ids, condition, extra). `condition` is the first
+    (lowest sort_order) condition that matched, None when the grid decided.
+    `extra` is every OTHER condition that also matched — normally empty, since
+    conditions are meant to describe disjoint rows. All four are None/[] when
+    the row has no CR/DR marker and so cannot be judged at all.
 
-    Conditions first, first match wins — that is the whole precedence rule, and
-    it is here rather than split between the check and the fix so the two
-    endpoints cannot come to different answers about the same row.
+    Conditions first, first match wins for DECIDING the row's status — that
+    precedence is unchanged and lives here so the check and the fix cannot
+    disagree about it. But a keyword shared across several conditions (a
+    company's own name shows up in nearly every narration) can make more than
+    one condition's OR-chain true for the same row, and silently keeping only
+    the first would hide that the row is genuinely ambiguous. So every match is
+    still collected: `heads`/`ids` are the union across all of them (the first
+    condition's heads listed first, so it stays what a dropdown preselects),
+    which is what lets the existing "more than one legitimate answer" dropdown
+    do the same job here it already does for a grid direction with two heads —
+    a person decides instead of row order silently deciding for them.
     """
     if direction not in allowed_ids:
-        return None, None, None
-    for c in conditions:
-        if c["direction"] == direction and match(c, subjects):
-            return c["heads"], c["ids"], c
-    return expected.get(direction, []), allowed_ids[direction], None
+        return None, None, None, []
+    matched = [c for c in conditions
+               if c["direction"] == direction and match(c, subjects)]
+    if not matched:
+        return expected.get(direction, []), allowed_ids[direction], None, []
+
+    primary, extra = matched[0], matched[1:]
+    heads, ids = [], set()
+    for c in matched:
+        for h in c["heads"]:
+            if h["id"] not in ids:
+                ids.add(h["id"])
+                heads.append(h)
+    return heads, ids, primary, extra

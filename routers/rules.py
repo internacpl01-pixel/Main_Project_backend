@@ -402,14 +402,20 @@ async def list_conditions(
 
     Filtered to one head type, and its `heads` come from that same master, so
     the list and the dropdown that edits it can never be about different tables.
+
+    Includes inactive heads, unlike /matrix's row list — a condition already
+    naming one has to keep showing it when its own picker is reopened for
+    editing, rather than presenting a blank in its place. The browser renders
+    those as disabled options: visible for context, not choosable for a new
+    pick. `is_active` rides along on each one so it can.
     """
     t = _target(target)
     async with company_connection(user["schema"]) as conn:
         conditions = await _fetch_conditions(conn, t)
         columns = await _subject_columns(conn)
         heads = await conn.fetch(
-            f"SELECT id, name FROM {t['master_table']} "
-            f"WHERE is_active = true ORDER BY name, id"
+            f"SELECT id, name, is_active FROM {t['master_table']} "
+            f"ORDER BY name, id"
         )
         types = await conn.fetch(
             "SELECT upper(btrim(name)) AS name FROM account_type_master "
@@ -422,7 +428,8 @@ async def list_conditions(
         "conditions": conditions,
         "columns": list(columns.values()),
         "operators": rules.operator_catalog(),
-        "heads": [{"id": h["id"], "name": h["name"]} for h in heads],
+        "heads": [{"id": h["id"], "name": h["name"], "is_active": h["is_active"]}
+                  for h in heads],
         "account_types": [t["name"] for t in types],
         "directions": list(_DIRECTIONS),
         "target": {"target": t["target"], "label": _target_label(t),

@@ -523,7 +523,7 @@ async def _account_values(conn, table: str, column: str, where: str,
 
     rows = await conn.fetch(
         f"""
-        SELECT v.value, v.n, b.company, b.account_type, b.bank_name
+        SELECT v.value, v.n, b.company, b.account_type, b.bank_name, b.is_active
           FROM (
             SELECT btrim(t.{column}) AS value, count(*) AS n
               FROM {table} t
@@ -533,16 +533,17 @@ async def _account_values(conn, table: str, column: str, where: str,
              GROUP BY 1
           ) v
           LEFT JOIN LATERAL (
-            SELECT b.company, b.account_type, b.bank_name
+            SELECT b.company, b.account_type, b.bank_name, b.is_active
               FROM bank_master b
              WHERE b.account_number IS NOT NULL
-               AND b.is_active = true
                AND {bank_acct} <> ''
                AND {bank_acct} = {value_acct}
-             -- A deactivated Bank row is invisible to every feature, this
-             -- dropdown included -- an account whose only match is archived
-             -- reads exactly like one with no Bank row at all.
-             ORDER BY b.id
+             -- An archived Bank row still names the account, but a live one
+             -- describes it better, so it wins when both exist. is_active
+             -- rides along on the row picked either way, so a caller can grey
+             -- an archived match out rather than pretend it is unrecorded --
+             -- it must still be unusable, just not invisible.
+             ORDER BY b.is_active DESC, b.id
              LIMIT 1
           ) b ON true
          ORDER BY 1
@@ -570,6 +571,10 @@ async def _account_values(conn, table: str, column: str, where: str,
                 # label: an account with no Bank row is also an account whose
                 # Company can never be filled in, and that is worth seeing here.
                 "in_bank_master": r["bank_name"] is not None,
+                # None when there is no Bank row at all, so a caller can tell
+                # "unrecorded" apart from "recorded, but switched off" -- the
+                # two look the same otherwise and need different messages.
+                "bank_active": r["is_active"],
             }
             for r in rows
         ],
@@ -1475,15 +1480,24 @@ async def _judged_rows(conn, user: dict, ctx: dict) -> list[dict]:
         # whether or not the values are kept, so no alias can reach the client.
         subjects = rules.take_subjects(row, fields)
         values = rules.take_subjects(row, display, prefix="d")
-        _heads, ids, cond = rules.resolve(
+        heads, ids, cond, extra = rules.resolve(
             direction, subjects, conditions, expected, allowed_ids)
         row["status"] = rules.judge(ids, row["current_id"])
         # Which sentence judged this row — null when the grid did. The dialog
         # reads its heads from the same place, so what it offers as a
         # replacement is always what the check just used.
         row["rule_id"] = cond["id"] if cond else None
+        # More than one condition can share a keyword (a company's own name
+        # shows up in almost every narration) and both come out true for the
+        # same row. Rather than let sort_order silently pick a winner, the
+        # dropdown offers every head any matching condition named — heads/ids
+        # sent straight from resolve() rather than looked up again through
+        # `conditions[rule_id]`, which only ever knew about the first one.
+        # `extra_rule_ids` is how the dialog explains the "ambiguous" badge.
         if row["status"] == "conflict":
             row["values"] = values
+            row["heads"] = heads
+            row["extra_rule_ids"] = [c["id"] for c in extra]
         out.append(row)
     return out
 
@@ -1710,7 +1724,7 @@ async def apply_temp_rules(
             # two rows on the same side different answers, "what this row is
             # allowed to be" is a question about the row. Same call the check
             # made, on the row as it stands now.
-            _heads, ids, cond = rules.resolve(
+            _heads, ids, cond, _extra = rules.resolve(
                 direction, rules.subject_values(r, fields),
                 conditions, expected, allowed_ids)
             if ids is None or chosen not in ids:
