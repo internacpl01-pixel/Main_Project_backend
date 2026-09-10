@@ -18,12 +18,13 @@ import logging
 import re
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 
 import permissions
 from database import company_connection
 from routers import master
 from routers.auth import get_company_user, get_current_schema, require_level
-from services import custom_fields, rules, scoping, staging
+from services import custom_fields, farvision, rules, scoping, staging
 
 logger = logging.getLogger(__name__)
 
@@ -1264,6 +1265,45 @@ async def list_temp_trans(
         "sort": sort_applied,
         "dir": dir_applied,
     }
+
+
+@router.get("/temp-trans/export-farvision")
+async def export_farvision(
+    batch_id: int = None,
+    classified: bool = None,
+    date_from: str = Query(None),
+    date_to: str = Query(None),
+    account: str = Query(None),
+    company: str = Query(None),
+    search: str = Query(""),
+    rule_conflicts: str = Query(None),
+    user: dict = Depends(get_company_user),
+):
+    """Export the same rows the Imported Rows table is showing, Farvision-shaped.
+
+    Takes the exact filters the list endpoint takes and builds the exact same
+    WHERE via _temp_filters, so "what's on screen" and "what's in the download"
+    can never disagree -- filter down to one batch or one account first, then
+    export, the same way the table itself is narrowed.
+
+    Account Head and Parent Account Head are blank in every row for now: they
+    depend on a Farvision chart-of-accounts master (fuzzy-matched against the
+    narration) that has not been imported yet.
+    """
+    async with company_connection(user["schema"]) as conn:
+        where, params, _columns, _term, _idx = await _temp_filters(
+            conn, user, batch_id=batch_id, classified=classified,
+            date_from=date_from, date_to=date_to, account=account,
+            company=company, search=search, rule_conflicts=rule_conflicts,
+        )
+        rows = await farvision.fetch_rows(conn, where, params)
+
+    content = farvision.to_xlsx_bytes(rows)
+    return StreamingResponse(
+        iter([content]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="farvision_export.xlsx"'},
+    )
 
 
 @router.get("/temp-trans/filters")
