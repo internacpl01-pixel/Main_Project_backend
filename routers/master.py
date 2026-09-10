@@ -14,7 +14,7 @@ from fastapi import (APIRouter, Depends, File, Form, HTTPException, Query,
 import permissions
 from database import company_connection
 from routers.auth import get_current_schema, require_level
-from services import beneficiary_import, tabular_import
+from services import beneficiary_import, farvision_account_import, tabular_import
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +222,42 @@ _TABLES = {
                     'updated_at'],
         'order_by': 'name',
         'label_field': 'name',
+    },
+    # The Farvision chart of accounts: Account Head / Parent Account Head and
+    # the other Farvision-specific columns, fuzzy-matched against a temp_trans
+    # row's narration by services.farvision to fill the export's Account Head
+    # and Parent Account Head. Free text throughout -- these are Farvision's
+    # own ledger names, not this company's Internal/RERA/TCP heads, so nothing
+    # here is chosen from another master.
+    'farvision_account': {
+        'label': 'Farvision Account',
+        'table': 'farvision_account_master',
+        'importable': True,
+        'fields': ['company', 'account_head', 'parent_account_head',
+                   'document_type', 'financial_year', 'bank_name',
+                   'deduction_type', 'description', 'entry_types',
+                   'debit_credit', 'payment_mode', 'payee_name', 'docno',
+                   'invoice_no', 'business_unit'],
+        'labels': {
+            'company': 'Company', 'account_head': 'Account Head',
+            'parent_account_head': 'Parent Account Head',
+            'document_type': 'Document Type', 'financial_year': 'Financial Year',
+            'bank_name': 'Bank Name', 'deduction_type': 'Deduction Type',
+            'description': 'Description', 'entry_types': 'EntryTypes',
+            'debit_credit': 'Debit/Credit', 'payment_mode': 'Payment Mode',
+            'payee_name': 'Payee Name', 'docno': 'Docno',
+            'invoice_no': 'Invoice No', 'business_unit': 'Business Unit',
+        },
+        'unique': ['company', 'account_head'],
+        'required': ['account_head'],
+        'columns': ['id', 'company', 'account_head', 'parent_account_head',
+                    'document_type', 'financial_year', 'bank_name',
+                    'deduction_type', 'description', 'entry_types',
+                    'debit_credit', 'payment_mode', 'payee_name', 'docno',
+                    'invoice_no', 'business_unit', 'is_active', 'created_at',
+                    'updated_at'],
+        'order_by': 'account_head',
+        'label_field': 'account_head',
     },
     'account_type': {
         'label': 'Type of Account',
@@ -488,6 +524,75 @@ async def import_beneficiaries(
                 conn, analysis, on_duplicate, on_cross_company)
         except RuntimeError as e:
             raise HTTPException(400, str(e))
+
+    return {
+        **{k: v for k, v in analysis.items() if not k.startswith("_")},
+        "saved": True,
+        **result,
+    }
+
+
+@router.delete("/farvision_account/all", dependencies=[Depends(require_manager)])
+async def delete_all_farvision_accounts(schema: str = Depends(get_current_schema)):
+    """Empty the Farvision account master, the same way beneficiary's does.
+
+    Nothing else references this table -- it exists only to answer the
+    Farvision export's Account Head lookup -- so this is a plain DELETE with
+    no archive-instead-of-delete case to worry about.
+    """
+    async with company_connection(schema) as conn:
+        deleted = await conn.fetchval(
+            "WITH gone AS (DELETE FROM farvision_account_master RETURNING 1) "
+            "SELECT count(*) FROM gone")
+    logger.info("[master] %s: farvision_account cleared (%s rows) by request",
+               schema, deleted)
+    return {"deleted": deleted}
+
+
+@router.post("/farvision_account/import", dependencies=[Depends(require_manager)])
+async def import_farvision_accounts(
+    file: UploadFile = File(...),
+    save: bool = Form(False, description="false previews, true writes"),
+    on_duplicate: str = Form(
+        "skip", description="skip | overwrite — rows whose Company AND Account "
+                            "Head already exist"),
+    schema: str = Depends(get_current_schema),
+):
+    """Bulk-load the Farvision chart of accounts from an Excel or CSV sheet.
+
+    Same preview-then-commit shape as /master/beneficiary/import. Every column
+    is copied as free text -- there is nothing here to resolve against another
+    master, only a sheet to read.
+    """
+    name = (file.filename or "").lower()
+    if name.endswith(".xlsx"):
+        reader = tabular_import.READERS["excel"][0]
+    elif name.endswith(".csv"):
+        reader = tabular_import.READERS["csv"][0]
+    else:
+        raise HTTPException(
+            400, "Upload an .xlsx or .csv file. An older .xls has to be saved "
+                 "as .xlsx first.")
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(400, "That file is empty.")
+
+    try:
+        grid = reader(file_bytes)
+    except Exception as e:
+        raise HTTPException(400, f"That file could not be read: {e}")
+
+    async with company_connection(schema) as conn:
+        try:
+            analysis = await farvision_account_import.analyse(conn, grid)
+        except RuntimeError as e:
+            raise HTTPException(400, str(e))
+
+        if not save:
+            return {k: v for k, v in analysis.items() if not k.startswith("_")}
+
+        result = await farvision_account_import.commit(conn, analysis, on_duplicate)
 
     return {
         **{k: v for k, v in analysis.items() if not k.startswith("_")},
