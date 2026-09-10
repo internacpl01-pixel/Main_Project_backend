@@ -82,7 +82,16 @@ async def analyse(conn, grid: list[list[str]]) -> dict:
                 for r in await conn.fetch(
                     "SELECT id, company, account_head FROM farvision_account_master")}
 
-    parsed, errors, duplicates = [], [], []
+    # Keyed by (company, account_head) in row order, last one wins. A sheet
+    # this size legitimately repeats the same ledger name more than once --
+    # this is what surfaced it: two rows sharing a key both went into the same
+    # executemany batch and the database's own UNIQUE constraint (correctly)
+    # refused the second one. Collapsing here, the same way a re-imported
+    # sheet already collapses onto what's in the database, means the batch
+    # sent to the database never has two rows fighting over one key.
+    by_key: dict[tuple, dict] = {}
+    errors = []
+    sheet_duplicate_count = 0
     for row_num, raw in enumerate(data_rows, start=2):
         values = {col: (raw[i] if i < len(raw) else None) or None
                   for i, col in col_by_index.items()}
@@ -103,6 +112,12 @@ async def analyse(conn, grid: list[list[str]]) -> dict:
         entry["account_head"] = account_head
         entry["company"] = company or None
 
+        if key in by_key:
+            sheet_duplicate_count += 1
+        by_key[key] = entry
+
+    parsed, duplicates = [], []
+    for key, entry in by_key.items():
         if key in existing:
             duplicates.append(entry)
         else:
@@ -113,6 +128,7 @@ async def analyse(conn, grid: list[list[str]]) -> dict:
         "importable": len(parsed),
         "duplicate_count": len(duplicates),
         "cross_company_count": 0,
+        "sheet_duplicate_count": sheet_duplicate_count,
         "error_count": len(errors),
         "unmapped_headers": unmapped,
         "preview": (parsed + duplicates)[:PREVIEW_ROWS],
