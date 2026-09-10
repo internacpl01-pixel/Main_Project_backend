@@ -17,6 +17,7 @@ imported and a fuzzy narration match is wired in against it -- there is
 nowhere else that answer can honestly come from yet.
 """
 from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 from io import BytesIO
 
 COLUMNS = [
@@ -169,6 +170,9 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
     return out
 
 
+_DATE_COLUMNS = {"Document Date", "Date", "Invoice Date"}
+
+
 def to_xlsx_bytes(rows: list[dict]) -> bytes:
     wb = Workbook()
     ws = wb.active
@@ -176,6 +180,18 @@ def to_xlsx_bytes(rows: list[dict]) -> bytes:
     ws.append(COLUMNS)
     for row in rows:
         ws.append([row.get(col) for col in COLUMNS])
+
+    # A date cell shows ##### when the column is narrower than its format
+    # needs, not when the value is wrong -- Excel's default datetime format is
+    # wider than the DD-MM-YYYY this only needs, so both are fixed together.
+    for i, name in enumerate(COLUMNS, start=1):
+        letter = get_column_letter(i)
+        if name in _DATE_COLUMNS:
+            for cell in ws[letter][1:]:
+                if cell.value is not None:
+                    cell.number_format = "DD-MM-YYYY"
+        ws.column_dimensions[letter].width = 12 if name in _DATE_COLUMNS else max(len(name) + 2, 10)
+
     buf = BytesIO()
     wb.save(buf)
     return buf.getvalue()
