@@ -132,28 +132,33 @@ async def commit(conn, analysis: dict, on_duplicate: str) -> dict:
     skipped = len(analysis["_duplicates"]) if on_duplicate != "overwrite" else 0
 
     cols = ["company", "account_head"] + [c for c in _COLUMNS if c not in ("company", "account_head")]
-    inserted = updated = 0
+    update_cols = [c for c in cols if c not in ("company", "account_head")]
 
+    # executemany pipelines every row over one prepared statement instead of
+    # one round trip to the database per row -- the difference between a
+    # sheet with thousands of rows finishing in a couple of seconds and it
+    # timing out before the last row is even sent. A 15,885-row sheet is
+    # exactly the case that surfaced this: one execute() per row never
+    # finished inside any reasonable request deadline.
     async with conn.transaction():
-        for entry in parsed:
-            values = [entry.get(c) for c in cols]
+        if parsed:
             placeholders = ", ".join(f"${i+1}" for i in range(len(cols)))
-            await conn.execute(
+            await conn.executemany(
                 f"INSERT INTO farvision_account_master ({', '.join(cols)}) "
                 f"VALUES ({placeholders})",
-                *values,
+                [[entry.get(c) for c in cols] for entry in parsed],
             )
-            inserted += 1
 
-        for entry in duplicates:
-            set_clause = ", ".join(f"{c} = ${i+3}" for i, c in enumerate(
-                c for c in cols if c not in ("company", "account_head")))
-            values = [entry.get(c) for c in cols if c not in ("company", "account_head")]
-            await conn.execute(
+        if duplicates:
+            set_clause = ", ".join(f"{c} = ${i+3}" for i, c in enumerate(update_cols))
+            await conn.executemany(
                 f"UPDATE farvision_account_master SET {set_clause}, updated_at = now() "
                 f"WHERE company IS NOT DISTINCT FROM $1 AND account_head = $2",
-                entry.get("company"), entry.get("account_head"), *values,
+                [[entry.get("company"), entry.get("account_head"),
+                  *[entry.get(c) for c in update_cols]] for entry in duplicates],
             )
-            updated += 1
+
+    inserted = len(parsed)
+    updated = len(duplicates)
 
     return {"inserted": inserted, "updated": updated, "skipped": skipped}
