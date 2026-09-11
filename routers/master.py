@@ -14,7 +14,7 @@ from fastapi import (APIRouter, Depends, File, Form, HTTPException, Query,
 import permissions
 from database import company_connection
 from routers.auth import get_current_schema, require_level
-from services import beneficiary_import, farvision_account_import, tabular_import
+from services import beneficiary_import, farvision, farvision_account_import, tabular_import
 
 logger = logging.getLogger(__name__)
 
@@ -239,28 +239,14 @@ _TABLES = {
         'label': 'Farvision Account (DPL)',
         'table': 'farvision_account_master_dpl',
         'importable': True,
-        'fields': ['account_head', 'parent_account_head', 'document_type',
-                   'financial_year', 'bank_name', 'deduction_type',
-                   'description', 'entry_types', 'debit_credit',
-                   'payment_mode', 'payee_name', 'docno', 'invoice_no',
-                   'business_unit'],
+        'fields': ['account_head', 'parent_account_head'],
         'labels': {
             'account_head': 'Account Head',
             'parent_account_head': 'Parent Account Head',
-            'document_type': 'Document Type', 'financial_year': 'Financial Year',
-            'bank_name': 'Bank Name', 'deduction_type': 'Deduction Type',
-            'description': 'Description', 'entry_types': 'EntryTypes',
-            'debit_credit': 'Debit/Credit', 'payment_mode': 'Payment Mode',
-            'payee_name': 'Payee Name', 'docno': 'Docno',
-            'invoice_no': 'Invoice No', 'business_unit': 'Business Unit',
         },
         'required': ['account_head'],
         'columns': ['id', 'account_head', 'parent_account_head',
-                    'document_type', 'financial_year', 'bank_name',
-                    'deduction_type', 'description', 'entry_types',
-                    'debit_credit', 'payment_mode', 'payee_name', 'docno',
-                    'invoice_no', 'business_unit', 'is_active', 'created_at',
-                    'updated_at'],
+                    'is_active', 'created_at', 'updated_at'],
         # id, not account_head: the user wants the imported sheet's own row
         # order preserved, and id is assigned in insertion order, which the
         # import already inserts in the sheet's row order.
@@ -271,28 +257,14 @@ _TABLES = {
         'label': 'Farvision Account (AMB)',
         'table': 'farvision_account_master_amb',
         'importable': True,
-        'fields': ['account_head', 'parent_account_head', 'document_type',
-                   'financial_year', 'bank_name', 'deduction_type',
-                   'description', 'entry_types', 'debit_credit',
-                   'payment_mode', 'payee_name', 'docno', 'invoice_no',
-                   'business_unit'],
+        'fields': ['account_head', 'parent_account_head'],
         'labels': {
             'account_head': 'Account Head',
             'parent_account_head': 'Parent Account Head',
-            'document_type': 'Document Type', 'financial_year': 'Financial Year',
-            'bank_name': 'Bank Name', 'deduction_type': 'Deduction Type',
-            'description': 'Description', 'entry_types': 'EntryTypes',
-            'debit_credit': 'Debit/Credit', 'payment_mode': 'Payment Mode',
-            'payee_name': 'Payee Name', 'docno': 'Docno',
-            'invoice_no': 'Invoice No', 'business_unit': 'Business Unit',
         },
         'required': ['account_head'],
         'columns': ['id', 'account_head', 'parent_account_head',
-                    'document_type', 'financial_year', 'bank_name',
-                    'deduction_type', 'description', 'entry_types',
-                    'debit_credit', 'payment_mode', 'payee_name', 'docno',
-                    'invoice_no', 'business_unit', 'is_active', 'created_at',
-                    'updated_at'],
+                    'is_active', 'created_at', 'updated_at'],
         'order_by': 'id',
         'label_field': 'account_head',
     },
@@ -567,6 +539,18 @@ async def import_beneficiaries(
         "saved": True,
         **result,
     }
+
+
+@router.get("/farvision_account/reference")
+async def farvision_account_reference():
+    """Read-only reference values for the fields the master table no longer stores.
+
+    Financial Year, Deduction Type, Description and the rest carried almost
+    no real per-Account-Head data in the original sheet, so they aren't
+    master columns -- this just surfaces the format/examples that were found,
+    for the Master Data page to show as a plain reference list.
+    """
+    return farvision.REFERENCE_VALUES
 
 
 @router.delete("/farvision_account/all", dependencies=[Depends(require_manager)])

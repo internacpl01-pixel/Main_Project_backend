@@ -21,7 +21,18 @@ company's party of the same name. A row whose Company doesn't resolve to
 either table gets no match at all, rather than guessing. Parent Account Head
 and Payee Name simply come along with whichever Account Head matched. No
 match found means both stay blank rather than guessed.
+
+Only Account Head and Parent Account Head are genuinely tied to a specific
+row in that master -- confirmed with the user. Everything else the original
+sheet carried (Financial Year, Document Type, Bank Name, Deduction Type,
+Description, EntryTypes, Debit/Credit, Payment Mode, Docno, Invoice No,
+Business Unit) was near-empty across the real data and isn't stored in the
+master at all; it lives here as REFERENCE_VALUES, a plain lookup of the
+format/examples found in that original sheet, shown to the user as read-only
+reference material rather than joined into the export automatically.
 """
+import re
+
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from io import BytesIO
@@ -57,6 +68,30 @@ _TDS_DESCRIPTION = {
     "INTEREST": "TDS ON INTEREST OTHER THAN SECURITIES",
 }
 
+# Read-only reference material for the Master Data page's Farvision Account
+# tabs: the format/example values found in the original master sheet for
+# columns that carry no genuine per-Account-Head data, so a person filling
+# the export by hand (or checking it) can see what these fields are supposed
+# to look like without them cluttering the master table as mostly-blank
+# columns. Not consumed anywhere in fetch_rows -- purely informational.
+REFERENCE_VALUES = [
+    {"field": "Financial Year", "values": ["01-04-2026-31-03-2027",
+        "01-04-2027-31-03-2028", "01-04-2029-31-03-2030"],
+     "note": "Format is 01-04-<year>-31-03-<year+1>. The export builds this "
+             "automatically from temp_trans's own \"FY YY-YY\" text."},
+    {"field": "Document Type / EntryTypes", "values": ["RECEIPT / PAYMENT", "Deposit / Withdrawal"],
+     "note": "The export fills these from the row's head type, not from this list."},
+    {"field": "Debit/Credit", "values": ["Debit", "Credit"]},
+    {"field": "Deduction Type", "values": ["Tax deducted at source", "Goods and Service Tax"],
+     "note": "The export currently only ever fills \"Tax deducted at source\", "
+             "when Description matches a TDS keyword."},
+    {"field": "Description (TDS)", "values": sorted(set(_TDS_DESCRIPTION.values())),
+     "note": "Filled automatically from the row's head name via the keyword table above."},
+    {"field": "Payment Mode", "values": ["Direct"], "note": "The export always fills this literally."},
+    {"field": "Docno", "values": ["ON A/C"], "note": "The export always fills \"ON A/c\" literally."},
+    {"field": "Invoice No", "values": ["Normal"], "note": "The export always fills this literally."},
+]
+
 
 def _is_internal(head_name: str | None) -> bool:
     """Head Type is Internal Head AND the name itself is literally Internal.
@@ -73,6 +108,26 @@ def _skip_document_type(head_name: str | None) -> bool:
         return False
     n = head_name.strip().upper()
     return n in ("CANCELLATION", "COLLECTION")
+
+
+_FY_RE = re.compile(r"(\d{2})\s*-\s*(\d{2})")
+
+
+def _format_financial_year(fy_text: str | None) -> str | None:
+    """"FY 26-27" -> "01-04-2026-31-03-2027", the master's own example format.
+
+    Confirmed against the master's 3 sample Financial Year rows, all of which
+    spell out the same 1 April - 31 March span the sheet's own short "FY
+    YY-YY" text already implies. Text that doesn't look like "FY YY-YY" is
+    left exactly as it came from temp_trans rather than guessed.
+    """
+    if not fy_text:
+        return fy_text
+    m = _FY_RE.search(fy_text)
+    if not m:
+        return fy_text
+    y1, y2 = int(m.group(1)), int(m.group(2))
+    return f"01-04-20{y1:02d}-31-03-20{y2:02d}"
 
 
 _ACCOUNT_TABLES = {"DPL": "farvision_account_master_dpl", "AMB": "farvision_account_master_amb"}
@@ -170,7 +225,7 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
         out.append({
             "Link Ref Code": i,
             "Business Unit": r["business_unit"],
-            "Financial Year": r["financial_year"],
+            "Financial Year": _format_financial_year(r["financial_year"]),
             "Document Type": document_type,
             "Document Date": r["document_date"],
             "Document No": None,
@@ -204,7 +259,7 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
             "Department Name": None,
             "Cost Center": None,
             "Purpose Of Payment": None,
-            "Deduction Type": "Tax deducted at source" if internal else None,
+            "Deduction Type": "Tax deducted at source" if tds_description else None,
             "Description": tds_description,
             "Docno": "ON A/c",
             "Date": r["document_date"],

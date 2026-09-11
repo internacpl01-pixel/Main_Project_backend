@@ -11,6 +11,15 @@ and AMB rows never collide even when they happen to share an Account Head
 name. A row whose Company isn't recognised as DPL or AMB is reported as an
 error rather than guessed into either table.
 
+Only Account Head and Parent Account Head are stored -- confirmed with the
+user that these are the only two columns genuinely tied to a specific
+Account Head; the sheet's other columns (Document Type, Financial Year, Bank
+Name, Deduction Type, Description, EntryTypes, Debit/Credit, Payment Mode,
+Payee Name, Docno, Invoice No, Business Unit) were near-empty across the real
+data and are reference/format values now hardcoded in services.farvision
+instead. If the sheet has those columns they simply show up as unmapped
+headers -- harmless, not an error.
+
 No duplicate checking: the user's real sheet legitimately repeats the same
 Account Head more than once per company, and every row is wanted as its own
 row rather than collapsed onto whatever's already in the table (confirmed
@@ -26,29 +35,12 @@ PREVIEW_ROWS = 25
 
 _TABLES = {"DPL": "farvision_account_master_dpl", "AMB": "farvision_account_master_amb"}
 
-_COLUMNS = [
-    "account_head", "parent_account_head", "document_type",
-    "financial_year", "bank_name", "deduction_type", "description",
-    "entry_types", "debit_credit", "payment_mode", "payee_name", "docno",
-    "invoice_no", "business_unit",
-]
+_COLUMNS = ["account_head", "parent_account_head"]
 
 _ALIASES: dict[str, list[str]] = {
     "company": ["company"],
     "account_head": ["account head", "accounthead"],
     "parent_account_head": ["parent account head", "parent acc head", "parent head"],
-    "document_type": ["document type", "doc type"],
-    "financial_year": ["financial year", "fy"],
-    "bank_name": ["bank name", "bankname", "bank"],
-    "deduction_type": ["deduction type"],
-    "description": ["description"],
-    "entry_types": ["entrytypes", "entry types", "entry type"],
-    "debit_credit": ["debit/credit", "debit credit", "dr/cr"],
-    "payment_mode": ["payment mode"],
-    "payee_name": ["payee name"],
-    "docno": ["docno", "doc no"],
-    "invoice_no": ["invoice no", "invoiceno"],
-    "business_unit": ["business unit"],
 }
 
 
