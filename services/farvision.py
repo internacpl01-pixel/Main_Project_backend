@@ -26,17 +26,29 @@ matching against the wrong table could pick the wrong company's party of the
 same name. A row whose Company doesn't resolve to either table gets no match
 at all, rather than guessing.
 
-The search text is the narration's "To: <party>" segment when there is one --
-not the whole narration -- confirmed against a real mismatch where the master
-head "Software" won by matching the Purpose text ("Software Expenses")
-instead of the real party named after "To:". Narrations with no "To:" (mostly
-internal transfers between the company's own accounts) fall back to the
-whole narration. Both the search text and every candidate Account Head are
-normalized first (corporate suffixes LIMITED/PRIVATE folded to LTD/PVT, a
-trailing plural S dropped) so "Gamut Infosystem Ltd" matches narration text
-reading "GAMUT INFOSYSTEMS LIMITED" -- confirmed against that exact case.
-Parent Account Head and Payee Name simply come along with whichever Account
-Head matched. No match found means both stay blank rather than guessed.
+The search text is temp_trans's own DESC field (field_text_1) -- the raw
+bank-statement text (e.g. "YIB-NEFT-YESME62170041087-INDIA PRIDE COM-
+CNRB0001565-VENDOR- CANARA BANK"), confirmed against the user's own
+screenshot of it. NARRATION (field_text_11), used here previously, turned
+out to be a synthetic field, often just the literal placeholder text
+"Remarks Compulsory For Narration" rather than real bank text -- confirmed
+live. DESC has no "To:"/"Purpose:" structure to isolate a party segment
+from, so it is searched whole. Both the search text and every candidate
+Account Head are normalized first (corporate suffixes LIMITED/PRIVATE folded
+to LTD/PVT, a trailing plural S dropped) so "Gamut Infosystem Ltd" matches
+DESC text reading "GAMUT INFOSYSTEMS LIMITED" -- confirmed against that
+exact case. Parent Account Head and Payee Name simply come along with
+whichever Account Head matched. No match found means both stay blank rather
+than guessed.
+
+An Internal-head row (Head is "Internal") skips the Account Head master
+entirely -- it is a transfer between the company's own bank accounts, not a
+payment to any party, and whole-DESC matching against the Account Head
+master started false-matching the company's own legal name in transfer
+routing text ("...vide YIB-TPT-DWARKADHIS PROJECTS PRIVATE LIMITED...")
+against an unrelated Account Head master row of the same name. Account Head
+for these rows is instead the Farvision Bank Name on the other side of the
+transfer -- see _match_internal_account_head.
 
 Only Account Head and Parent Account Head are genuinely tied to a specific
 row in that master -- confirmed with the user. Everything else the original
@@ -225,6 +237,74 @@ def _match_bank_name(account_number: str | None, candidates: list[str]) -> str |
     return min(hits, key=len) if hits else None
 
 
+async def _bank_short_codes(conn) -> list[str]:
+    """bank_master's own short bank labels ("BOM", "YES", "KVB", ...).
+
+    A curated vocabulary rather than an open word scan of DESC -- confirmed
+    necessary after DESC-matching for Internal rows needed a fallback when no
+    account number is present, and an unbounded scan of DESC's own words
+    ("TPT", "CIRP", "PROJECTS", ...) would repeat the exact kind of false
+    positive already fixed once for Account Head matching (_MIN_MATCH_LENGTH).
+    """
+    rows = await conn.fetch(
+        "SELECT DISTINCT bank_name FROM bank_master WHERE bank_name IS NOT NULL AND bank_name <> ''")
+    return [r["bank_name"] for r in rows]
+
+
+_ACCOUNT_NUMBER_RE = re.compile(r"\d{6,}")
+
+
+def _match_internal_account_head(
+    desc_text: str | None, bank_names: list[str], short_codes: list[str],
+) -> tuple[str | None, list[str] | None]:
+    """For an Internal-head row (a transfer between the company's own bank
+    accounts, not a payment to any external party), Account Head is the
+    specific Farvision Bank Name on the other side of the transfer, not a
+    party from the Account Head master -- confirmed with the user after
+    whole-DESC Account Head matching started accidentally matching the
+    company's own legal name in transfer routing text ("...vide YIB-TPT-
+    DWARKADHIS PROJECTS PRIVATE LIMITED...") against an unrelated Account
+    Head master row of the same name.
+
+    Tries, in order, confirmed with the user:
+      1. An account number embedded in DESC, matched the same way
+         _match_bank_name already matches BankName -- confident, filled
+         directly. More than one distinct bank matched this way is offered
+         as a dropdown instead of guessing between them.
+      2. A short bank code found in DESC -- offered as a dropdown of every
+         Farvision Bank Name sharing that code, since several accounts can.
+      3. Every Farvision Bank Name, as a last-resort dropdown, when DESC gave
+         no usable hint at all.
+    """
+    if not bank_names:
+        return None, None
+
+    # A source formatting quirk sometimes puts a bare space inside an account
+    # number ("0455632 00000264") -- confirmed live. Left alone, the half
+    # after the space can strip down to only 2-3 leading-zero-stripped digits
+    # ("264"), too short to trust as a match on its own even though it
+    # happened to be correct there; merging digit runs split only by
+    # whitespace fixes the number itself instead of relying on luck.
+    compact = re.sub(r"(?<=\d)\s+(?=\d)", "", desc_text or "")
+    numbers = {re.sub(r"\D", "", n).lstrip("0") for n in _ACCOUNT_NUMBER_RE.findall(compact)}
+    numbers = {n for n in numbers if len(n) >= 6}
+    by_number = {b for n in numbers for b in bank_names if n in re.sub(r"\D", "", b)}
+    if len(by_number) == 1:
+        return next(iter(by_number)), None
+    if len(by_number) > 1:
+        return None, sorted(by_number)
+
+    desc_upper = (desc_text or "").upper()
+    by_code = {
+        b for code in short_codes if code and code.upper() in desc_upper
+        for b in bank_names if code.upper() in b.upper()
+    }
+    if by_code:
+        return None, sorted(by_code)
+
+    return None, sorted(bank_names)
+
+
 _ACCOUNT_TABLES = {"DPL": "farvision_account_master_dpl", "AMB": "farvision_account_master_amb"}
 
 
@@ -286,8 +366,6 @@ async def _duplicate_options_map(conn, company: str) -> dict[str, list[str]]:
     return options
 
 
-_TO_RE = re.compile(r"\bTo:\s*([^|]+)")
-
 # Confirmed against a real mismatch: the master's "Gamut Infosystem Ltd"
 # didn't match narration text reading "GAMUT INFOSYSTEMS LIMITED" -- same
 # company, just spelled with the full/plural corporate suffix instead of the
@@ -320,20 +398,23 @@ def _normalize_party_name(text: str | None) -> str:
 _MIN_MATCH_LENGTH = 5
 
 
-def _match_account_head(narration: str | None, candidates: list[dict]) -> tuple[str | None, str | None]:
-    """Search just the "To: <party>" segment when the narration has one.
+def _match_account_head(desc_text: str | None, candidates: list[dict]) -> tuple[str | None, str | None]:
+    """Search temp_trans's own DESC field (field_text_1), the real bank text.
 
-    Searching the whole narration let a generic head name (e.g. "Software")
-    win by matching the Purpose text instead of the actual party named after
-    "To:" -- confirmed against a real row where that happened. Narrations
-    without a "To:" (mostly internal transfers between the company's own
-    accounts, named "(From X to Y)") fall back to the whole narration, since
-    there's no separate party field to isolate there.
+    NARRATION (field_text_11) looked like it should be the search source, but
+    it is a synthetic field -- confirmed against real data where it was
+    frequently just the literal placeholder text "Remarks Compulsory For
+    Narration", not the bank's actual description, and even when populated it
+    is built from other classified fields, so matching against it would be
+    circular. DESC is the raw hyphen-joined bank text (e.g. "YIB-NEFT-
+    YESME62170041087-INDIA PRIDE COM-CNRB0001565-VENDOR- CANARA BANK")
+    confirmed by the user's own screenshot of it, and is searched whole --
+    there is no "To:"/"Purpose:" structure in DESC to isolate a party
+    segment from, unlike the synthetic Narration.
     """
-    if not narration:
+    if not desc_text:
         return None, None
-    m = _TO_RE.search(narration)
-    search_text = _normalize_party_name(m.group(1) if m else narration)
+    search_text = _normalize_party_name(desc_text)
     if not search_text:
         return None, None
     for c in candidates:
@@ -352,6 +433,7 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
                t.field_text_21 AS financial_year,
                t.field_date_1  AS document_date,
                t.field_text_11 AS narration,
+               t.field_text_1  AS desc_text,
                t.field_text_17 AS account_number,
                t.field_num_1   AS debit_amount,
                t.field_num_2   AS credit_amount,
@@ -384,6 +466,7 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
     candidates_by_company: dict[str | None, list[dict]] = {}
     dup_options_by_company: dict[str | None, dict[str, list[str]]] = {}
     bank_name_candidates = await _bank_name_candidates(conn)
+    bank_short_codes = await _bank_short_codes(conn)
 
     out = []
     for i, r in enumerate(rows, start=1):
@@ -399,26 +482,38 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
             tds_description = _TDS_DESCRIPTION.get(r["head_name"].strip().upper())
 
         company = r["company"]
-        if company not in candidates_by_company:
-            candidates_by_company[company] = await _account_head_candidates(conn, company)
-        if company not in dup_options_by_company:
-            dup_options_by_company[company] = await _duplicate_options_map(conn, company)
-        account_head, parent_account_head = _match_account_head(
-            r["narration"], candidates_by_company[company])
         bank_name = _match_bank_name(r["account_number"], bank_name_candidates) or r["bank_name"]
 
-        # A match that landed on a head with known duplicates ("India Pride
-        # Com" / "INDIA PRIDE.COM") is left blank rather than guessed -- the
-        # sheet gets a dropdown of every spelling in the group instead
-        # (built in to_xlsx_bytes), confirmed with the user.
-        account_head_options = dup_options_by_company[company].get(account_head)
-        if account_head_options:
-            # Parent Account Head can differ between spellings in the same
-            # group (confirmed live -- two duplicate rows for the same party
-            # carried different Parent text), so it is just as ambiguous as
-            # Account Head itself and left blank the same way.
-            account_head = None
+        if internal:
+            # A transfer between the company's own bank accounts has no
+            # external party at all -- Account Head is the specific bank
+            # account on the other side of the transfer instead, confirmed
+            # with the user after whole-DESC matching against the Account
+            # Head master started false-matching the company's own legal
+            # name in transfer routing text.
+            account_head, account_head_options = _match_internal_account_head(
+                r["desc_text"], bank_name_candidates, bank_short_codes)
             parent_account_head = None
+        else:
+            if company not in candidates_by_company:
+                candidates_by_company[company] = await _account_head_candidates(conn, company)
+            if company not in dup_options_by_company:
+                dup_options_by_company[company] = await _duplicate_options_map(conn, company)
+            account_head, parent_account_head = _match_account_head(
+                r["desc_text"], candidates_by_company[company])
+
+            # A match that landed on a head with known duplicates ("India
+            # Pride Com" / "INDIA PRIDE.COM") is left blank rather than
+            # guessed -- the sheet gets a dropdown of every spelling in the
+            # group instead (built in to_xlsx_bytes), confirmed with the user.
+            account_head_options = dup_options_by_company[company].get(account_head)
+            if account_head_options:
+                # Parent Account Head can differ between spellings in the
+                # same group (confirmed live -- two duplicate rows for the
+                # same party carried different Parent text), so it is just as
+                # ambiguous as Account Head itself and left blank the same way.
+                account_head = None
+                parent_account_head = None
 
         out.append({
             # Not a real column -- read by to_xlsx_bytes to add a dropdown on
