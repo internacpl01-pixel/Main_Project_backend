@@ -24,12 +24,21 @@ match found means both stay blank rather than guessed.
 
 Only Account Head and Parent Account Head are genuinely tied to a specific
 row in that master -- confirmed with the user. Everything else the original
-sheet carried (Financial Year, Document Type, Bank Name, Deduction Type,
-Description, EntryTypes, Debit/Credit, Payment Mode, Docno, Invoice No,
-Business Unit) was near-empty across the real data and isn't stored in the
-master at all; it lives here as REFERENCE_VALUES, a plain lookup of the
-format/examples found in that original sheet, shown to the user as read-only
-reference material rather than joined into the export automatically.
+sheet carried (Financial Year, Document Type, Deduction Type, Description,
+EntryTypes, Debit/Credit, Payment Mode, Docno, Invoice No, Business Unit) was
+near-empty across the real data and isn't stored in the master at all; it
+lives here as REFERENCE_VALUES, a plain lookup of the format/examples found
+in that original sheet, shown to the user as read-only reference material
+rather than joined into the export automatically.
+
+BankName is the one exception treated specially: bank_master's own bank_name
+is a short generic label ("BOM", "YES", "KVB") shared by several accounts,
+but farvision_bank_name_master holds Farvision's own full bank-name strings,
+each of which embeds one account's actual number. The row's account number
+(resolved the same way as the temp_trans-derived bank_name lookup already
+was) is matched against those account numbers to fill BankName with the
+exact Farvision text; a row whose account number matches nothing there falls
+back to the old temp_trans-derived value.
 """
 import re
 
@@ -130,6 +139,30 @@ def _format_financial_year(fy_text: str | None) -> str | None:
     return f"01-04-20{y1:02d}-31-03-20{y2:02d}"
 
 
+async def _bank_name_candidates(conn) -> list[str]:
+    rows = await conn.fetch("SELECT name FROM farvision_bank_name_master WHERE is_active")
+    return [r["name"] for r in rows]
+
+
+def _match_bank_name(account_number: str | None, candidates: list[str]) -> str | None:
+    """The Farvision Bank Name whose text embeds this account's own digits.
+
+    bank_master's own bank_name is a short generic label ("BOM", "YES", "KVB")
+    shared by several accounts; the account number is what's actually unique,
+    and every Farvision Bank Name that names a bank account embeds it in the
+    text. Leading zeros are stripped since some sources keep them and others
+    don't. When an account number's digits appear in more than one Farvision
+    name (confirmed to happen once, for a shared "BOM" account), the shortest
+    match wins -- the longer one is a project-specific alias of the same
+    account, confirmed with the user for that exact case.
+    """
+    digits = re.sub(r"\D", "", account_number or "").lstrip("0")
+    if not digits:
+        return None
+    hits = [c for c in candidates if digits in re.sub(r"\D", "", c)]
+    return min(hits, key=len) if hits else None
+
+
 _ACCOUNT_TABLES = {"DPL": "farvision_account_master_dpl", "AMB": "farvision_account_master_amb"}
 
 
@@ -202,6 +235,7 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
     # once rather than per row -- a batch is usually one bank account and
     # therefore one company, but nothing here assumes that.
     candidates_by_company: dict[str | None, list[dict]] = {}
+    bank_name_candidates = await _bank_name_candidates(conn)
 
     out = []
     for i, r in enumerate(rows, start=1):
@@ -221,6 +255,7 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
             candidates_by_company[company] = await _account_head_candidates(conn, company)
         account_head, parent_account_head = _match_account_head(
             r["narration"], candidates_by_company[company])
+        bank_name = _match_bank_name(r["account_number"], bank_name_candidates) or r["bank_name"]
 
         out.append({
             "Link Ref Code": i,
@@ -230,7 +265,7 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
             "Document Date": r["document_date"],
             "Document No": None,
             "Narration": r["narration"],
-            "BankName": r["bank_name"],
+            "BankName": bank_name,
             "EntryTypes": document_type,
             "Detail Link Ref Code": i,
             "Debit/Credit": r["debit_credit"],
