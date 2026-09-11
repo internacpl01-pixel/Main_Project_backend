@@ -539,7 +539,7 @@ def _add_account_head_dropdowns(wb, ws, rows: list[dict]) -> None:
             helper.cell(row=opt_row, column=col_idx, value=option)
         dv = DataValidation(
             type="list",
-            formula1=f"=AccountHeadOptions!${col_letter}$1:${col_letter}${len(options)}",
+            formula1=f"AccountHeadOptions!${col_letter}$1:${col_letter}${len(options)}",
             allow_blank=True,
         )
         ws.add_data_validation(dv)
