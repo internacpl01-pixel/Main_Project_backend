@@ -101,7 +101,9 @@ REFERENCE_VALUES = [
     {"field": "Debit/Credit", "values": ["Debit", "Credit"]},
     {"field": "Business Unit", "values": ["ARAVALI HEIGHTS", "CASA ROMANA",
         "DWARKADHIS PROJECTS PVT. LTD-HO"],
-     "note": "The export fills this from temp_trans's own Business Unit field, not from this list."},
+     "note": "The export maps temp_trans's own Business Unit value onto these exact "
+             "Farvision strings (e.g. \"HO\" -> \"DWARKADHIS PROJECTS PVT. LTD-HO\"); "
+             "anything that doesn't match one of the three is passed through as-is."},
     {"field": "Deduction Type", "values": ["Tax deducted at source", "Goods and Service Tax"],
      "note": "The export currently only ever fills \"Tax deducted at source\", "
              "when Description matches a TDS keyword."},
@@ -111,6 +113,23 @@ REFERENCE_VALUES = [
     {"field": "Docno", "values": ["ON A/C"], "note": "The export always fills \"ON A/c\" literally."},
     {"field": "Invoice No", "values": ["Normal"], "note": "The export always fills this literally."},
 ]
+
+
+# temp_trans's own Business Unit text (field_text_4) -> the exact string
+# Farvision expects. Confirmed with the user against real values found in
+# temp_trans -- "HO" alone isn't a real Farvision business unit, it's this
+# project's short form of the full name.
+_BUSINESS_UNIT_MAP = {
+    "ARAVALI HEIGHTS": "ARAVALI HEIGHTS",
+    "CASA ROMANA": "CASA ROMANA",
+    "HO": "DWARKADHIS PROJECTS PVT. LTD-HO",
+}
+
+
+def _format_business_unit(business_unit: str | None) -> str | None:
+    if not business_unit:
+        return business_unit
+    return _BUSINESS_UNIT_MAP.get(business_unit.strip().upper(), business_unit)
 
 
 def _is_internal(head_name: str | None) -> bool:
@@ -270,7 +289,7 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
 
         out.append({
             "Link Ref Code": i,
-            "Business Unit": r["business_unit"],
+            "Business Unit": _format_business_unit(r["business_unit"]),
             "Financial Year": _format_financial_year(r["financial_year"]),
             "Document Type": document_type,
             "Document Date": r["document_date"],
