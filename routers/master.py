@@ -268,6 +268,21 @@ _TABLES = {
         'order_by': 'id',
         'label_field': 'account_head',
     },
+    'farvision_bank_name': {
+        'label': 'Farvision Bank Name',
+        'table': 'farvision_bank_name_master',
+        'fields': ['name'],
+        'labels': {'name': 'Name'},
+        # A plain reference list, the same shape as account_type_master --
+        # every Bank Name string found in the Farvision master sheet, with no
+        # link to a specific Account Head or company (confirmed with the
+        # user: Bank Name wasn't genuinely tied to one Account Head anyway).
+        'unique': ['name'],
+        'required': ['name'],
+        'columns': ['id', 'name', 'is_active', 'created_at', 'updated_at'],
+        'order_by': 'name',
+        'label_field': 'name',
+    },
     'account_type': {
         'label': 'Type of Account',
         'table': 'account_type_master',
