@@ -55,11 +55,19 @@ each of which embeds one account's actual number. The row's account number
 was) is matched against those account numbers to fill BankName with the
 exact Farvision text; a row whose account number matches nothing there falls
 back to the old temp_trans-derived value.
+
+The same real Account Head sometimes got typed twice with different
+formatting ("India Pride Com" vs "INDIA PRIDE.COM") -- confirmed live across
+~16,000 rows, hundreds of such pairs exist. Rather than guessing which
+spelling is "right", a match that lands on one of these is left blank in the
+export and given an in-Excel dropdown listing every spelling instead (see
+_duplicate_options_map and to_xlsx_bytes's _add_account_head_dropdowns).
 """
 import re
 
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
 from io import BytesIO
 
 from services import staging
@@ -240,6 +248,44 @@ async def _account_head_candidates(conn, company: str | None) -> list[dict]:
     return sorted(candidates, key=lambda r: -len(r["_norm"]))
 
 
+def _duplicate_key(account_head: str) -> str:
+    """Uppercase, punctuation stripped, whitespace collapsed.
+
+    Looser than _normalize_party_name (no suffix folding, no plural
+    stripping) on purpose: this is for spotting two rows that are almost
+    certainly the same typed-twice entry ("priyanka Redhu" / "priyanka
+    Redhu."), not for narration matching, so it should only fold away pure
+    formatting noise and nothing that could change meaning.
+    """
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", account_head.upper())).strip()
+
+
+async def _duplicate_options_map(conn, company: str) -> dict[str, list[str]]:
+    """account_head text -> every spelling that normalizes the same way
+    (itself included), only for account heads that actually have a duplicate.
+
+    Used by fetch_rows to know when a match landed on an ambiguous head so
+    the export can offer every spelling in an Excel dropdown instead of
+    guessing one -- confirmed with the user: there is no "canonical" spelling
+    tracked anywhere, every duplicate is presented every time.
+    """
+    table = _ACCOUNT_TABLES.get((company or "").strip().upper())
+    if not table:
+        return {}
+    rows = await conn.fetch(f"SELECT account_head FROM {table}")
+    groups: dict[str, list[str]] = {}
+    for r in rows:
+        groups.setdefault(_duplicate_key(r["account_head"]), []).append(r["account_head"])
+    options: dict[str, list[str]] = {}
+    for heads in groups.values():
+        if len(heads) < 2:
+            continue
+        heads_sorted = sorted(set(heads))
+        for h in heads_sorted:
+            options[h] = heads_sorted
+    return options
+
+
 _TO_RE = re.compile(r"\bTo:\s*([^|]+)")
 
 # Confirmed against a real mismatch: the master's "Gamut Infosystem Ltd"
@@ -336,6 +382,7 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
     # once rather than per row -- a batch is usually one bank account and
     # therefore one company, but nothing here assumes that.
     candidates_by_company: dict[str | None, list[dict]] = {}
+    dup_options_by_company: dict[str | None, dict[str, list[str]]] = {}
     bank_name_candidates = await _bank_name_candidates(conn)
 
     out = []
@@ -354,11 +401,29 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
         company = r["company"]
         if company not in candidates_by_company:
             candidates_by_company[company] = await _account_head_candidates(conn, company)
+        if company not in dup_options_by_company:
+            dup_options_by_company[company] = await _duplicate_options_map(conn, company)
         account_head, parent_account_head = _match_account_head(
             r["narration"], candidates_by_company[company])
         bank_name = _match_bank_name(r["account_number"], bank_name_candidates) or r["bank_name"]
 
+        # A match that landed on a head with known duplicates ("India Pride
+        # Com" / "INDIA PRIDE.COM") is left blank rather than guessed -- the
+        # sheet gets a dropdown of every spelling in the group instead
+        # (built in to_xlsx_bytes), confirmed with the user.
+        account_head_options = dup_options_by_company[company].get(account_head)
+        if account_head_options:
+            # Parent Account Head can differ between spellings in the same
+            # group (confirmed live -- two duplicate rows for the same party
+            # carried different Parent text), so it is just as ambiguous as
+            # Account Head itself and left blank the same way.
+            account_head = None
+            parent_account_head = None
+
         out.append({
+            # Not a real column -- read by to_xlsx_bytes to add a dropdown on
+            # this row's Account Head cell, then dropped before writing.
+            "_account_head_options": account_head_options,
             "Link Ref Code": i,
             "Business Unit": _format_business_unit(r["business_unit"]),
             "Financial Year": _format_financial_year(r["financial_year"]),
@@ -436,6 +501,47 @@ def to_xlsx_bytes(rows: list[dict]) -> bytes:
                     cell.number_format = "DD-MM-YYYY"
         ws.column_dimensions[letter].width = 12 if name in _DATE_COLUMNS else max(len(name) + 2, 10)
 
+    _add_account_head_dropdowns(wb, ws, rows)
+
     buf = BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def _add_account_head_dropdowns(wb, ws, rows: list[dict]) -> None:
+    """Give a row's Account Head cell an in-Excel dropdown when the match was
+    ambiguous between duplicate spellings, instead of guessing one.
+
+    Options for the same duplicate group are shared across every row that
+    hit it, so a group used by hundreds of rows still only writes one helper
+    column and one DataValidation, added once and referenced by every
+    matching cell. Excel's list-validation formula1 has to point at real
+    cells rather than an inline literal list -- an Account Head can contain
+    commas, and the combined text can exceed the 255-char inline limit -- so
+    the option strings go on a hidden helper sheet instead.
+    """
+    account_head_col = get_column_letter(COLUMNS.index("Account Head") + 1)
+    cells_by_options: dict[tuple, list[str]] = {}
+    for row_index, row in enumerate(rows, start=2):
+        options = row.get("_account_head_options")
+        if options:
+            cells_by_options.setdefault(tuple(options), []).append(
+                f"{account_head_col}{row_index}")
+
+    if not cells_by_options:
+        return
+
+    helper = wb.create_sheet("AccountHeadOptions")
+    helper.sheet_state = "hidden"
+    for col_idx, (options, cell_refs) in enumerate(cells_by_options.items(), start=1):
+        col_letter = get_column_letter(col_idx)
+        for opt_row, option in enumerate(options, start=1):
+            helper.cell(row=opt_row, column=col_idx, value=option)
+        dv = DataValidation(
+            type="list",
+            formula1=f"=AccountHeadOptions!${col_letter}$1:${col_letter}${len(options)}",
+            allow_blank=True,
+        )
+        ws.add_data_validation(dv)
+        for ref in cell_refs:
+            dv.add(ref)
