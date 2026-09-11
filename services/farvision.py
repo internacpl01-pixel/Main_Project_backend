@@ -11,6 +11,14 @@ resolved through custom_fields' label lookup: this feature is built for one
 company's Farvision layout, not a generic one, and the PDF spec named these
 physical columns already.
 
+The row's head (used for Document Type, EntryTypes, Deduction Type and
+Description) prefers the real head_master/rera_head_master/idw_head_master
+join when head_id/rera_head_id/idw_head_id is set, but falls back to
+field_text_5 (fieldmap label "HEAD") when none is -- confirmed against real
+data where a batch had a HEAD value on every row ("Internal", "Professional",
+"Salary HO", ...) but none of the three head_id columns actually set. Always
+check the head field present in temp_trans, not just the resolved head_id.
+
 Account Head and Parent Account Head come from farvision_account_master_dpl or
 _amb, one table per company: the row's Narration (field_text_11, which
 already embeds "To: <party>" phrases) is searched for the longest Account
@@ -91,6 +99,9 @@ REFERENCE_VALUES = [
     {"field": "Document Type / EntryTypes", "values": ["RECEIPT / PAYMENT", "Deposit / Withdrawal"],
      "note": "The export fills these from the row's head type, not from this list."},
     {"field": "Debit/Credit", "values": ["Debit", "Credit"]},
+    {"field": "Business Unit", "values": ["ARAVALI HEIGHTS", "CASA ROMANA",
+        "DWARKADHIS PROJECTS PVT. LTD-HO"],
+     "note": "The export fills this from temp_trans's own Business Unit field, not from this list."},
     {"field": "Deduction Type", "values": ["Tax deducted at source", "Goods and Service Tax"],
      "note": "The export currently only ever fills \"Tax deducted at source\", "
              "when Description matches a TDS keyword."},
@@ -208,7 +219,7 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
                t.field_text_19 AS debit_credit,
                t.field_num_1   AS debit_amount,
                t.field_num_2   AS credit_amount,
-               coalesce(h.name, rh.name, ih.name) AS head_name,
+               coalesce(h.name, rh.name, ih.name, t.field_text_5) AS head_name,
                bm.bank_name AS bank_name,
                {company_select}
                t.id AS temp_trans_id
