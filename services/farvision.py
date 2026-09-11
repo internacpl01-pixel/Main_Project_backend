@@ -20,15 +20,23 @@ data where a batch had a HEAD value on every row ("Internal", "Professional",
 check the head field present in temp_trans, not just the resolved head_id.
 
 Account Head and Parent Account Head come from farvision_account_master_dpl or
-_amb, one table per company: the row's Narration (field_text_11, which
-already embeds "To: <party>" phrases) is searched for the longest Account
-Head string that appears in it, using only the table for the row's own
-Company -- DPL and AMB share this company_028 schema and each have their own
-ledger names, so matching against the wrong table could pick the wrong
-company's party of the same name. A row whose Company doesn't resolve to
-either table gets no match at all, rather than guessing. Parent Account Head
-and Payee Name simply come along with whichever Account Head matched. No
-match found means both stay blank rather than guessed.
+_amb, one table per company, matched against the row's own Company -- DPL and
+AMB share this company_028 schema and each have their own ledger names, so
+matching against the wrong table could pick the wrong company's party of the
+same name. A row whose Company doesn't resolve to either table gets no match
+at all, rather than guessing.
+
+The search text is the narration's "To: <party>" segment when there is one --
+not the whole narration -- confirmed against a real mismatch where the master
+head "Software" won by matching the Purpose text ("Software Expenses")
+instead of the real party named after "To:". Narrations with no "To:" (mostly
+internal transfers between the company's own accounts) fall back to the
+whole narration. Both the search text and every candidate Account Head are
+normalized first (corporate suffixes LIMITED/PRIVATE folded to LTD/PVT, a
+trailing plural S dropped) so "Gamut Infosystem Ltd" matches narration text
+reading "GAMUT INFOSYSTEMS LIMITED" -- confirmed against that exact case.
+Parent Account Head and Payee Name simply come along with whichever Account
+Head matched. No match found means both stay blank rather than guessed.
 
 Only Account Head and Parent Account Head are genuinely tied to a specific
 row in that master -- confirmed with the user. Everything else the original
@@ -132,6 +140,22 @@ def _format_business_unit(business_unit: str | None) -> str | None:
     return _BUSINESS_UNIT_MAP.get(business_unit.strip().upper(), business_unit)
 
 
+def _debit_or_credit(debit_amount, credit_amount) -> str | None:
+    """"Debit" when the row has a debit amount, "Credit" otherwise.
+
+    field_text_19 (temp_trans's own Debit/Credit text) is often blank --
+    confirmed against a real batch where it was NULL on every row. Debit
+    Amount and Credit Amount are never both set and never both blank on a
+    real row, so which one is present already says which this is; no
+    guessing needed when field_text_19 is missing.
+    """
+    if debit_amount is not None:
+        return "Debit"
+    if credit_amount is not None:
+        return "Credit"
+    return None
+
+
 def _is_internal(head_name: str | None) -> bool:
     """Head Type is Internal Head AND the name itself is literally Internal.
 
@@ -210,17 +234,65 @@ async def _account_head_candidates(conn, company: str | None) -> list[dict]:
     if not table:
         return []
     rows = await conn.fetch(f"SELECT account_head, parent_account_head FROM {table}")
-    return sorted((dict(r) for r in rows), key=lambda r: -len(r["account_head"] or ""))
+    candidates = [dict(r) for r in rows]
+    for c in candidates:
+        c["_norm"] = _normalize_party_name(c["account_head"])
+    return sorted(candidates, key=lambda r: -len(r["_norm"]))
+
+
+_TO_RE = re.compile(r"\bTo:\s*([^|]+)")
+
+# Confirmed against a real mismatch: the master's "Gamut Infosystem Ltd"
+# didn't match narration text reading "GAMUT INFOSYSTEMS LIMITED" -- same
+# company, just spelled with the full/plural corporate suffix instead of the
+# master's abbreviated/singular one. Normalizing both sides the same way
+# before comparing catches this without doing open-ended fuzzy matching.
+_SUFFIX_MAP = {"LIMITED": "LTD", "PRIVATE": "PVT"}
+
+
+def _normalize_party_name(text: str | None) -> str:
+    if not text:
+        return ""
+    words = re.sub(r"[^\w\s]", " ", text.upper()).split()
+    out = []
+    for w in words:
+        w = _SUFFIX_MAP.get(w, w)
+        if len(w) > 3 and w.endswith("S") and w not in ("LTD", "PVT"):
+            w = w[:-1]
+        out.append(w)
+    return " ".join(out)
+
+
+# Below this normalized length, a head name is too generic to trust as a
+# plain substring match -- confirmed against two real false positives once
+# punctuation-stripping was added: "CR--" (normalizes to "CR", 2 chars)
+# matched almost every narration mentioning the "YES CR FREE" bank account,
+# and "Car" (3 chars) matched "Credit Card" (its own letters are a substring
+# of "Card"). Real 5+ letter names (people's names, "HDFC", "BONUS", ...)
+# still match fine; a genuine match this short just isn't distinguishable
+# from an accidental one and is left blank instead of guessed.
+_MIN_MATCH_LENGTH = 5
 
 
 def _match_account_head(narration: str | None, candidates: list[dict]) -> tuple[str | None, str | None]:
+    """Search just the "To: <party>" segment when the narration has one.
+
+    Searching the whole narration let a generic head name (e.g. "Software")
+    win by matching the Purpose text instead of the actual party named after
+    "To:" -- confirmed against a real row where that happened. Narrations
+    without a "To:" (mostly internal transfers between the company's own
+    accounts, named "(From X to Y)") fall back to the whole narration, since
+    there's no separate party field to isolate there.
+    """
     if not narration:
         return None, None
-    upper = narration.upper()
+    m = _TO_RE.search(narration)
+    search_text = _normalize_party_name(m.group(1) if m else narration)
+    if not search_text:
+        return None, None
     for c in candidates:
-        head = c["account_head"]
-        if head and head.upper() in upper:
-            return head, c["parent_account_head"]
+        if len(c["_norm"]) >= _MIN_MATCH_LENGTH and c["_norm"] in search_text:
+            return c["account_head"], c["parent_account_head"]
     return None, None
 
 
@@ -235,7 +307,6 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
                t.field_date_1  AS document_date,
                t.field_text_11 AS narration,
                t.field_text_17 AS account_number,
-               t.field_text_19 AS debit_credit,
                t.field_num_1   AS debit_amount,
                t.field_num_2   AS credit_amount,
                coalesce(h.name, rh.name, ih.name, t.field_text_5) AS head_name,
@@ -298,7 +369,7 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
             "BankName": bank_name,
             "EntryTypes": document_type,
             "Detail Link Ref Code": i,
-            "Debit/Credit": r["debit_credit"],
+            "Debit/Credit": _debit_or_credit(r["debit_amount"], r["credit_amount"]),
             "Account Head": account_head,
             "Parent Account Head": parent_account_head,
             "Debit Amount": r["debit_amount"],
