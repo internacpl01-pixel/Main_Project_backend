@@ -261,7 +261,10 @@ _TABLES = {
                     'debit_credit', 'payment_mode', 'payee_name', 'docno',
                     'invoice_no', 'business_unit', 'is_active', 'created_at',
                     'updated_at'],
-        'order_by': 'account_head',
+        # id, not account_head: the user wants the imported sheet's own row
+        # order preserved, and id is assigned in insertion order, which the
+        # import already inserts in the sheet's row order.
+        'order_by': 'id',
         'label_field': 'account_head',
     },
     'farvision_account_amb': {
@@ -290,7 +293,7 @@ _TABLES = {
                     'debit_credit', 'payment_mode', 'payee_name', 'docno',
                     'invoice_no', 'business_unit', 'is_active', 'created_at',
                     'updated_at'],
-        'order_by': 'account_head',
+        'order_by': 'id',
         'label_field': 'account_head',
     },
     'account_type': {
