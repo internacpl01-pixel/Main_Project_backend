@@ -5,9 +5,17 @@ a commit. Simpler than that one because nothing here is resolved against
 another master table -- every column is free text, copied from the sheet
 exactly as Farvision itself will read it back.
 
-'company' + 'account_head' is the natural key: a company keeps one ledger name
-per party, and importing a corrected sheet should update that party's row
-rather than add a second one next to it.
+One sheet, two tables: farvision_account_master_dpl and _amb each hold one
+company's chart of accounts, split by the sheet's own Company column so DPL
+and AMB rows never collide even when they happen to share an Account Head
+name. A row whose Company isn't recognised as DPL or AMB is reported as an
+error rather than guessed into either table.
+
+No duplicate checking: the user's real sheet legitimately repeats the same
+Account Head more than once per company, and every row is wanted as its own
+row rather than collapsed onto whatever's already in the table (confirmed
+with the user; the tables no longer have a UNIQUE(account_head) constraint
+for exactly this reason). Every valid row is a plain INSERT.
 """
 from __future__ import annotations
 
@@ -16,8 +24,10 @@ import re
 MAX_ROWS = 20000
 PREVIEW_ROWS = 25
 
+_TABLES = {"DPL": "farvision_account_master_dpl", "AMB": "farvision_account_master_amb"}
+
 _COLUMNS = [
-    "company", "account_head", "parent_account_head", "document_type",
+    "account_head", "parent_account_head", "document_type",
     "financial_year", "bank_name", "deduction_type", "description",
     "entry_types", "debit_credit", "payment_mode", "payee_name", "docno",
     "invoice_no", "business_unit",
@@ -78,20 +88,8 @@ async def analyse(conn, grid: list[list[str]]) -> dict:
         if i not in col_by_index and (header_row[i] or "").strip()
     })
 
-    existing = {(r["company"] or "", r["account_head"] or ""): r["id"]
-                for r in await conn.fetch(
-                    "SELECT id, company, account_head FROM farvision_account_master")}
-
-    # Keyed by (company, account_head) in row order, last one wins. A sheet
-    # this size legitimately repeats the same ledger name more than once --
-    # this is what surfaced it: two rows sharing a key both went into the same
-    # executemany batch and the database's own UNIQUE constraint (correctly)
-    # refused the second one. Collapsing here, the same way a re-imported
-    # sheet already collapses onto what's in the database, means the batch
-    # sent to the database never has two rows fighting over one key.
-    by_key: dict[tuple, dict] = {}
     errors = []
-    sheet_duplicate_count = 0
+    parsed = []
     for row_num, raw in enumerate(data_rows, start=2):
         values = {col: (raw[i] if i < len(raw) else None) or None
                   for i, col in col_by_index.items()}
@@ -99,56 +97,44 @@ async def analyse(conn, grid: list[list[str]]) -> dict:
         if not account_head:
             continue  # A wholly blank row, or one with no Account Head at all — not worth reporting as an error.
 
+        raw_company = (values.get("company") or "").strip()
+        company = raw_company.upper()
+
         problems = []
         if len(account_head) > 500:
             problems.append("Account Head is implausibly long")
+        if company not in _TABLES:
+            problems.append(
+                f'Company must be DPL or AMB, got "{raw_company or "(blank)"}"')
         if problems:
             errors.append({"row": row_num, "name": account_head, "problems": problems})
             continue
 
-        company = (values.get("company") or "").strip()
-        key = (company, account_head)
         entry = {"row": row_num, **{c: (values.get(c) or "").strip() or None for c in _COLUMNS}}
         entry["account_head"] = account_head
-        entry["company"] = company or None
-
-        if key in by_key:
-            sheet_duplicate_count += 1
-        by_key[key] = entry
-
-    parsed, duplicates = [], []
-    for key, entry in by_key.items():
-        if key in existing:
-            duplicates.append(entry)
-        else:
-            parsed.append(entry)
+        entry["company"] = company
+        parsed.append(entry)
 
     return {
         "total_rows": len(data_rows),
         "importable": len(parsed),
-        "duplicate_count": len(duplicates),
+        "duplicate_count": 0,
         "cross_company_count": 0,
-        "sheet_duplicate_count": sheet_duplicate_count,
+        "sheet_duplicate_count": 0,
         "error_count": len(errors),
         "unmapped_headers": unmapped,
-        "preview": (parsed + duplicates)[:PREVIEW_ROWS],
+        "preview": parsed[:PREVIEW_ROWS],
         "errors": errors[:PREVIEW_ROWS],
         "errors_truncated": len(errors) > PREVIEW_ROWS,
-        "duplicates": [{"row": d["row"], "name": d["account_head"],
-                        "account_number": d["company"]} for d in duplicates[:PREVIEW_ROWS]],
-        "duplicates_truncated": len(duplicates) > PREVIEW_ROWS,
+        "duplicates": [],
+        "duplicates_truncated": False,
         "_parsed": parsed,
-        "_duplicates": duplicates,
     }
 
 
-async def commit(conn, analysis: dict, on_duplicate: str) -> dict:
+async def commit(conn, analysis: dict, on_duplicate: str | None = None) -> dict:
     parsed = analysis["_parsed"]
-    duplicates = analysis["_duplicates"] if on_duplicate == "overwrite" else []
-    skipped = len(analysis["_duplicates"]) if on_duplicate != "overwrite" else 0
-
-    cols = ["company", "account_head"] + [c for c in _COLUMNS if c not in ("company", "account_head")]
-    update_cols = [c for c in cols if c not in ("company", "account_head")]
+    cols = _COLUMNS
 
     # executemany pipelines every row over one prepared statement instead of
     # one round trip to the database per row -- the difference between a
@@ -157,24 +143,13 @@ async def commit(conn, analysis: dict, on_duplicate: str) -> dict:
     # exactly the case that surfaced this: one execute() per row never
     # finished inside any reasonable request deadline.
     async with conn.transaction():
-        if parsed:
-            placeholders = ", ".join(f"${i+1}" for i in range(len(cols)))
-            await conn.executemany(
-                f"INSERT INTO farvision_account_master ({', '.join(cols)}) "
-                f"VALUES ({placeholders})",
-                [[entry.get(c) for c in cols] for entry in parsed],
-            )
+        for company, table in _TABLES.items():
+            rows = [e for e in parsed if e["company"] == company]
+            if rows:
+                placeholders = ", ".join(f"${i+1}" for i in range(len(cols)))
+                await conn.executemany(
+                    f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})",
+                    [[entry.get(c) for c in cols] for entry in rows],
+                )
 
-        if duplicates:
-            set_clause = ", ".join(f"{c} = ${i+3}" for i, c in enumerate(update_cols))
-            await conn.executemany(
-                f"UPDATE farvision_account_master SET {set_clause}, updated_at = now() "
-                f"WHERE company IS NOT DISTINCT FROM $1 AND account_head = $2",
-                [[entry.get("company"), entry.get("account_head"),
-                  *[entry.get(c) for c in update_cols]] for entry in duplicates],
-            )
-
-    inserted = len(parsed)
-    updated = len(duplicates)
-
-    return {"inserted": inserted, "updated": updated, "skipped": skipped}
+    return {"inserted": len(parsed), "updated": 0, "skipped": 0}

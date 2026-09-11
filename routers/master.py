@@ -223,23 +223,29 @@ _TABLES = {
         'order_by': 'name',
         'label_field': 'name',
     },
-    # The Farvision chart of accounts: Account Head / Parent Account Head and
-    # the other Farvision-specific columns, fuzzy-matched against a temp_trans
-    # row's narration by services.farvision to fill the export's Account Head
-    # and Parent Account Head. Free text throughout -- these are Farvision's
-    # own ledger names, not this company's Internal/RERA/TCP heads, so nothing
-    # here is chosen from another master.
-    'farvision_account': {
-        'label': 'Farvision Account',
-        'table': 'farvision_account_master',
+    # The Farvision chart of accounts, one table per company: DPL and AMB each
+    # keep their own ledger names, and the same Account Head text legitimately
+    # exists once in each -- a single shared table made that look like a
+    # duplicate the moment anyone browsed it without also reading a Company
+    # column. Two tables makes the distinction structural instead of
+    # something the UI has to explain. Nothing here is chosen from another
+    # master: these are Farvision's own party-level ledger names, not this
+    # company's Internal/RERA/TCP heads.
+    #
+    # Fuzzy-matched against a temp_trans row's narration by services.farvision
+    # (scoped to the row's own Company) to fill the export's Account Head and
+    # Parent Account Head.
+    'farvision_account_dpl': {
+        'label': 'Farvision Account (DPL)',
+        'table': 'farvision_account_master_dpl',
         'importable': True,
-        'fields': ['company', 'account_head', 'parent_account_head',
-                   'document_type', 'financial_year', 'bank_name',
-                   'deduction_type', 'description', 'entry_types',
-                   'debit_credit', 'payment_mode', 'payee_name', 'docno',
-                   'invoice_no', 'business_unit'],
+        'fields': ['account_head', 'parent_account_head', 'document_type',
+                   'financial_year', 'bank_name', 'deduction_type',
+                   'description', 'entry_types', 'debit_credit',
+                   'payment_mode', 'payee_name', 'docno', 'invoice_no',
+                   'business_unit'],
         'labels': {
-            'company': 'Company', 'account_head': 'Account Head',
+            'account_head': 'Account Head',
             'parent_account_head': 'Parent Account Head',
             'document_type': 'Document Type', 'financial_year': 'Financial Year',
             'bank_name': 'Bank Name', 'deduction_type': 'Deduction Type',
@@ -248,9 +254,37 @@ _TABLES = {
             'payee_name': 'Payee Name', 'docno': 'Docno',
             'invoice_no': 'Invoice No', 'business_unit': 'Business Unit',
         },
-        'unique': ['company', 'account_head'],
         'required': ['account_head'],
-        'columns': ['id', 'company', 'account_head', 'parent_account_head',
+        'columns': ['id', 'account_head', 'parent_account_head',
+                    'document_type', 'financial_year', 'bank_name',
+                    'deduction_type', 'description', 'entry_types',
+                    'debit_credit', 'payment_mode', 'payee_name', 'docno',
+                    'invoice_no', 'business_unit', 'is_active', 'created_at',
+                    'updated_at'],
+        'order_by': 'account_head',
+        'label_field': 'account_head',
+    },
+    'farvision_account_amb': {
+        'label': 'Farvision Account (AMB)',
+        'table': 'farvision_account_master_amb',
+        'importable': True,
+        'fields': ['account_head', 'parent_account_head', 'document_type',
+                   'financial_year', 'bank_name', 'deduction_type',
+                   'description', 'entry_types', 'debit_credit',
+                   'payment_mode', 'payee_name', 'docno', 'invoice_no',
+                   'business_unit'],
+        'labels': {
+            'account_head': 'Account Head',
+            'parent_account_head': 'Parent Account Head',
+            'document_type': 'Document Type', 'financial_year': 'Financial Year',
+            'bank_name': 'Bank Name', 'deduction_type': 'Deduction Type',
+            'description': 'Description', 'entry_types': 'EntryTypes',
+            'debit_credit': 'Debit/Credit', 'payment_mode': 'Payment Mode',
+            'payee_name': 'Payee Name', 'docno': 'Docno',
+            'invoice_no': 'Invoice No', 'business_unit': 'Business Unit',
+        },
+        'required': ['account_head'],
+        'columns': ['id', 'account_head', 'parent_account_head',
                     'document_type', 'financial_year', 'bank_name',
                     'deduction_type', 'description', 'entry_types',
                     'debit_credit', 'payment_mode', 'payee_name', 'docno',
@@ -534,16 +568,18 @@ async def import_beneficiaries(
 
 @router.delete("/farvision_account/all", dependencies=[Depends(require_manager)])
 async def delete_all_farvision_accounts(schema: str = Depends(get_current_schema)):
-    """Empty the Farvision account master, the same way beneficiary's does.
+    """Empty both Farvision account master tables, the same way beneficiary's does.
 
-    Nothing else references this table -- it exists only to answer the
+    Nothing else references these tables -- they exist only to answer the
     Farvision export's Account Head lookup -- so this is a plain DELETE with
-    no archive-instead-of-delete case to worry about.
+    no archive-instead-of-delete case to worry about. One button clears both
+    DPL and AMB, matching the single shared import.
     """
     async with company_connection(schema) as conn:
-        deleted = await conn.fetchval(
-            "WITH gone AS (DELETE FROM farvision_account_master RETURNING 1) "
-            "SELECT count(*) FROM gone")
+        deleted = 0
+        for table in ("farvision_account_master_dpl", "farvision_account_master_amb"):
+            deleted += await conn.fetchval(
+                f"WITH gone AS (DELETE FROM {table} RETURNING 1) SELECT count(*) FROM gone")
     logger.info("[master] %s: farvision_account cleared (%s rows) by request",
                schema, deleted)
     return {"deleted": deleted}
@@ -553,16 +589,16 @@ async def delete_all_farvision_accounts(schema: str = Depends(get_current_schema
 async def import_farvision_accounts(
     file: UploadFile = File(...),
     save: bool = Form(False, description="false previews, true writes"),
-    on_duplicate: str = Form(
-        "skip", description="skip | overwrite — rows whose Company AND Account "
-                            "Head already exist"),
     schema: str = Depends(get_current_schema),
 ):
     """Bulk-load the Farvision chart of accounts from an Excel or CSV sheet.
 
-    Same preview-then-commit shape as /master/beneficiary/import. Every column
-    is copied as free text -- there is nothing here to resolve against another
-    master, only a sheet to read.
+    Same preview-then-commit shape as /master/beneficiary/import, minus the
+    duplicate question: the user's real sheet legitimately repeats the same
+    Account Head more than once per company and wants every row inserted as
+    its own row, so this is a plain INSERT with no existing-row lookup. Every
+    column is copied as free text. One sheet, one import: each row's Company
+    column (DPL or AMB) routes it into the matching table.
     """
     name = (file.filename or "").lower()
     if name.endswith(".xlsx"):
@@ -592,7 +628,7 @@ async def import_farvision_accounts(
         if not save:
             return {k: v for k, v in analysis.items() if not k.startswith("_")}
 
-        result = await farvision_account_import.commit(conn, analysis, on_duplicate)
+        result = await farvision_account_import.commit(conn, analysis)
 
     return {
         **{k: v for k, v in analysis.items() if not k.startswith("_")},

@@ -11,14 +11,22 @@ resolved through custom_fields' label lookup: this feature is built for one
 company's Farvision layout, not a generic one, and the PDF spec named these
 physical columns already.
 
-Account Head / Parent Account Head are left blank for every row until the
-Farvision chart-of-accounts master (thousands of party-level ledger names) is
-imported and a fuzzy narration match is wired in against it -- there is
-nowhere else that answer can honestly come from yet.
+Account Head and Parent Account Head come from farvision_account_master_dpl or
+_amb, one table per company: the row's Narration (field_text_11, which
+already embeds "To: <party>" phrases) is searched for the longest Account
+Head string that appears in it, using only the table for the row's own
+Company -- DPL and AMB share this company_028 schema and each have their own
+ledger names, so matching against the wrong table could pick the wrong
+company's party of the same name. A row whose Company doesn't resolve to
+either table gets no match at all, rather than guessing. Parent Account Head
+and Payee Name simply come along with whichever Account Head matched. No
+match found means both stay blank rather than guessed.
 """
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from io import BytesIO
+
+from services import staging
 
 COLUMNS = [
     "Link Ref Code", "Business Unit", "Financial Year", "Document Type",
@@ -67,7 +75,41 @@ def _skip_document_type(head_name: str | None) -> bool:
     return n in ("CANCELLATION", "COLLECTION")
 
 
+_ACCOUNT_TABLES = {"DPL": "farvision_account_master_dpl", "AMB": "farvision_account_master_amb"}
+
+
+async def _account_head_candidates(conn, company: str | None) -> list[dict]:
+    """This company's Account Heads, longest name first.
+
+    Longest-first means the first substring hit while scanning in order is
+    also the most specific one -- the same reasoning the Rules engine uses:
+    a bare, generic head name should not win over one that actually names the
+    party. Looked up from the row's own company's table, so 'INTEREST' in
+    DPL's books cannot match an AMB row and vice versa. A company that isn't
+    DPL or AMB has no table to match against.
+    """
+    table = _ACCOUNT_TABLES.get((company or "").strip().upper())
+    if not table:
+        return []
+    rows = await conn.fetch(f"SELECT account_head, parent_account_head FROM {table}")
+    return sorted((dict(r) for r in rows), key=lambda r: -len(r["account_head"] or ""))
+
+
+def _match_account_head(narration: str | None, candidates: list[dict]) -> tuple[str | None, str | None]:
+    if not narration:
+        return None, None
+    upper = narration.upper()
+    for c in candidates:
+        head = c["account_head"]
+        if head and head.upper() in upper:
+            return head, c["parent_account_head"]
+    return None, None
+
+
 async def fetch_rows(conn, where: str, params: list) -> list[dict]:
+    company_col = await staging.company_column(conn)
+    company_select = f"t.{company_col} AS company," if company_col else "NULL AS company,"
+
     rows = await conn.fetch(
         f"""
         SELECT t.field_text_4  AS business_unit,
@@ -79,7 +121,9 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
                t.field_num_1   AS debit_amount,
                t.field_num_2   AS credit_amount,
                coalesce(h.name, rh.name, ih.name) AS head_name,
-               bm.bank_name AS bank_name
+               bm.bank_name AS bank_name,
+               {company_select}
+               t.id AS temp_trans_id
           FROM temp_trans t
           LEFT JOIN head_master      h  ON h.id  = t.head_id
           LEFT JOIN rera_head_master rh ON rh.id = t.rera_head_id
@@ -99,6 +143,11 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
         *params,
     )
 
+    # One candidate list per distinct company seen in this batch, fetched
+    # once rather than per row -- a batch is usually one bank account and
+    # therefore one company, but nothing here assumes that.
+    candidates_by_company: dict[str | None, list[dict]] = {}
+
     out = []
     for i, r in enumerate(rows, start=1):
         internal = _is_internal(r["head_name"])
@@ -112,7 +161,11 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
         if r["head_name"]:
             tds_description = _TDS_DESCRIPTION.get(r["head_name"].strip().upper())
 
-        amount = r["debit_amount"] if r["debit_amount"] else r["credit_amount"]
+        company = r["company"]
+        if company not in candidates_by_company:
+            candidates_by_company[company] = await _account_head_candidates(conn, company)
+        account_head, parent_account_head = _match_account_head(
+            r["narration"], candidates_by_company[company])
 
         out.append({
             "Link Ref Code": i,
@@ -126,19 +179,15 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
             "EntryTypes": document_type,
             "Detail Link Ref Code": i,
             "Debit/Credit": r["debit_credit"],
-            # Account Head / Parent Account Head: pending the Farvision chart
-            # of accounts master + narration fuzzy match. Left blank rather
-            # than guessed.
-            "Account Head": None,
-            "Parent Account Head": None,
+            "Account Head": account_head,
+            "Parent Account Head": parent_account_head,
             "Debit Amount": r["debit_amount"],
             "Credit Amount": r["credit_amount"],
             "Payment Mode": "Direct",
             "Cheque No": None,
             "Cheque Date": None,
             "Cheque Type": None,
-            # Mirrors Account Head once that is wired in.
-            "Payee Name": None,
+            "Payee Name": account_head,
             "Beneficiary": None,
             "Card Type": None,
             "Print Cheque": None,
@@ -163,9 +212,13 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
             "Invoice Date": r["document_date"],
             "Bill Amount": None,
             "Balance Amount": None,
-            # Adjustment Amount is skipped (left blank) when Parent Account
-            # Head is blank -- which it always is until the master lands.
-            "Adjustment Amount": None,
+            # Skipped when Parent Account Head is blank -- there is nothing to
+            # adjust against. Otherwise whichever of Debit/Credit is the row's
+            # real amount (only one of the two is ever set).
+            "Adjustment Amount": (
+                (r["debit_amount"] or r["credit_amount"])
+                if parent_account_head else None
+            ),
         })
     return out
 
