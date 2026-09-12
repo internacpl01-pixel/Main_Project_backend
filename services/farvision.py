@@ -152,6 +152,105 @@ _COLUMN_ALIASES = {
     "DepositWithdrawal Narration": "Narration",
 }
 
+# The Receipt Payment workbook's 6th tab: a flat, static reference table
+# (Sheet Name, Column Name, Property(ies)) describing every column across the
+# other 5 sheets, given verbatim by the user from the real Farvision Info
+# sheet -- confirmed as documentation only, not something the export checks
+# rows against (a follow-up question about enforcing these rules was
+# dismissed twice; the only instruction given was to build this exact
+# 3-column shape). Not derived from SHEETS -- the real sheet's own row order
+# doesn't match this file's, and a handful of columns here (BankName,
+# EntryTypes, ...) carry no properties at all.
+INFO_SHEET_ROWS: list[tuple[str, str, str]] = [
+    ("ReceiptPayment", "Link Ref Code", "Is Required : True"),
+    ("ReceiptPayment", "Business Unit", "Is Required : False;Min Length : 10;Max Length : 500"),
+    ("ReceiptPayment", "Financial Year", "Is Required : True;Min Length : 1;Max Length : 30"),
+    ("ReceiptPayment", "Document Type", "Is Required : True;Min Length : 1;Max Length : 30"),
+    ("ReceiptPayment", "Document Date", "Is Required : True;Min Length : 1;Max Length : 30"),
+    ("ReceiptPayment", "Document No", "Is Required : True;Min Length : 1;Max Length : 30"),
+    ("ReceiptPayment", "Narration", "Is Required : False;Min Length : 0;Max Length : 500"),
+    ("ReceiptPayment", "BankName", ""),
+    ("ReceiptPayment", "EntryTypes", ""),
+    ("ReceiptPaymentDetail", "Link Ref Code", "Is Required : True"),
+    ("ReceiptPaymentDetail", "Detail Link Ref Code", "Is Required : True"),
+    ("LedgerDetails", "Link Ref Code", "Is Required : True"),
+    ("LedgerDetails", "Detail Link Ref Code", "Is Required : True"),
+    ("LedgerDetails", "Business Unit", "Is Required : False;Min Length : 10;Max Length : 500"),
+    ("LedgerDetails", "Document Type", "Is Required : True;Min Length : 1;Max Length : 30"),
+    ("LedgerDetails", "Debit/Credit", "Is Required : True"),
+    ("LedgerDetails", "Account Head", "Is Required : True"),
+    ("LedgerDetails", "Parent Account Head", "Is Required : True"),
+    ("LedgerDetails", "Debit Amount", "Is Required : False"),
+    ("LedgerDetails", "Credit Amount", "Is Required : False"),
+    ("LedgerDetails", "Narration", ""),
+    ("LedgerDetails", "Payment Mode", "Is Required : True"),
+    ("LedgerDetails", "Cheque No", ""),
+    ("LedgerDetails", "Cheque Date", ""),
+    ("LedgerDetails", "Cheque Type", ""),
+    ("LedgerDetails", "Payee Name", "Is Required : True"),
+    ("LedgerDetails", "Beneficiary", "Is Required : False"),
+    ("LedgerDetails", "Card Type", ""),
+    ("LedgerDetails", "Print Cheque", "Is Required : False"),
+    ("LedgerDetails", "Sub Project", ""),
+    ("LedgerDetails", "Budget", ""),
+    ("LedgerDetails", "Zone", ""),
+    ("LedgerDetails", "Department", ""),
+    ("LedgerDetails", "Order", ""),
+    ("LedgerDetails", "Milestone", ""),
+    ("LedgerDetails", "Tower", ""),
+    ("LedgerDetails", "Segment", ""),
+    ("LedgerDetails", "Employee", ""),
+    ("LedgerDetails", "Employee Name", ""),
+    ("LedgerDetails", "Department Name", ""),
+    ("LedgerDetails", "Cost Center", ""),
+    ("LedgerDetails", "Purpose Of Payment", ""),
+    ("AdjustmentDetails", "Link Ref Code", "Is Required : True"),
+    ("AdjustmentDetails", "Detail Link Ref Code", "Is Required : True"),
+    ("AdjustmentDetails", "Docno", "Is Required : True"),
+    ("AdjustmentDetails", "Date", "Is Required : True"),
+    ("AdjustmentDetails", "Invoice No", "Is Required : False"),
+    ("AdjustmentDetails", "Invoice Date", "Is Required : False"),
+    ("AdjustmentDetails", "Bill Amount", ""),
+    ("AdjustmentDetails", "Balance Amount", ""),
+    ("AdjustmentDetails", "Adjustment Amount", "Is Required : True"),
+    ("ImportTaxInfo", "Link Ref Code", "Is Required : True"),
+    ("ImportTaxInfo", "Detail Link Ref Code", "Is Required : True"),
+    ("ImportTaxInfo", "Deduction Type", "Is Required : True"),
+    ("ImportTaxInfo", "Description", "Is Required : True"),
+]
+
+# The Deposit Withdrawal workbook's own 4th tab -- same idea as
+# INFO_SHEET_ROWS above (static reference data, given verbatim by the user),
+# scoped to DW_SHEETS's own columns and headers instead of Receipt Payment's.
+INFO_SHEET_ROWS_DW: list[tuple[str, str, str]] = [
+    ("DepositWithdrawal", "Link Ref Code", "Is Required : True"),
+    ("DepositWithdrawal", "DepositWithdrawal Business Unit",
+     "Is Required : False;Min Length : 10;Max Length : 500"),
+    ("DepositWithdrawal", "DepositWithdrawal Narration",
+     "Is Required : False;Min Length : 10;Max Length : 500"),
+    ("DepositWithdrawal", "Financial Year", "Is Required : True;Min Length : 1;Max Length : 30"),
+    ("DepositWithdrawal", "Document Type", "Is Required : True;Min Length : 1;Max Length : 30"),
+    ("DepositWithdrawal", "Document Date", "Is Required : True;Min Length : 1;Max Length : 30"),
+    ("DepositWithdrawal", "Document No", "Is Required : True;Min Length : 1;Max Length : 30"),
+    ("DepositWithdrawal", "BankName", ""),
+    ("DepositWithdrawal", "EntryTypes", ""),
+    ("DepositWithdrawalDetails", "Link Ref Code", "Is Required : True"),
+    ("LedgerDetails", "Link Ref Code", "Is Required : True"),
+    ("LedgerDetails", "Debit/Credit", "Is Required : True"),
+    ("LedgerDetails", "Account Head", "Is Required : True"),
+    ("LedgerDetails", "Parent Account Head", "Is Required : True"),
+    ("LedgerDetails", "Debit Amount", "Is Required : False"),
+    ("LedgerDetails", "Credit Amount", "Is Required : False"),
+    ("LedgerDetails", "Payment Mode", "Is Required : True"),
+    ("LedgerDetails", "Cheque No", ""),
+    ("LedgerDetails", "Cheque Date", ""),
+    ("LedgerDetails", "Cheque Type", ""),
+    ("LedgerDetails", "Payee Name", "Is Required : True"),
+    ("LedgerDetails", "Card Type", ""),
+    ("LedgerDetails", "Narration", ""),
+    ("LedgerDetails", "Print Cheque", "Is Required : False"),
+]
+
 # The full field list fetch_rows builds per row, independent of how to_xlsx_bytes
 # later splits it across sheets -- a deduplicated union of both workbooks'
 # sheets (aliases resolved to their real field) rather than a second
@@ -788,6 +887,19 @@ def to_xlsx_bytes(rows: list[dict], sheets: dict[str, list[str]] = SHEETS) -> by
                     if cell.value is not None:
                         cell.number_format = "DD-MM-YYYY"
             ws.column_dimensions[letter].width = 12 if name in _DATE_COLUMNS else max(len(name) + 2, 10)
+
+    # Info is a 6th tab on the Receipt Payment workbook only -- confirmed
+    # with the user -- static reference data with nothing to do with the
+    # rows being exported, so it never appears on the Deposit Withdrawal one.
+    info_rows = INFO_SHEET_ROWS if sheets is SHEETS else INFO_SHEET_ROWS_DW if sheets is DW_SHEETS else None
+    if info_rows is not None:
+        info_columns = ["Sheet Name", "Column Name", "Property(ies)"]
+        ws = wb.create_sheet("Info")
+        ws.append(info_columns)
+        for sheet_name, column_name, properties in info_rows:
+            ws.append([sheet_name, column_name, properties])
+        for i, name in enumerate(info_columns, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = max(len(name) + 2, 20)
 
     buf = BytesIO()
     wb.save(buf)
