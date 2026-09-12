@@ -89,18 +89,42 @@ from io import BytesIO
 
 from services import staging
 
-COLUMNS = [
-    "Link Ref Code", "Business Unit", "Financial Year", "Document Type",
-    "Document Date", "Document No", "Narration", "BankName", "EntryTypes",
-    "Detail Link Ref Code", "Debit/Credit", "Account Head",
-    "Parent Account Head", "Debit Amount", "Credit Amount", "Payment Mode",
-    "Cheque No", "Cheque Date", "Cheque Type", "Payee Name", "Beneficiary",
-    "Card Type", "Print Cheque", "Sub Project", "Budget", "Zone",
-    "Department", "Order", "Milestone", "Tower", "Segment", "Employee",
-    "Employee Name", "Department Name", "Cost Center", "Purpose Of Payment",
-    "Deduction Type", "Description", "Docno", "Date", "Invoice No",
-    "Invoice Date", "Bill Amount", "Balance Amount", "Adjustment Amount",
-]
+# The real Farvision workbook is 6 sheets, not one flat one -- confirmed with
+# the user from a screenshot of the real tab bar (ReceiptPayment,
+# ReceiptPaymentDetail, LedgerDetails, ImportTaxInfo, AdjustmentDetails,
+# Info). Info is deferred -- its columns haven't been given yet -- so only
+# the first 5 are built here. Link Ref Code / Detail Link Ref Code are the
+# join keys tying one logical row's sheets back together; both are just the
+# row's own sequence number (see fetch_rows), so every sheet's Nth data row
+# is the same source row. A handful of fields (Business Unit, Document Type,
+# Narration) legitimately appear on more than one sheet -- confirmed against
+# the user's own column lists for each sheet, not an accidental duplicate.
+SHEETS: dict[str, list[str]] = {
+    "ReceiptPayment": [
+        "Link Ref Code", "Business Unit", "Financial Year", "Document Type",
+        "Document Date", "Document No", "Narration", "BankName", "EntryTypes",
+    ],
+    "ReceiptPaymentDetail": ["Link Ref Code", "Detail Link Ref Code"],
+    "LedgerDetails": [
+        "Link Ref Code", "Detail Link Ref Code", "Business Unit", "Document Type",
+        "Debit/Credit", "Account Head", "Parent Account Head", "Debit Amount",
+        "Credit Amount", "Narration", "Payment Mode", "Cheque No", "Cheque Date",
+        "Cheque Type", "Payee Name", "Beneficiary", "Card Type", "Print Cheque",
+        "Sub Project", "Budget", "Zone", "Department", "Order", "Milestone",
+        "Tower", "Segment", "Employee", "Employee Name", "Department Name",
+        "Cost Center", "Purpose Of Payment",
+    ],
+    "ImportTaxInfo": ["Link Ref Code", "Detail Link Ref Code", "Deduction Type", "Description"],
+    "AdjustmentDetails": [
+        "Link Ref Code", "Detail Link Ref Code", "Docno", "Date", "Invoice No",
+        "Invoice Date", "Bill Amount", "Balance Amount", "Adjustment Amount",
+    ],
+}
+
+# The full field list fetch_rows builds per row, independent of how to_xlsx_bytes
+# later splits it across sheets -- a deduplicated union of SHEETS rather than a
+# second hand-written list, so the two can never drift apart.
+COLUMNS = list(dict.fromkeys(col for cols in SHEETS.values() for col in cols))
 
 # Head name (upper-cased, trimmed) -> TDS Description. Only heads confirmed by
 # the user; everything else stays blank rather than guessed.
@@ -614,22 +638,25 @@ _DATE_COLUMNS = {"Document Date", "Date", "Invoice Date"}
 
 def to_xlsx_bytes(rows: list[dict]) -> bytes:
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Farvision"
-    ws.append(COLUMNS)
-    for row in rows:
-        ws.append([row.get(col) for col in COLUMNS])
+    wb.remove(wb.active)  # the default blank sheet every new Workbook starts with
 
-    # A date cell shows ##### when the column is narrower than its format
-    # needs, not when the value is wrong -- Excel's default datetime format is
-    # wider than the DD-MM-YYYY this only needs, so both are fixed together.
-    for i, name in enumerate(COLUMNS, start=1):
-        letter = get_column_letter(i)
-        if name in _DATE_COLUMNS:
-            for cell in ws[letter][1:]:
-                if cell.value is not None:
-                    cell.number_format = "DD-MM-YYYY"
-        ws.column_dimensions[letter].width = 12 if name in _DATE_COLUMNS else max(len(name) + 2, 10)
+    for sheet_name, columns in SHEETS.items():
+        ws = wb.create_sheet(sheet_name)
+        ws.append(columns)
+        for row in rows:
+            ws.append([row.get(col) for col in columns])
+
+        # A date cell shows ##### when the column is narrower than its format
+        # needs, not when the value is wrong -- Excel's default datetime
+        # format is wider than the DD-MM-YYYY this only needs, so both are
+        # fixed together.
+        for i, name in enumerate(columns, start=1):
+            letter = get_column_letter(i)
+            if name in _DATE_COLUMNS:
+                for cell in ws[letter][1:]:
+                    if cell.value is not None:
+                        cell.number_format = "DD-MM-YYYY"
+            ws.column_dimensions[letter].width = 12 if name in _DATE_COLUMNS else max(len(name) + 2, 10)
 
     buf = BytesIO()
     wb.save(buf)
