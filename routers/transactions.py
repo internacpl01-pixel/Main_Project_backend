@@ -1339,16 +1339,23 @@ async def farvision_verify_rows(
         )
         rows = await farvision.fetch_rows(conn, where, params)
 
-    return [
-        {
-            "id": r["_temp_trans_id"],
-            "narration": r["Narration"],
-            "account_head": r["Account Head"],
-            "matched": r["_account_head_matched"],
-            "options": r["_account_head_options"],
-        }
-        for r in rows
-    ]
+    # Every Farvision export column, not just Narration/Account Head --
+    # confirmed with the user: this page reviews the row the export will
+    # actually write, so it should look like that row, not a narrow summary
+    # of it. "columns" is the same fixed order to_xlsx_bytes builds from, so
+    # the page can render a table without guessing an order of its own.
+    return {
+        "columns": farvision.COLUMNS,
+        "rows": [
+            {
+                "id": r["_temp_trans_id"],
+                "matched": r["_account_head_matched"],
+                "options": r["_account_head_options"],
+                **{col: r.get(col) for col in farvision.COLUMNS},
+            }
+            for r in rows
+        ],
+    }
 
 
 @router.post("/temp-trans/farvision-verify/resolve")
