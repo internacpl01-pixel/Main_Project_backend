@@ -319,7 +319,13 @@ def _match_internal_account_head(
     numbers = {n for n in numbers if len(n) >= 6}
     by_number = {b for n in numbers for b in bank_names if n in re.sub(r"\D", "", b)}
     if len(by_number) == 1:
-        return next(iter(by_number)), None
+        # A confident match still gets an options list -- not used to decide
+        # this row, but there for the Farvision Verify page's "Not correct?"
+        # override, confirmed with the user: matching isn't infallible, and a
+        # confident row should still be correctable without hunting through
+        # every bank name by hand.
+        head = next(iter(by_number))
+        return head, (_closest_matches(desc_text, bank_names) or [head])
     if len(by_number) > 1:
         return None, sorted(by_number)
 
@@ -331,7 +337,8 @@ def _match_internal_account_head(
     if by_code:
         return None, sorted(by_code)
 
-    return None, sorted(bank_names)
+    closest = _closest_matches(desc_text, bank_names)
+    return None, (closest or sorted(bank_names))
 
 
 _ACCOUNT_TABLES = {"DPL": "farvision_account_master_dpl", "AMB": "farvision_account_master_amb"}
@@ -414,6 +421,40 @@ def _normalize_party_name(text: str | None) -> str:
             w = w[:-1]
         out.append(w)
     return " ".join(out)
+
+
+# Below this length, a normalized word is too generic to count as a shared
+# keyword between DESC and a candidate -- the same reasoning as
+# _MIN_MATCH_LENGTH below, just applied per-word instead of to a whole
+# candidate name.
+_KEYWORD_MIN_LEN = 4
+
+
+def _closest_matches(desc_text: str | None, texts: list[str], limit: int = 20) -> list[str]:
+    """Candidates ranked by how many 4+ letter normalized words they share
+    with DESC, most shared first -- confirmed with the user as the general
+    fallback for a "Not correct?" override, a genuinely blank row, or any
+    residual ambiguity: not the full ~7,900-row master, not free-text search,
+    just whichever entries actually look related to this row's own bank
+    text. Ties keep the shorter (more specific) text first; the list is
+    capped so a common word shared by hundreds of entries doesn't produce an
+    unusably long dropdown.
+    """
+    desc_words = {w for w in _normalize_party_name(desc_text).split() if len(w) >= _KEYWORD_MIN_LEN}
+    if not desc_words:
+        return []
+    scored = []
+    seen = set()
+    for text in texts:
+        if text in seen:
+            continue
+        words = {w for w in _normalize_party_name(text).split() if len(w) >= _KEYWORD_MIN_LEN}
+        overlap = len(desc_words & words)
+        if overlap:
+            scored.append((overlap, len(text), text))
+            seen.add(text)
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [text for _, _, text in scored[:limit]]
 
 
 # Below this normalized length, a head name is too generic to trust as a
@@ -534,13 +575,25 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
         company = r["company"]
         bank_name = _match_bank_name(r["account_number"], bank_name_candidates) or r["bank_name"]
 
+        # The pool a "Not correct?" override or a blank row picks from: the
+        # Farvision Bank Names for an Internal transfer, this company's
+        # Account Heads otherwise -- the same universe each row's own
+        # matching already searches.
+        if internal:
+            pool = bank_name_candidates
+        else:
+            if company not in candidates_by_company:
+                candidates_by_company[company] = await _account_head_candidates(conn, company)
+            pool = [c["account_head"] for c in candidates_by_company[company]]
+
+        account_head_options = None
+
         if r["account_head_override"]:
             # Resolved for good on the Farvision Verify page -- always wins
             # over re-matching, confirmed with the user, so a batch already
             # reviewed once stays resolved on every later export.
             account_head = r["account_head_override"]
             parent_account_head = r["parent_account_head_override"]
-            account_head_options = None
         elif internal:
             # A transfer between the company's own bank accounts has no
             # external party at all -- Account Head is the specific bank
@@ -552,8 +605,6 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
                 r["desc_text"], bank_name_candidates, bank_short_codes)
             parent_account_head = None
         else:
-            if company not in candidates_by_company:
-                candidates_by_company[company] = await _account_head_candidates(conn, company)
             if company not in dup_options_by_company:
                 dup_options_by_company[company] = await _duplicate_options_map(conn, company)
             account_head, parent_account_head = _match_account_head(
@@ -561,8 +612,8 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
 
             # A match that landed on a head with known duplicates ("India
             # Pride Com" / "INDIA PRIDE.COM") is left blank rather than
-            # guessed -- the sheet gets a dropdown of every spelling in the
-            # group instead (built in to_xlsx_bytes), confirmed with the user.
+            # guessed -- the Farvision Verify page offers every spelling in
+            # the group instead, confirmed with the user.
             account_head_options = dup_options_by_company[company].get(account_head)
             if account_head_options:
                 # Parent Account Head can differ between spellings in the
@@ -572,11 +623,29 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
                 account_head = None
                 parent_account_head = None
 
+        # Whenever there's no strict ambiguous list already (a confident
+        # match that still deserves a "Not correct?" override, or a
+        # genuinely blank row with no duplicate/number/code signal at all),
+        # fall back to the closest keyword matches against DESC -- confirmed
+        # with the user as the general answer, rather than either free-text
+        # search or the full company-wide master. A row with no keyword
+        # overlap at all (an already-resolved row's override text rarely
+        # echoes its own DESC, for one) still gets the full pool rather than
+        # an empty dropdown with nothing to re-pick from.
+        if not account_head_options:
+            account_head_options = _closest_matches(r["desc_text"], pool) or sorted(pool)
+
+        # Whether this row needs a decision on the Farvision Verify page, or
+        # is only offered for an optional "Not correct?" override -- the page
+        # shows every row either way, confirmed with the user.
+        account_head_matched = account_head is not None
+
         out.append({
             # Not real columns -- to_xlsx_bytes only ever reads COLUMNS, so
             # these ride along harmlessly for callers that want them (the
-            # Farvision Verify endpoint, to find which rows need a decision).
+            # Farvision Verify endpoint, to show every row's current state).
             "_temp_trans_id": r["temp_trans_id"],
+            "_account_head_matched": account_head_matched,
             "_account_head_options": account_head_options,
             "Link Ref Code": i,
             "Business Unit": _format_business_unit(r["business_unit"]),

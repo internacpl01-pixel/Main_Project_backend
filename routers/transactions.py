@@ -1318,9 +1318,13 @@ async def farvision_verify_rows(
     rule_conflicts: str = Query(None),
     user: dict = Depends(get_company_user),
 ):
-    """The rows export-farvision's own filters would include, but whose
-    Account Head is still ambiguous -- a duplicate spelling, or (for an
-    Internal transfer) more than one candidate bank account.
+    """Every row export-farvision's own filters would include, with its
+    current Account Head and a list of alternatives to review or correct --
+    confirmed with the user, the same shape as the Check Rules dialog: every
+    row is shown, a confident match is just text with a "Not correct?"
+    override, and a row with no confident match (blank, or genuinely
+    ambiguous -- a duplicate spelling, or for an Internal transfer more than
+    one candidate bank account) gets its dropdown right away.
 
     Takes the exact same filters as export-farvision, for the same reason
     that endpoint takes the Imported Rows table's own filters: the Farvision
@@ -1339,9 +1343,11 @@ async def farvision_verify_rows(
         {
             "id": r["_temp_trans_id"],
             "narration": r["Narration"],
+            "account_head": r["Account Head"],
+            "matched": r["_account_head_matched"],
             "options": r["_account_head_options"],
         }
-        for r in rows if r["_account_head_options"]
+        for r in rows
     ]
 
 
