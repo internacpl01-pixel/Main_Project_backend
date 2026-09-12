@@ -121,10 +121,47 @@ SHEETS: dict[str, list[str]] = {
     ],
 }
 
+# The Deposit Withdrawal export -- a separate workbook, not another tab in
+# the Receipt Payment one, confirmed with the user: same underlying rows,
+# but only the ones whose Document Type is "Deposit/withdrawal" (Internal
+# transfers, see filter_deposit_withdrawal), with their own 3-sheet shape and
+# some of their own column headers (DepositWithdrawal Business Unit /
+# DepositWithdrawal Narration) even though the value behind them is exactly
+# the same Business Unit / Narration a Receipt Payment row would show --
+# _COLUMN_ALIASES is what makes a renamed header still pull the right field.
+DW_SHEETS: dict[str, list[str]] = {
+    "DepositWithdrawal": [
+        "Link Ref Code", "DepositWithdrawal Business Unit",
+        "DepositWithdrawal Narration", "Financial Year", "Document Type",
+        "Document Date", "Document No", "BankName", "EntryTypes",
+    ],
+    "DepositWithdrawalDetails": ["Link Ref Code"],
+    "LedgerDetails": [
+        "Link Ref Code", "Debit/Credit", "Account Head", "Parent Account Head",
+        "Debit Amount", "Credit Amount", "Payment Mode", "Cheque No",
+        "Cheque Date", "Cheque Type", "Payee Name", "Card Type", "Narration",
+        "Print Cheque",
+    ],
+}
+
+# Sheet-header text -> the row field it actually reads, for the handful of
+# Deposit Withdrawal headers that are relabeled rather than renamed data.
+# Anything not listed here reads its own name, in both workbooks.
+_COLUMN_ALIASES = {
+    "DepositWithdrawal Business Unit": "Business Unit",
+    "DepositWithdrawal Narration": "Narration",
+}
+
 # The full field list fetch_rows builds per row, independent of how to_xlsx_bytes
-# later splits it across sheets -- a deduplicated union of SHEETS rather than a
-# second hand-written list, so the two can never drift apart.
-COLUMNS = list(dict.fromkeys(col for cols in SHEETS.values() for col in cols))
+# later splits it across sheets -- a deduplicated union of both workbooks'
+# sheets (aliases resolved to their real field) rather than a second
+# hand-written list, so nothing here can drift out of step with SHEETS/DW_SHEETS.
+COLUMNS = list(dict.fromkeys(
+    _COLUMN_ALIASES.get(col, col)
+    for sheets in (SHEETS, DW_SHEETS)
+    for cols in sheets.values()
+    for col in cols
+))
 
 # Head name (upper-cased, trimmed) -> TDS Description. Only heads confirmed by
 # the user; everything else stays blank rather than guessed.
@@ -705,15 +742,40 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
 _DATE_COLUMNS = {"Document Date", "Date", "Invoice Date"}
 
 
-def to_xlsx_bytes(rows: list[dict]) -> bytes:
+def _renumbered(rows: list[dict]) -> list[dict]:
+    """Link Ref Code / Detail Link Ref Code, reassigned 1..N for this subset.
+
+    Each export is its own workbook containing only its own rows, so the
+    join key should read as a clean sequence for that file -- confirmed with
+    the user's own Receipt Payment / Deposit Withdrawal split -- rather than
+    keeping the gaps left by whichever rows the other export took.
+    """
+    out = []
+    for i, row in enumerate(rows, start=1):
+        r = dict(row)
+        r["Link Ref Code"] = i
+        r["Detail Link Ref Code"] = i
+        out.append(r)
+    return out
+
+
+def filter_receipt_payment(rows: list[dict]) -> list[dict]:
+    return _renumbered([r for r in rows if r["Document Type"] == "Payment/Reciept"])
+
+
+def filter_deposit_withdrawal(rows: list[dict]) -> list[dict]:
+    return _renumbered([r for r in rows if r["Document Type"] == "Deposit/withdrawal"])
+
+
+def to_xlsx_bytes(rows: list[dict], sheets: dict[str, list[str]] = SHEETS) -> bytes:
     wb = Workbook()
     wb.remove(wb.active)  # the default blank sheet every new Workbook starts with
 
-    for sheet_name, columns in SHEETS.items():
+    for sheet_name, columns in sheets.items():
         ws = wb.create_sheet(sheet_name)
         ws.append(columns)
         for row in rows:
-            ws.append([row.get(col) for col in columns])
+            ws.append([row.get(_COLUMN_ALIASES.get(col, col)) for col in columns])
 
         # A date cell shows ##### when the column is narrower than its format
         # needs, not when the value is wrong -- Excel's default datetime

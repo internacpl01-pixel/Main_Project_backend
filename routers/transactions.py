@@ -1267,8 +1267,17 @@ async def list_temp_trans(
     }
 
 
+_EXPORT_KINDS = {
+    "receipt_payment": (
+        farvision.filter_receipt_payment, farvision.SHEETS, "farvision_receipt_payment.xlsx"),
+    "deposit_withdrawal": (
+        farvision.filter_deposit_withdrawal, farvision.DW_SHEETS, "farvision_deposit_withdrawal.xlsx"),
+}
+
+
 @router.get("/temp-trans/export-farvision")
 async def export_farvision(
+    kind: str = Query("receipt_payment", description="receipt_payment or deposit_withdrawal"),
     batch_id: int = None,
     classified: bool = None,
     date_from: str = Query(None),
@@ -1286,10 +1295,16 @@ async def export_farvision(
     can never disagree -- filter down to one batch or one account first, then
     export, the same way the table itself is narrowed.
 
-    Account Head and Parent Account Head are blank in every row for now: they
-    depend on a Farvision chart-of-accounts master (fuzzy-matched against the
-    narration) that has not been imported yet.
+    kind picks one of two separate workbooks over that same filtered set --
+    confirmed with the user: Receipt Payment (the original 5-sheet shape) for
+    rows whose Document Type is "Payment/Reciept", or Deposit Withdrawal (its
+    own 3-sheet shape) for the "Deposit/withdrawal" rows -- never both kinds
+    of row in the same file.
     """
+    if kind not in _EXPORT_KINDS:
+        raise HTTPException(400, f"kind must be one of {sorted(_EXPORT_KINDS)}.")
+    filter_fn, sheets, filename = _EXPORT_KINDS[kind]
+
     async with company_connection(user["schema"]) as conn:
         where, params, _columns, _term, _idx = await _temp_filters(
             conn, user, batch_id=batch_id, classified=classified,
@@ -1298,11 +1313,11 @@ async def export_farvision(
         )
         rows = await farvision.fetch_rows(conn, where, params)
 
-    content = farvision.to_xlsx_bytes(rows)
+    content = farvision.to_xlsx_bytes(filter_fn(rows), sheets)
     return StreamingResponse(
         iter([content]),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": 'attachment; filename="farvision_export.xlsx"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
