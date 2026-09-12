@@ -1306,6 +1306,78 @@ async def export_farvision(
     )
 
 
+@router.get("/temp-trans/farvision-verify")
+async def farvision_verify_rows(
+    batch_id: int = None,
+    classified: bool = None,
+    date_from: str = Query(None),
+    date_to: str = Query(None),
+    account: str = Query(None),
+    company: str = Query(None),
+    search: str = Query(""),
+    rule_conflicts: str = Query(None),
+    user: dict = Depends(get_company_user),
+):
+    """The rows export-farvision's own filters would include, but whose
+    Account Head is still ambiguous -- a duplicate spelling, or (for an
+    Internal transfer) more than one candidate bank account.
+
+    Takes the exact same filters as export-farvision, for the same reason
+    that endpoint takes the Imported Rows table's own filters: the Farvision
+    Verify page is a review step in front of that export, so what it reviews
+    and what gets downloaded have to be the same set.
+    """
+    async with company_connection(user["schema"]) as conn:
+        where, params, _columns, _term, _idx = await _temp_filters(
+            conn, user, batch_id=batch_id, classified=classified,
+            date_from=date_from, date_to=date_to, account=account,
+            company=company, search=search, rule_conflicts=rule_conflicts,
+        )
+        rows = await farvision.fetch_rows(conn, where, params)
+
+    return [
+        {
+            "id": r["_temp_trans_id"],
+            "narration": r["Narration"],
+            "options": r["_account_head_options"],
+        }
+        for r in rows if r["_account_head_options"]
+    ]
+
+
+@router.post("/temp-trans/farvision-verify/resolve")
+async def farvision_verify_resolve(
+    id: int = Body(...),
+    account_head: str = Body(...),
+    user: dict = Depends(get_company_user),
+):
+    """Pick one option for an ambiguous row on the Farvision Verify page.
+
+    Written straight onto the temp_trans row (farvision_account_head_override
+    / _parent_account_head_override) so it is resolved for good -- confirmed
+    with the user -- rather than only for the export about to run. Parent
+    Account Head is looked up server-side from whichever company table
+    matches account_head exactly, rather than trusted from the client; a
+    bank name (the Internal-row case) matches neither table and correctly
+    ends up with no Parent.
+    """
+    async with company_connection(user["schema"]) as conn:
+        parent_account_head = await farvision.lookup_parent_account_head(conn, account_head)
+        updated = await conn.fetchval(
+            """
+            UPDATE temp_trans
+               SET farvision_account_head_override = $1,
+                   farvision_parent_account_head_override = $2
+             WHERE id = $3
+         RETURNING id
+            """,
+            account_head, parent_account_head, id,
+        )
+    if updated is None:
+        raise HTTPException(404, f"No staged row with id={id}.")
+    return {"id": id, "account_head": account_head, "parent_account_head": parent_account_head}
+
+
 @router.get("/temp-trans/filters")
 async def temp_trans_filter_options(user: dict = Depends(get_company_user)):
     """The values the Date, Account Number and Company filters can offer.

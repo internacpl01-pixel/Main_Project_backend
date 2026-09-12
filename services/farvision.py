@@ -71,15 +71,20 @@ back to the old temp_trans-derived value.
 The same real Account Head sometimes got typed twice with different
 formatting ("India Pride Com" vs "INDIA PRIDE.COM") -- confirmed live across
 ~16,000 rows, hundreds of such pairs exist. Rather than guessing which
-spelling is "right", a match that lands on one of these is left blank in the
-export and given an in-Excel dropdown listing every spelling instead (see
-_duplicate_options_map and to_xlsx_bytes's _add_account_head_dropdowns).
+spelling is "right", a match that lands on one of these is left ambiguous
+(see _duplicate_options_map / _match_internal_account_head's own dropdown
+cases). Resolving it no longer happens in Excel -- confirmed with the user
+after an in-Excel dropdown proved easy to miss -- but on a "Farvision
+Verify" page in the app (routers.transactions's /farvision-verify
+endpoints), which writes the chosen text back onto that temp_trans row
+(farvision_account_head_override / farvision_parent_account_head_override,
+company/037_farvision_account_master.sql's sibling migration 044). Once set,
+an override always wins over re-matching -- see fetch_rows.
 """
 import re
 
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.datavalidation import DataValidation
 from io import BytesIO
 
 from services import staging
@@ -423,6 +428,25 @@ def _match_account_head(desc_text: str | None, candidates: list[dict]) -> tuple[
     return None, None
 
 
+async def lookup_parent_account_head(conn, account_head: str) -> str | None:
+    """The Parent Account Head that goes with an exact Account Head text.
+
+    Used when the Farvision Verify page resolves an ambiguous row: the
+    dropdown there only offers plain Account Head strings (same shape as the
+    old Excel dropdown), so the matching Parent has to be looked up
+    separately at save time rather than trusted from the client. Tries both
+    company tables since the caller does not necessarily know which one the
+    chosen text came from -- a bank name (the Internal-row case) matches
+    neither table and correctly returns None.
+    """
+    for table in _ACCOUNT_TABLES.values():
+        row = await conn.fetchrow(
+            f"SELECT parent_account_head FROM {table} WHERE account_head = $1", account_head)
+        if row:
+            return row["parent_account_head"]
+    return None
+
+
 async def fetch_rows(conn, where: str, params: list) -> list[dict]:
     company_col = await staging.company_column(conn)
     company_select = f"t.{company_col} AS company," if company_col else "NULL AS company,"
@@ -439,6 +463,8 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
                t.field_num_2   AS credit_amount,
                coalesce(h.name, rh.name, ih.name, t.field_text_5) AS head_name,
                bm.bank_name AS bank_name,
+               t.farvision_account_head_override AS account_head_override,
+               t.farvision_parent_account_head_override AS parent_account_head_override,
                {company_select}
                t.id AS temp_trans_id
           FROM temp_trans t
@@ -484,7 +510,14 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
         company = r["company"]
         bank_name = _match_bank_name(r["account_number"], bank_name_candidates) or r["bank_name"]
 
-        if internal:
+        if r["account_head_override"]:
+            # Resolved for good on the Farvision Verify page -- always wins
+            # over re-matching, confirmed with the user, so a batch already
+            # reviewed once stays resolved on every later export.
+            account_head = r["account_head_override"]
+            parent_account_head = r["parent_account_head_override"]
+            account_head_options = None
+        elif internal:
             # A transfer between the company's own bank accounts has no
             # external party at all -- Account Head is the specific bank
             # account on the other side of the transfer instead, confirmed
@@ -516,8 +549,10 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
                 parent_account_head = None
 
         out.append({
-            # Not a real column -- read by to_xlsx_bytes to add a dropdown on
-            # this row's Account Head cell, then dropped before writing.
+            # Not real columns -- to_xlsx_bytes only ever reads COLUMNS, so
+            # these ride along harmlessly for callers that want them (the
+            # Farvision Verify endpoint, to find which rows need a decision).
+            "_temp_trans_id": r["temp_trans_id"],
             "_account_head_options": account_head_options,
             "Link Ref Code": i,
             "Business Unit": _format_business_unit(r["business_unit"]),
@@ -596,47 +631,6 @@ def to_xlsx_bytes(rows: list[dict]) -> bytes:
                     cell.number_format = "DD-MM-YYYY"
         ws.column_dimensions[letter].width = 12 if name in _DATE_COLUMNS else max(len(name) + 2, 10)
 
-    _add_account_head_dropdowns(wb, ws, rows)
-
     buf = BytesIO()
     wb.save(buf)
     return buf.getvalue()
-
-
-def _add_account_head_dropdowns(wb, ws, rows: list[dict]) -> None:
-    """Give a row's Account Head cell an in-Excel dropdown when the match was
-    ambiguous between duplicate spellings, instead of guessing one.
-
-    Options for the same duplicate group are shared across every row that
-    hit it, so a group used by hundreds of rows still only writes one helper
-    column and one DataValidation, added once and referenced by every
-    matching cell. Excel's list-validation formula1 has to point at real
-    cells rather than an inline literal list -- an Account Head can contain
-    commas, and the combined text can exceed the 255-char inline limit -- so
-    the option strings go on a hidden helper sheet instead.
-    """
-    account_head_col = get_column_letter(COLUMNS.index("Account Head") + 1)
-    cells_by_options: dict[tuple, list[str]] = {}
-    for row_index, row in enumerate(rows, start=2):
-        options = row.get("_account_head_options")
-        if options:
-            cells_by_options.setdefault(tuple(options), []).append(
-                f"{account_head_col}{row_index}")
-
-    if not cells_by_options:
-        return
-
-    helper = wb.create_sheet("AccountHeadOptions")
-    helper.sheet_state = "hidden"
-    for col_idx, (options, cell_refs) in enumerate(cells_by_options.items(), start=1):
-        col_letter = get_column_letter(col_idx)
-        for opt_row, option in enumerate(options, start=1):
-            helper.cell(row=opt_row, column=col_idx, value=option)
-        dv = DataValidation(
-            type="list",
-            formula1=f"AccountHeadOptions!${col_letter}$1:${col_letter}${len(options)}",
-            allow_blank=True,
-        )
-        ws.add_data_validation(dv)
-        for ref in cell_refs:
-            dv.add(ref)
