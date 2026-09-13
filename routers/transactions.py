@@ -1363,6 +1363,7 @@ async def export_farvision(
     )
 
     async def _runner():
+        jobs.set_state(job_id, jobs.PARSING, "Building the Farvision workbook...")
         try:
             content, filename = await _build_farvision_export(
                 schema=user["schema"], user=user, kind=kind, batch_id=batch_id,
