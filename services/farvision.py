@@ -101,7 +101,15 @@ from services import staging
 # there's nothing here a dict can't hold. Keyed by (schema, kind[, company])
 # rather than by company alone, since two companies' schemas could otherwise
 # collide on the same bank_master/farvision_bank_name_master data.
-_CACHE_TTL_SECONDS = 60
+#
+# The real defense against stale data is invalidate_cache() below, called
+# from every write path in routers.master -- a save is visible on the very
+# next request regardless of this TTL. This is only the fallback for a write
+# that reaches these tables some other way (a direct SQL edit, a future write
+# path that forgets to invalidate), so it can be generous: an hour, not a
+# minute, confirmed with the user as an acceptable worst-case staleness
+# window given how rarely this data changes.
+_CACHE_TTL_SECONDS = 3600
 _candidate_cache: dict[tuple, tuple[float, object]] = {}
 
 
