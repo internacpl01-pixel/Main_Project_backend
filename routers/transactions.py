@@ -14,6 +14,8 @@ Both list endpoints are paged and searchable, and both return
 on every render, which was fine at a few hundred and is not at a few hundred
 thousand — one statement import is several hundred rows on its own.
 """
+import asyncio
+import base64
 import logging
 import re
 
@@ -24,7 +26,7 @@ import permissions
 from database import company_connection
 from routers import master
 from routers.auth import get_company_user, get_current_schema, require_level
-from services import custom_fields, farvision, rules, scoping, staging
+from services import custom_fields, farvision, jobs, rules, scoping, staging
 
 logger = logging.getLogger(__name__)
 
@@ -1275,6 +1277,29 @@ _EXPORT_KINDS = {
 }
 
 
+async def _build_farvision_export(
+    *, schema: str, user: dict, kind: str, batch_id, classified, date_from,
+    date_to, account, company, search, rule_conflicts,
+) -> tuple[bytes, str]:
+    """The actual work behind export-farvision: fetch, match, and render.
+
+    Split out so it can run either inline (background=false, the original
+    behaviour) or inside a jobs.py background task (background=true) without
+    two copies of the same body.
+    """
+    filter_fn, sheets, filename = _EXPORT_KINDS[kind]
+    async with company_connection(schema) as conn:
+        where, params, _columns, _term, _idx = await _temp_filters(
+            conn, user, batch_id=batch_id, classified=classified,
+            date_from=date_from, date_to=date_to, account=account,
+            company=company, search=search, rule_conflicts=rule_conflicts,
+        )
+        rows = await farvision.fetch_rows(conn, where, params, schema=schema)
+
+    content = farvision.to_xlsx_bytes(filter_fn(rows), sheets)
+    return content, filename
+
+
 @router.get("/temp-trans/export-farvision")
 async def export_farvision(
     kind: str = Query("receipt_payment", description="receipt_payment or deposit_withdrawal"),
@@ -1286,6 +1311,11 @@ async def export_farvision(
     company: str = Query(None),
     search: str = Query(""),
     rule_conflicts: str = Query(None),
+    background: bool = Query(
+        False,
+        description="true returns a job id immediately; poll GET /imports/jobs/{id} "
+                    "and read result.content_b64 / result.filename once state is 'done'",
+    ),
     user: dict = Depends(get_company_user),
 ):
     """Export the same rows the Imported Rows table is showing, Farvision-shaped.
@@ -1300,25 +1330,56 @@ async def export_farvision(
     rows whose Document Type is "Payment/Reciept", or Deposit Withdrawal (its
     own 3-sheet shape) for the "Deposit/withdrawal" rows -- never both kinds
     of row in the same file.
+
+    background=true hands the same work to services.jobs the way /imports/pdf
+    already does for a long parse: building the sheet holds a DB connection
+    and a worker for as long as matching every row takes, and on a large batch
+    that can be real seconds a synchronous request would otherwise hold open
+    for no reason. The request returns a job id immediately; poll it the same
+    way an import job is polled (GET /imports/jobs/{job_id} — the registry is
+    shared, so that route works regardless of which endpoint created the
+    job). Once state is "done", result.content_b64 is the xlsx file
+    (base64-encoded) and result.filename is its name.
     """
     if kind not in _EXPORT_KINDS:
         raise HTTPException(400, f"kind must be one of {sorted(_EXPORT_KINDS)}.")
-    filter_fn, sheets, filename = _EXPORT_KINDS[kind]
 
-    async with company_connection(user["schema"]) as conn:
-        where, params, _columns, _term, _idx = await _temp_filters(
-            conn, user, batch_id=batch_id, classified=classified,
-            date_from=date_from, date_to=date_to, account=account,
-            company=company, search=search, rule_conflicts=rule_conflicts,
+    if not background:
+        content, filename = await _build_farvision_export(
+            schema=user["schema"], user=user, kind=kind, batch_id=batch_id,
+            classified=classified, date_from=date_from, date_to=date_to,
+            account=account, company=company, search=search,
+            rule_conflicts=rule_conflicts,
         )
-        rows = await farvision.fetch_rows(conn, where, params)
+        return StreamingResponse(
+            iter([content]),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
-    content = farvision.to_xlsx_bytes(filter_fn(rows), sheets)
-    return StreamingResponse(
-        iter([content]),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    job_id = jobs.create(
+        schema=user["schema"], username=user["username"],
+        filename=_EXPORT_KINDS[kind][2], total_units=1, total_pages=None,
     )
+
+    async def _runner():
+        try:
+            content, filename = await _build_farvision_export(
+                schema=user["schema"], user=user, kind=kind, batch_id=batch_id,
+                classified=classified, date_from=date_from, date_to=date_to,
+                account=account, company=company, search=search,
+                rule_conflicts=rule_conflicts,
+            )
+            jobs.finish(job_id, {
+                "filename": filename,
+                "content_b64": base64.b64encode(content).decode("ascii"),
+            })
+        except Exception as exc:                      # noqa: BLE001
+            logger.warning("[Farvision export] job %s failed: %s", job_id, exc)
+            jobs.fail(job_id, str(exc))
+
+    jobs.attach_task(job_id, asyncio.create_task(_runner()))
+    return {"job_id": job_id, "state": jobs.QUEUED}
 
 
 @router.get("/temp-trans/farvision-verify")
@@ -1352,7 +1413,7 @@ async def farvision_verify_rows(
             date_from=date_from, date_to=date_to, account=account,
             company=company, search=search, rule_conflicts=rule_conflicts,
         )
-        rows = await farvision.fetch_rows(conn, where, params)
+        rows = await farvision.fetch_rows(conn, where, params, schema=user["schema"])
 
     # Every Farvision export column, not just Narration/Account Head --
     # confirmed with the user: this page reviews the row the export will

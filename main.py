@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 from database import close_pool, init_pool
 from routers import (auth, companies, custom_fields, export, fieldmap, imports,
@@ -70,6 +71,13 @@ app.add_middleware(
     allow_headers=["*"],
     max_age=600,
 )
+
+# Compresses any response over 1 KB before it leaves the server -- a plain
+# JSON list or an xlsx download shrinks substantially in transit for
+# negligible CPU cost. Registered after CORS so CORS headers are still added
+# to the (now smaller) response; middleware order runs outside-in on the
+# way out, so this is the innermost layer.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # Order is cosmetic (it sets the grouping in /docs) except that auth comes
 # first because every other router depends on it.

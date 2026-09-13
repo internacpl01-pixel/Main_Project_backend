@@ -316,6 +316,19 @@ def _get_config(master_type: str):
     return cfg
 
 
+# Master types services.farvision reads from and caches (see farvision.py's
+# _candidate_cache) -- a write to any of these has to drop that company's
+# cached lookups immediately, or a just-added bank name / account head would
+# stay invisible to Farvision Verify for up to a minute.
+_FARVISION_CACHED_TYPES = {'bank', 'farvision_bank_name',
+                          'farvision_account_dpl', 'farvision_account_amb'}
+
+
+def _invalidate_farvision_cache(master_type: str, schema: str) -> None:
+    if master_type in _FARVISION_CACHED_TYPES:
+        farvision.invalidate_cache(schema)
+
+
 def _normalise(cfg: dict, field: str, raw) -> str | None:
     """Trim, upper-case where the field asks for it, and turn "" into NULL.
 
@@ -582,6 +595,7 @@ async def delete_all_farvision_accounts(schema: str = Depends(get_current_schema
         for table in ("farvision_account_master_dpl", "farvision_account_master_amb"):
             deleted += await conn.fetchval(
                 f"WITH gone AS (DELETE FROM {table} RETURNING 1) SELECT count(*) FROM gone")
+    farvision.invalidate_cache(schema)
     logger.info("[master] %s: farvision_account cleared (%s rows) by request",
                schema, deleted)
     return {"deleted": deleted}
@@ -632,6 +646,7 @@ async def import_farvision_accounts(
 
         result = await farvision_account_import.commit(conn, analysis)
 
+    farvision.invalidate_cache(schema)
     return {
         **{k: v for k, v in analysis.items() if not k.startswith("_")},
         "saved": True,
@@ -753,6 +768,7 @@ async def create_master(
             )
         except Exception as e:
             raise _write_error(e, cfg, clean)
+    _invalidate_farvision_cache(master_type, schema)
     return dict(row)
 
 
@@ -818,6 +834,7 @@ async def update_master(
             raise _write_error(e, cfg, clean)
     if row is None:
         raise HTTPException(404, "Item not found.")
+    _invalidate_farvision_cache(master_type, schema)
     return dict(row)
 
 
@@ -839,6 +856,7 @@ async def delete_master(
             )
         if row is None:
             raise HTTPException(400, "Already archived or not found.")
+        _invalidate_farvision_cache(master_type, schema)
         return {"status": "archived"}
 
     async with company_connection(schema) as conn:
@@ -859,6 +877,7 @@ async def delete_master(
             raise HTTPException(400, str(e))
     if tag.split()[-1] == "0":
         raise HTTPException(404, "Item not found.")
+    _invalidate_farvision_cache(master_type, schema)
     return {"status": "deleted"}
 
 
@@ -884,4 +903,5 @@ async def activate_master(
         )
     if row is None:
         raise HTTPException(400, "Already active or not found.")
+    _invalidate_farvision_cache(master_type, schema)
     return {"status": "activated"}

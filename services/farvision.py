@@ -82,12 +82,49 @@ company/037_farvision_account_master.sql's sibling migration 044). Once set,
 an override always wins over re-matching -- see fetch_rows.
 """
 import re
+import time
 
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from io import BytesIO
 
 from services import staging
+
+# Candidate lookups (_bank_name_candidates, _bank_short_codes,
+# _account_head_candidates) are read-only reference data that rarely changes
+# but was being re-queried from scratch on every single Verify/export
+# request -- two clicks a few seconds apart re-ran the same four queries.
+# This is a plain in-process dict, the same shape as services.jobs' registry:
+# one web process serves this app, the key set is tiny and bounded (one
+# company's worth of bank names/codes, and one Account Head list per
+# company -- a handful of keys total, never one per row or per filter), so
+# there's nothing here a dict can't hold. Keyed by (schema, kind[, company])
+# rather than by company alone, since two companies' schemas could otherwise
+# collide on the same bank_master/farvision_bank_name_master data.
+_CACHE_TTL_SECONDS = 60
+_candidate_cache: dict[tuple, tuple[float, object]] = {}
+
+
+async def _cached(key: tuple, fetch_fn):
+    now = time.monotonic()
+    hit = _candidate_cache.get(key)
+    if hit is not None and now - hit[0] < _CACHE_TTL_SECONDS:
+        return hit[1]
+    value = await fetch_fn()
+    _candidate_cache[key] = (now, value)
+    return value
+
+
+def invalidate_cache(schema: str) -> None:
+    """Drop every cached candidate list for one company's schema.
+
+    Called after a write to any table these lookups read from
+    (farvision_bank_name_master, bank_master, farvision_account_master_dpl/
+    amb) -- see routers.master's generic CRUD router -- so a save is visible
+    on the very next request instead of waiting out the TTL.
+    """
+    for key in [k for k in _candidate_cache if k[0] == schema]:
+        _candidate_cache.pop(key, None)
 
 # The real Farvision workbook is 6 sheets, not one flat one -- confirmed with
 # the user from a screenshot of the real tab bar (ReceiptPayment,
@@ -648,7 +685,7 @@ async def lookup_parent_account_head(conn, account_head: str) -> str | None:
     return None
 
 
-async def fetch_rows(conn, where: str, params: list) -> list[dict]:
+async def fetch_rows(conn, where: str, params: list, schema: str) -> list[dict]:
     company_col = await staging.company_column(conn)
     company_select = f"t.{company_col} AS company," if company_col else "NULL AS company,"
 
@@ -692,8 +729,10 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
     # therefore one company, but nothing here assumes that.
     candidates_by_company: dict[str | None, list[dict]] = {}
     dup_options_by_company: dict[str | None, dict[str, list[str]]] = {}
-    bank_name_candidates = await _bank_name_candidates(conn)
-    bank_short_codes = await _bank_short_codes(conn)
+    bank_name_candidates = await _cached(
+        (schema, "bank_names"), lambda: _bank_name_candidates(conn))
+    bank_short_codes = await _cached(
+        (schema, "bank_codes"), lambda: _bank_short_codes(conn))
 
     out = []
     for i, r in enumerate(rows, start=1):
@@ -719,7 +758,9 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
             pool = bank_name_candidates
         else:
             if company not in candidates_by_company:
-                candidates_by_company[company] = await _account_head_candidates(conn, company)
+                candidates_by_company[company] = await _cached(
+                    (schema, "account_heads", company),
+                    lambda company=company: _account_head_candidates(conn, company))
             pool = [c["account_head"] for c in candidates_by_company[company]]
 
         account_head_options = None
@@ -742,7 +783,9 @@ async def fetch_rows(conn, where: str, params: list) -> list[dict]:
             parent_account_head = None
         else:
             if company not in dup_options_by_company:
-                dup_options_by_company[company] = await _duplicate_options_map(conn, company)
+                dup_options_by_company[company] = await _cached(
+                    (schema, "dup_options", company),
+                    lambda company=company: _duplicate_options_map(conn, company))
             account_head, parent_account_head = _match_account_head(
                 r["desc_text"], candidates_by_company[company])
 
