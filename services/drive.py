@@ -7,16 +7,24 @@ file after it's been handled so it's never picked up again.
 
 Auth is a one-time browser consent (InstalledAppFlow), not a service account
 -- this app acts as the same Google account that owns the folder, the
-simplest grant for one person's own Drive. The first call that needs a token
-and finds none cached opens the user's real browser to ask for it; every call
-after that reuses the cached, auto-refreshed token in DRIVE_TOKEN_PATH. Both
-the downloaded OAuth client (DRIVE_CREDENTIALS_PATH) and the cached token are
-gitignored -- see backend/.gitignore's `credentials/` entry -- the same
-per-machine-secret treatment as .env.
+simplest grant for one person's own Drive. That consent can only ever happen
+on a machine with a real browser, which a host like Render is not -- there is
+no local browser for InstalledAppFlow.run_local_server() to open, and no way
+to click Allow on a headless server. So the consent is done once, locally,
+and the resulting token -- which Google keeps refreshing on its own from
+here on -- is what a deployed instance actually runs on, supplied as the
+DRIVE_TOKEN_JSON env var rather than a file it could never have produced
+itself. Locally, the same token is cached to DRIVE_TOKEN_PATH instead, purely
+so repeat local runs skip the browser too. Both the downloaded OAuth client
+(DRIVE_CREDENTIALS_PATH) and the cached token file are gitignored -- see
+backend/.gitignore's `credentials/` entry -- the same per-machine-secret
+treatment as .env; DRIVE_TOKEN_JSON on Render is the deployed equivalent of
+that same secret.
 """
 from __future__ import annotations
 
 import io
+import json
 import os
 
 from google.auth.transport.requests import Request
@@ -38,22 +46,40 @@ _service = None
 
 def _load_credentials() -> Credentials:
     creds = None
-    if os.path.exists(config.DRIVE_TOKEN_PATH):
+
+    # A deployed instance (Render) has no local browser and no file this app
+    # itself could ever have written -- it arrives with the already-consented
+    # token as a plain env var instead. Checked first so a machine that
+    # happens to have both prefers the one meant for it to run on.
+    token_json = os.getenv("DRIVE_TOKEN_JSON")
+    if token_json:
+        creds = Credentials.from_authorized_user_info(json.loads(token_json), _SCOPES)
+    elif os.path.exists(config.DRIVE_TOKEN_PATH):
         creds = Credentials.from_authorized_user_file(config.DRIVE_TOKEN_PATH, _SCOPES)
 
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
 
     if not creds or not creds.valid:
-        # Only reached once, ever, per machine: opens the real default
-        # browser and blocks until the user clicks Allow. Everything after
-        # this run reuses the token file instead.
+        # Only reached locally, ever: opens the real default browser and
+        # blocks until the user clicks Allow. A host with no DRIVE_TOKEN_JSON
+        # and no browser to open would fail here with a clear file-not-found
+        # rather than hang, which is the correct outcome -- it has no way to
+        # complete this step itself.
         flow = InstalledAppFlow.from_client_secrets_file(
             config.DRIVE_CREDENTIALS_PATH, _SCOPES)
         creds = flow.run_local_server(port=0)
 
-    with open(config.DRIVE_TOKEN_PATH, "w") as f:
-        f.write(creds.to_json())
+    # Cache the (possibly just-refreshed) token back to disk so the next run
+    # on THIS machine skips both the browser and, once DRIVE_TOKEN_JSON is
+    # set, even needs it again. Best-effort: on a host with a read-only or
+    # ephemeral filesystem this simply doesn't persist, which is fine -- the
+    # env var or the browser consent covers it next time either way.
+    try:
+        with open(config.DRIVE_TOKEN_PATH, "w") as f:
+            f.write(creds.to_json())
+    except OSError:
+        pass
 
     return creds
 
