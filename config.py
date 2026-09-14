@@ -87,3 +87,17 @@ MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "0"))
 
 # --- App ---
 APP_ENV = os.getenv("APP_ENV", "development")
+
+# --- Google Drive import (services/drive.py) ---
+# The one flat folder auto-collected statements land in (see the Gmail Apps
+# Script). Its id is the segment after /folders/ in the folder's own URL.
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "")
+
+# Both live in backend/credentials/, which .gitignore excludes wholesale —
+# same reasoning as .env: per-machine secrets, never committed.
+# drive_credentials.json is the OAuth client downloaded from Google Cloud
+# Console; drive_token.json is written by services.drive after the one-time
+# browser consent and lets every run after the first skip that consent.
+DRIVE_CREDENTIALS_PATH = os.getenv(
+    "DRIVE_CREDENTIALS_PATH", "credentials/drive_credentials.json")
+DRIVE_TOKEN_PATH = os.getenv("DRIVE_TOKEN_PATH", "credentials/drive_token.json")

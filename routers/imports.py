@@ -18,16 +18,18 @@ This replaced routers/upload.py, which imported the same three formats into the
 same tables but parsed synchronously in the event loop, dropped failed rows
 silently, and recorded a blank uploaded_by.
 """
+import asyncio
 import json
 import logging
 
 from fastapi import (APIRouter, Depends, File, Form, HTTPException, Query,
                      UploadFile, status)
 
+import config
 import permissions
 from database import company_connection
 from routers.auth import get_company_user, get_current_schema, require_level
-from services import jobs
+from services import drive, jobs
 from services.pdf_import import (PDF_BATCH_PAGES, process_pdf_import,
                                  start_pdf_job)
 from services.staging import DuplicateFileError
@@ -181,6 +183,122 @@ async def get_import_job(job_id: str, user: dict = Depends(get_company_user)):
     if job is None or job.pop("_schema", None) != user["schema"]:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Import job not found.")
     return job
+
+
+def _split_ext(filename: str) -> tuple[str, str]:
+    if "." not in filename:
+        return filename, ""
+    stem, ext = filename.rsplit(".", 1)
+    return stem, f".{ext.lower()}"
+
+
+def _already_marked(filename: str) -> bool:
+    """True for a file this endpoint already finished with, last run.
+
+    Checked against the stem, not the raw name, so "statement_done.pdf"
+    matches regardless of case -- the same suffix this endpoint itself
+    writes after each file.
+    """
+    stem, _ = _split_ext(filename)
+    return stem.lower().endswith(("_done", "_failed"))
+
+
+@router.post("/from-drive")
+async def import_from_drive(
+    bank_id: int = Form(..., description="bank_master.id every file in the folder belongs to"),
+    user: dict = Depends(get_company_user),
+):
+    """
+    Import every un-marked file sitting in the one configured Google Drive
+    folder (services/drive.py, config.DRIVE_FOLDER_ID) -- the other end of
+    the Gmail Apps Script that copies matching statement attachments there
+    automatically.
+
+    Every file in this run is tied to the SAME bank_id. The folder is flat
+    with no per-bank structure by design (confirmed with the user), and
+    auto-detecting which bank a given file belongs to from its own content is
+    a separate, deferred decision -- for now this is picked by hand each run,
+    the same way a plain upload's Bank Account field is.
+
+    Runs as a background job (services/jobs.py, the same registry used
+    elsewhere in this router and by the Farvision export) since this can be
+    several files' worth of parsing. Poll GET /imports/jobs/{job_id}; once
+    state is "done", result is
+    {"files": [{"name", "status", "row_count"|"error"}], "imported", "failed"}.
+
+    Each file is renamed in Drive as it finishes -- "_done" on success,
+    "_failed" on parse/duplicate error -- so a file already handled is never
+    picked up again on a later run, and a failed one is flagged rather than
+    retried forever.
+    """
+    if not config.DRIVE_FOLDER_ID:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "DRIVE_FOLDER_ID is not configured.")
+
+    job_id = jobs.create(
+        schema=user["schema"], username=user["username"],
+        filename="Drive folder", total_units=1, total_pages=None,
+    )
+
+    async def _runner():
+        jobs.set_state(job_id, jobs.PARSING, "Listing the Drive folder...")
+        results = []
+        try:
+            drive_files = await asyncio.to_thread(
+                drive.list_folder_files, config.DRIVE_FOLDER_ID)
+            pending = [f for f in drive_files if not _already_marked(f["name"])]
+
+            for i, f in enumerate(pending, start=1):
+                jobs.set_state(
+                    job_id, jobs.PARSING,
+                    f"Importing {f['name']} ({i}/{len(pending)})...")
+                stem, ext = _split_ext(f["name"])
+
+                if ext not in (".pdf", ".xlsx", ".xls", ".csv"):
+                    results.append({"name": f["name"], "status": "skipped",
+                                    "error": "Unsupported file type."})
+                    continue
+
+                try:
+                    content = await asyncio.to_thread(drive.download_file, f["id"])
+                    if ext == ".pdf":
+                        res = await process_pdf_import(
+                            schema=user["schema"], file_bytes=content,
+                            filename=f["name"], username=user["username"],
+                            bank_id=bank_id, save=True,
+                        )
+                    else:
+                        res = await process_tabular_import(
+                            schema=user["schema"], file_bytes=content,
+                            filename=f["name"], username=user["username"],
+                            kind="excel" if ext in (".xlsx", ".xls") else "csv",
+                            bank_id=bank_id, save=True,
+                        )
+                    await asyncio.to_thread(
+                        drive.rename_file, f["id"], f"{stem}_done{ext}")
+                    results.append({"name": f["name"], "status": "done",
+                                    "row_count": res.get("row_count", 0)})
+                except (DuplicateFileError, RuntimeError) as e:
+                    await asyncio.to_thread(
+                        drive.rename_file, f["id"], f"{stem}_failed{ext}")
+                    results.append({"name": f["name"], "status": "failed",
+                                    "error": str(e)})
+                except Exception as e:                      # noqa: BLE001
+                    logger.exception("Drive import: %s failed", f["name"])
+                    await asyncio.to_thread(
+                        drive.rename_file, f["id"], f"{stem}_failed{ext}")
+                    results.append({"name": f["name"], "status": "failed",
+                                    "error": str(e)})
+
+            imported = sum(1 for r in results if r["status"] == "done")
+            failed = sum(1 for r in results if r["status"] == "failed")
+            jobs.finish(job_id, {"files": results, "imported": imported, "failed": failed})
+        except Exception as exc:                      # noqa: BLE001
+            logger.exception("Drive import job %s failed", job_id)
+            jobs.fail(job_id, str(exc))
+
+    jobs.attach_task(job_id, asyncio.create_task(_runner()))
+    return {"job_id": job_id, "state": jobs.QUEUED}
 
 
 async def _import_tabular(kind: str, file: UploadFile, save: bool, bank_id,
