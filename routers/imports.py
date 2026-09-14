@@ -205,7 +205,7 @@ def _already_marked(filename: str) -> bool:
 
 @router.post("/from-drive")
 async def import_from_drive(
-    bank_id: int = Form(..., description="bank_master.id every file in the folder belongs to"),
+    bank_id: int = Form(None, description="bank_master.id every file in the folder belongs to, if known"),
     user: dict = Depends(get_company_user),
 ):
     """
@@ -214,11 +214,11 @@ async def import_from_drive(
     the Gmail Apps Script that copies matching statement attachments there
     automatically.
 
-    Every file in this run is tied to the SAME bank_id. The folder is flat
-    with no per-bank structure by design (confirmed with the user), and
-    auto-detecting which bank a given file belongs to from its own content is
-    a separate, deferred decision -- for now this is picked by hand each run,
-    the same way a plain upload's Bank Account field is.
+    bank_id is optional, same as a plain upload's -- confirmed with the user:
+    this runs with no Bank Account picked at all, tagging nothing rather than
+    asking for one bank to apply to every file in the folder. Auto-detecting
+    which bank a given file belongs to from its own content is a separate,
+    still-deferred decision.
 
     Runs as a background job (services/jobs.py, the same registry used
     elsewhere in this router and by the Farvision export) since this can be
@@ -234,6 +234,8 @@ async def import_from_drive(
     if not config.DRIVE_FOLDER_ID:
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
                             "DRIVE_FOLDER_ID is not configured.")
+
+    clean_bank_id = _clean_bank_id(bank_id)
 
     job_id = jobs.create(
         schema=user["schema"], username=user["username"],
@@ -265,14 +267,14 @@ async def import_from_drive(
                         res = await process_pdf_import(
                             schema=user["schema"], file_bytes=content,
                             filename=f["name"], username=user["username"],
-                            bank_id=bank_id, save=True,
+                            bank_id=clean_bank_id, save=True,
                         )
                     else:
                         res = await process_tabular_import(
                             schema=user["schema"], file_bytes=content,
                             filename=f["name"], username=user["username"],
                             kind="excel" if ext in (".xlsx", ".xls") else "csv",
-                            bank_id=bank_id, save=True,
+                            bank_id=clean_bank_id, save=True,
                         )
                     await asyncio.to_thread(
                         drive.rename_file, f["id"], f"{stem}_done{ext}")
