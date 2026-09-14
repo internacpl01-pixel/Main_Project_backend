@@ -263,15 +263,25 @@ async def import_from_drive(
                 drive.list_folder_files, config.DRIVE_FOLDER_ID)
             pending = [f for f in drive_files if not _already_marked(f["name"])]
 
+            # One step per file, the same shape a workbook already reports one
+            # step per sheet in -- this is what lets the frontend's existing
+            # full-screen progress overlay (ImportProgressOverlay, built around
+            # that same step_index/step_total/batches_done shape) show a real
+            # per-file list for a Drive run without inventing a second
+            # component. job_id is deliberately NOT forwarded into
+            # process_pdf_import below: that would let a single large PDF's
+            # own internal page-batch ticking overwrite this per-file step
+            # numbering with its own, losing the "file i of N" framing.
             for i, f in enumerate(pending, start=1):
-                jobs.set_state(
-                    job_id, jobs.PARSING,
-                    f"Importing {f['name']} ({i}/{len(pending)})...")
+                jobs.start_step(
+                    job_id, index=i, total=len(pending), label=f["name"],
+                    units=1, message=f"Importing {f['name']}...")
                 stem, ext = _split_ext(f["name"])
 
                 if ext not in (".pdf", ".xlsx", ".xls", ".csv"):
                     results.append({"name": f["name"], "status": "skipped",
                                     "error": "Unsupported file type."})
+                    jobs.complete_step(job_id, rows=0)
                     continue
 
                 try:
@@ -294,17 +304,20 @@ async def import_from_drive(
                         drive.rename_file, f["id"], f"{stem}_done{ext}")
                     results.append({"name": f["name"], "status": "done",
                                     "row_count": res.get("row_count", 0)})
+                    jobs.complete_step(job_id, rows=res.get("row_count", 0))
                 except (DuplicateFileError, RuntimeError) as e:
                     await asyncio.to_thread(
                         drive.rename_file, f["id"], f"{stem}_failed{ext}")
                     results.append({"name": f["name"], "status": "failed",
                                     "error": str(e)})
+                    jobs.complete_step(job_id, rows=0)
                 except Exception as e:                      # noqa: BLE001
                     logger.exception("Drive import: %s failed", f["name"])
                     await asyncio.to_thread(
                         drive.rename_file, f["id"], f"{stem}_failed{ext}")
                     results.append({"name": f["name"], "status": "failed",
                                     "error": str(e)})
+                    jobs.complete_step(job_id, rows=0)
 
             imported = sum(1 for r in results if r["status"] == "done")
             failed = sum(1 for r in results if r["status"] == "failed")
