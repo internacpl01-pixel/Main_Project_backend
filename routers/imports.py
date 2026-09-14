@@ -206,6 +206,12 @@ def _already_marked(filename: str) -> bool:
 @router.post("/from-drive")
 async def import_from_drive(
     bank_id: int = Form(None, description="bank_master.id every file in the folder belongs to, if known"),
+    pages: str = Form("", description='PDF pages to read: "30", "31-65", or blank for all'),
+    batch_pages: int = Form(
+        None,
+        description="Read each PDF in stretches of this many pages (0 = one pass). "
+                    "Omit for the server default.",
+    ),
     user: dict = Depends(get_company_user),
 ):
     """
@@ -219,6 +225,12 @@ async def import_from_drive(
     asking for one bank to apply to every file in the folder. Auto-detecting
     which bank a given file belongs to from its own content is a separate,
     still-deferred decision.
+
+    pages/batch_pages are the same PDF page-range and batch-size controls
+    /imports/pdf takes, applied to every PDF this run finds -- confirmed with
+    the user: one shared setting for the whole run, the same as Bank Account
+    was before it was dropped. They have no effect on an Excel/CSV file in
+    the same run, same as the single-file form only showing them for a PDF.
 
     Runs as a background job (services/jobs.py, the same registry used
     elsewhere in this router and by the Farvision export) since this can be
@@ -236,6 +248,7 @@ async def import_from_drive(
                             "DRIVE_FOLDER_ID is not configured.")
 
     clean_bank_id = _clean_bank_id(bank_id)
+    clean_batch_pages = PDF_BATCH_PAGES if batch_pages is None else batch_pages
 
     job_id = jobs.create(
         schema=user["schema"], username=user["username"],
@@ -268,6 +281,7 @@ async def import_from_drive(
                             schema=user["schema"], file_bytes=content,
                             filename=f["name"], username=user["username"],
                             bank_id=clean_bank_id, save=True,
+                            pages_spec=pages, batch_pages=clean_batch_pages,
                         )
                     else:
                         res = await process_tabular_import(
