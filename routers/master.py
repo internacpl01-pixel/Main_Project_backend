@@ -37,10 +37,11 @@ _TABLES = {
         'label': 'Bank',
         'table': 'bank_master',
         'fields': ['bank_name', 'account_number', 'ifsc_code', 'account_type',
-                   'company', 'project'],
+                   'company', 'project', 'password'],
         'labels': {'bank_name': 'Bank Name', 'account_number': 'Account Number',
                    'ifsc_code': 'IFSC Code', 'account_type': 'Type',
-                   'company': 'Company', 'project': 'Project'},
+                   'company': 'Company', 'project': 'Project',
+                   'password': 'Password'},
         # All chosen from a list, not typed. See company/015, 016 and 023 on why
         # the name is stored rather than a reference to it.
         #
@@ -55,10 +56,20 @@ _TABLES = {
         # each other, so one holding a different form of the same value is the
         # kind of thing only discovered when a report groups by it.
         'options_value': {'company': 'abbreviation'},
+        # The PDF password this account's own statements are protected with --
+        # typed and edited by hand (company/045_bank_master_password.sql), not
+        # chosen from anywhere. Plain text, same trust level as the account
+        # number beside it: this is a bank statement's own unlock code, not a
+        # login credential, and the whole point of storing it is to read it
+        # back later (an import feature can offer it automatically instead of
+        # asking every time). Marked 'sensitive' purely so Master Data masks it
+        # in the list and the edit form -- masking is UI hygiene, not a
+        # security boundary those two tables enforce anyway.
+        'sensitive': ['password'],
         'unique': ['bank_name', 'account_number'],
         'required': ['bank_name'],
         'columns': ['id', 'bank_name', 'account_number', 'ifsc_code', 'account_type',
-                    'company', 'project', 'is_active', 'created_at', 'updated_at'],
+                    'company', 'project', 'password', 'is_active', 'created_at', 'updated_at'],
         'order_by': 'bank_name',
         'label_field': 'bank_name',
     },
@@ -694,6 +705,11 @@ async def master_schema():
                         for k, v in cfg.get('formats', {}).get(f, {}).items()
                         if k in ('maxlength', 'placeholder', 'upper')
                     },
+                    # A field worth masking in the list and typing hidden in
+                    # the form -- UI hygiene (see 'bank'.'password'), not a
+                    # security boundary. Absent (not False) when not sensitive,
+                    # matching every other optional flag here.
+                    **({"masked": True} if f in cfg.get('sensitive', []) else {}),
                 }
                 for f in cfg['fields']
             ],
