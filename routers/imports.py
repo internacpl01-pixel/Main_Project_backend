@@ -21,6 +21,7 @@ silently, and recorded a blank uploaded_by.
 import asyncio
 import json
 import logging
+import re
 
 from fastapi import (APIRouter, Depends, File, Form, HTTPException, Query,
                      UploadFile, status)
@@ -32,7 +33,7 @@ from routers.auth import get_company_user, get_current_schema, require_level
 from services import drive, jobs
 from services.pdf_import import (PDF_BATCH_PAGES, process_pdf_import,
                                  start_pdf_job)
-from services.staging import DuplicateFileError
+from services.staging import DuplicateFileError, find_bank_by_hint
 from services.tabular_import import (READERS, inspect_tabular,
                                      process_tabular_import, start_tabular_job)
 
@@ -197,15 +198,51 @@ def _already_marked(filename: str) -> bool:
 
     Checked against the stem, not the raw name, so "statement_done.pdf"
     matches regardless of case -- the same suffix this endpoint itself
-    writes after each file.
+    writes after each file. "_needs_password" counts too: that file has
+    already been matched to a bank once and is waiting on a person to type a
+    password via the retry endpoint below, not for this to guess again with
+    the same missing password every run.
     """
     stem, _ = _split_ext(filename)
-    return stem.lower().endswith(("_done", "_failed"))
+    return stem.lower().endswith(("_done", "_failed", "_needs_password"))
+
+
+# "yyyymmdd SHORTNAME LAST4" -- exactly what the Gmail Apps Script names a
+# saved attachment. SHORTNAME is free text (a bank name can have a space,
+# though today's short codes don't) but LAST4 is anchored to exactly four
+# trailing digits so a filename that merely CONTAINS four digits somewhere
+# in the middle doesn't false-match.
+_DRIVE_FILENAME_RE = re.compile(r"^\d{8} (.+) (\d{4})$")
+
+
+def _parse_drive_filename(stem: str) -> tuple[str, str] | None:
+    """(shortname, last4) from a Gmail-Apps-Script-named file, or None.
+
+    None covers both "doesn't look like our naming pattern at all" (a file
+    someone dropped in by hand, or one the script saved under its original
+    name because it couldn't extract an account number) and is the signal
+    the caller uses to skip rather than guess a bank.
+    """
+    m = _DRIVE_FILENAME_RE.match(stem)
+    return (m.group(1), m.group(2)) if m else None
+
+
+_PASSWORD_PROBLEM_RE = re.compile(r"ENCRYPTED|password-protected|Incorrect password", re.I)
+
+
+def _is_password_problem(message: str) -> bool:
+    """Same check as the frontend's isPasswordProblem, mirrored here.
+
+    Needed here specifically to tell "wrong/missing password" apart from
+    every other reason process_pdf_import can fail (duplicate, unreadable
+    file, no fieldmap) -- only the password case gets the softer
+    "_needs_password" outcome instead of a hard "_failed".
+    """
+    return bool(_PASSWORD_PROBLEM_RE.search(message or ""))
 
 
 @router.post("/from-drive")
 async def import_from_drive(
-    bank_id: int = Form(None, description="bank_master.id every file in the folder belongs to, if known"),
     pages: str = Form("", description='PDF pages to read: "30", "31-65", or blank for all'),
     batch_pages: int = Form(
         None,
@@ -218,18 +255,26 @@ async def import_from_drive(
     Import every un-marked file sitting in the one configured Google Drive
     folder (services/drive.py, config.DRIVE_FOLDER_ID) -- the other end of
     the Gmail Apps Script that copies matching statement attachments there
-    automatically.
+    automatically, named "yyyymmdd SHORTNAME LAST4.ext".
 
-    bank_id is optional, same as a plain upload's -- confirmed with the user:
-    this runs with no Bank Account picked at all, tagging nothing rather than
-    asking for one bank to apply to every file in the folder. Auto-detecting
-    which bank a given file belongs to from its own content is a separate,
-    still-deferred decision.
+    Which bank each file belongs to is read out of that filename, not
+    chosen by hand -- SHORTNAME + the account's last 4 digits are matched
+    against bank_master (services.staging.find_bank_by_hint). A filename
+    that doesn't parse, or names a bank that can't be matched confidently
+    (none or more than one), is skipped and marked "_failed" rather than
+    imported unassigned -- confirmed with the user.
+
+    Once a bank is known, that bank's own saved PDF password (Master Data's
+    Bank tab) is tried automatically -- see process_pdf_import's password
+    fallback, which this shares with a plain upload and a Computer batch.
+    If the file is protected and that password is missing or wrong, the file
+    is marked "_needs_password" instead of "_failed": it has already been
+    matched to a real bank, so this isn't a dead end, just something a
+    person needs to supply once via POST /imports/from-drive/retry-password.
 
     pages/batch_pages are the same PDF page-range and batch-size controls
-    /imports/pdf takes, applied to every PDF this run finds -- confirmed with
-    the user: one shared setting for the whole run, the same as Bank Account
-    was before it was dropped. They have no effect on an Excel/CSV file in
+    /imports/pdf takes, applied to every PDF this run finds -- one shared
+    setting for the whole run. They have no effect on an Excel/CSV file in
     the same run, same as the single-file form only showing them for a PDF.
 
     Runs as a background job (services/jobs.py, the same registry used
@@ -237,17 +282,12 @@ async def import_from_drive(
     several files' worth of parsing. Poll GET /imports/jobs/{job_id}; once
     state is "done", result is
     {"files": [{"name", "status", "row_count"|"error"}], "imported", "failed"}.
-
-    Each file is renamed in Drive as it finishes -- "_done" on success,
-    "_failed" on parse/duplicate error -- so a file already handled is never
-    picked up again on a later run, and a failed one is flagged rather than
-    retried forever.
+    status is one of "done", "failed", "password_required", or "skipped".
     """
     if not config.DRIVE_FOLDER_ID:
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
                             "DRIVE_FOLDER_ID is not configured.")
 
-    clean_bank_id = _clean_bank_id(bank_id)
     clean_batch_pages = PDF_BATCH_PAGES if batch_pages is None else batch_pages
 
     job_id = jobs.create(
@@ -284,13 +324,39 @@ async def import_from_drive(
                     jobs.complete_step(job_id, rows=0)
                     continue
 
+                hint = _parse_drive_filename(stem)
+                if hint is None:
+                    await asyncio.to_thread(
+                        drive.rename_file, f["id"], f"{stem}_failed{ext}")
+                    results.append({
+                        "name": f["name"], "status": "failed",
+                        "error": "Filename doesn't match the expected "
+                                "\"yyyymmdd BANK 1234\" pattern, so which "
+                                "account this belongs to can't be told.",
+                    })
+                    jobs.complete_step(job_id, rows=0)
+                    continue
+
+                async with company_connection(user["schema"]) as conn:
+                    matched_bank_id = await find_bank_by_hint(conn, *hint)
+                if matched_bank_id is None:
+                    await asyncio.to_thread(
+                        drive.rename_file, f["id"], f"{stem}_failed{ext}")
+                    results.append({
+                        "name": f["name"], "status": "failed",
+                        "error": f"No single active bank account matches "
+                                f"'{hint[0]}' ending {hint[1]}.",
+                    })
+                    jobs.complete_step(job_id, rows=0)
+                    continue
+
                 try:
                     content = await asyncio.to_thread(drive.download_file, f["id"])
                     if ext == ".pdf":
                         res = await process_pdf_import(
                             schema=user["schema"], file_bytes=content,
                             filename=f["name"], username=user["username"],
-                            bank_id=clean_bank_id, save=True,
+                            bank_id=matched_bank_id, save=True,
                             pages_spec=pages, batch_pages=clean_batch_pages,
                         )
                     else:
@@ -298,7 +364,7 @@ async def import_from_drive(
                             schema=user["schema"], file_bytes=content,
                             filename=f["name"], username=user["username"],
                             kind="excel" if ext in (".xlsx", ".xls") else "csv",
-                            bank_id=clean_bank_id, save=True,
+                            bank_id=matched_bank_id, save=True,
                         )
                     await asyncio.to_thread(
                         drive.rename_file, f["id"], f"{stem}_done{ext}")
@@ -306,10 +372,16 @@ async def import_from_drive(
                                     "row_count": res.get("row_count", 0)})
                     jobs.complete_step(job_id, rows=res.get("row_count", 0))
                 except (DuplicateFileError, RuntimeError) as e:
-                    await asyncio.to_thread(
-                        drive.rename_file, f["id"], f"{stem}_failed{ext}")
-                    results.append({"name": f["name"], "status": "failed",
-                                    "error": str(e)})
+                    if ext == ".pdf" and _is_password_problem(str(e)):
+                        await asyncio.to_thread(
+                            drive.rename_file, f["id"], f"{stem}_needs_password{ext}")
+                        results.append({"name": f["name"], "status": "password_required",
+                                        "error": str(e)})
+                    else:
+                        await asyncio.to_thread(
+                            drive.rename_file, f["id"], f"{stem}_failed{ext}")
+                        results.append({"name": f["name"], "status": "failed",
+                                        "error": str(e)})
                     jobs.complete_step(job_id, rows=0)
                 except Exception as e:                      # noqa: BLE001
                     logger.exception("Drive import: %s failed", f["name"])
@@ -321,13 +393,79 @@ async def import_from_drive(
 
             imported = sum(1 for r in results if r["status"] == "done")
             failed = sum(1 for r in results if r["status"] == "failed")
-            jobs.finish(job_id, {"files": results, "imported": imported, "failed": failed})
+            needs_password = sum(1 for r in results if r["status"] == "password_required")
+            jobs.finish(job_id, {
+                "files": results, "imported": imported, "failed": failed,
+                "needs_password": needs_password,
+            })
         except Exception as exc:                      # noqa: BLE001
             logger.exception("Drive import job %s failed", job_id)
             jobs.fail(job_id, str(exc))
 
     jobs.attach_task(job_id, asyncio.create_task(_runner()))
     return {"job_id": job_id, "state": jobs.QUEUED}
+
+
+@router.post("/from-drive/retry-password")
+async def retry_drive_file_with_password(
+    file_name: str = Form(..., description="The file's current name in Drive, "
+                                            "e.g. \"20260415 YES 2477_needs_password.pdf\""),
+    password: str = Form(...),
+    user: dict = Depends(get_company_user),
+):
+    """
+    Re-attempt one file /imports/from-drive already matched to a bank but
+    couldn't open -- its saved password (if any) was missing or wrong.
+
+    Only reachable for a file already carrying "_needs_password": that
+    suffix is what proves a bank match already succeeded once, so this
+    re-derives the SAME bank_id from the filename rather than trusting a
+    bank_id the caller could otherwise pass in for a file it was never
+    actually matched to.
+
+    Synchronous, not a background job -- this is always exactly one file, the
+    same shape as a plain (non-background) /imports/pdf call.
+    """
+    if not config.DRIVE_FOLDER_ID:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "DRIVE_FOLDER_ID is not configured.")
+
+    stem, ext = _split_ext(file_name)
+    if not stem.lower().endswith("_needs_password"):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "That file isn't waiting on a password -- only a file already "
+            "marked \"_needs_password\" can be retried here.")
+    base_stem = stem[: -len("_needs_password")]
+
+    hint = _parse_drive_filename(base_stem)
+    if hint is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "Could not re-read the bank this file was matched to.")
+
+    async with company_connection(user["schema"]) as conn:
+        bank_id = await find_bank_by_hint(conn, *hint)
+    if bank_id is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "That bank match no longer resolves to exactly one account.")
+
+    drive_files = await asyncio.to_thread(drive.list_folder_files, config.DRIVE_FOLDER_ID)
+    match = next((f for f in drive_files if f["name"] == file_name), None)
+    if match is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND,
+                            "That file is no longer in the Drive folder.")
+
+    content = await asyncio.to_thread(drive.download_file, match["id"])
+    try:
+        res = await process_pdf_import(
+            schema=user["schema"], file_bytes=content, filename=file_name,
+            username=user["username"], bank_id=bank_id, password=password, save=True,
+        )
+    except (DuplicateFileError, RuntimeError) as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(e))
+
+    await asyncio.to_thread(drive.rename_file, match["id"], f"{base_stem}_done{ext}")
+    return {"status": "done", "row_count": res.get("row_count", 0)}
 
 
 async def _import_tabular(kind: str, file: UploadFile, save: bool, bank_id,

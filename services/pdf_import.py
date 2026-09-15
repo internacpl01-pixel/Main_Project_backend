@@ -21,11 +21,12 @@ import time
 
 import config
 import parsers
+from database import company_connection
 from import_helpers import (compute_fill_rates, fields_by_category,
                             normalize_parsed_rows)
 from services import jobs
 from services.fieldmap import get_field_mappings, live_col_types
-from services.staging import assert_bank_exists, stage_batch
+from services.staging import assert_bank_exists, get_bank_password, stage_batch
 
 logger = logging.getLogger(__name__)
 
@@ -306,6 +307,19 @@ async def process_pdf_import(
     # difference between knowing now and knowing in three minutes.
     if save:
         await assert_bank_exists(schema, bank_id)
+
+    # A caller that named a bank but did not supply a password gets one
+    # tried automatically before ever asking a person -- the bank's own
+    # saved PDF password (Master Data's Bank tab, company/045). This is the
+    # one change that makes auto-password work identically for a plain
+    # upload, a batch, and a Drive import: all three already call this
+    # function, and none of them need their own copy of this lookup. If the
+    # saved password is wrong (or there isn't one), nothing here changes --
+    # the ENCRYPTED/Incorrect-password RuntimeError below still surfaces
+    # exactly as it always has, for the caller to handle exactly as before.
+    if not password and bank_id:
+        async with company_connection(schema) as conn:
+            password = await get_bank_password(conn, bank_id) or ""
 
     # --- Page selection and batching -----------------------------------------
     # Both are applied by handing the parser a shorter document, never by

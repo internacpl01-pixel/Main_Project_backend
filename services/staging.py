@@ -386,6 +386,41 @@ async def assert_bank_exists(schema: str, bank_id: int | None) -> None:
         await _bank_check(conn, bank_id)
 
 
+async def find_bank_by_hint(conn, shortname: str, last4: str) -> int | None:
+    """The one active bank_master row this filename hint names, or None.
+
+    Used by the Gmail->Drive pipeline, whose filenames the Apps Script builds
+    as "yyyymmdd SHORTNAME LAST4.ext" -- SHORTNAME is chosen there to match
+    bank_master.bank_name exactly (case-insensitively), so this is a plain
+    equality lookup rather than fuzzy text matching.
+
+    Zero matches and more than one match are both reported as None rather
+    than distinguished -- confirmed with the user: neither case is confident
+    enough to guess, so both take the same "skip and flag for manual review"
+    path the caller applies.
+    """
+    rows = await conn.fetch(
+        "SELECT id FROM bank_master "
+        "WHERE upper(bank_name) = upper($1) AND right(account_number, 4) = $2 "
+        "AND is_active = true",
+        shortname, last4,
+    )
+    return rows[0]["id"] if len(rows) == 1 else None
+
+
+async def get_bank_password(conn, bank_id: int | None) -> str | None:
+    """The PDF password saved on this bank_master row, or None.
+
+    A bank statement's own unlock code (Master Data's Bank tab, 'password'
+    column, company/045) -- used to try a protected PDF automatically before
+    ever asking a person to type one in.
+    """
+    if bank_id is None:
+        return None
+    return await conn.fetchval(
+        "SELECT password FROM bank_master WHERE id = $1", bank_id)
+
+
 class DuplicateFileError(RuntimeError):
     """This exact file has already been uploaded for this company."""
 
