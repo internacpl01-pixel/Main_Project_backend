@@ -302,6 +302,25 @@ async def update_drive_settings(
     return {"folder_id": folder_id}
 
 
+@router.get("/drive-files")
+async def list_drive_files(user: dict = Depends(get_company_user)):
+    """
+    Every file in the configured Drive folder /imports/from-drive would pick
+    up on a normal run -- i.e. not already "_done" or "_needs_password"
+    ("_failed" is included: see _already_marked). Powers the picker the
+    Import page shows before a Drive run, so a person can select just one or
+    a few files instead of always importing everything pending.
+    """
+    folder_id = await get_drive_folder_id(user["schema"])
+    if not folder_id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "No Drive folder is configured yet -- set one on "
+                            "this page first.")
+    drive_files = await asyncio.to_thread(drive.list_folder_files, folder_id)
+    pending = [f["name"] for f in drive_files if not _already_marked(f["name"])]
+    return {"files": pending}
+
+
 @router.post("/from-drive")
 async def import_from_drive(
     pages: str = Form("", description='PDF pages to read: "30", "31-65", or blank for all'),
@@ -310,13 +329,24 @@ async def import_from_drive(
         description="Read each PDF in stretches of this many pages (0 = one pass). "
                     "Omit for the server default.",
     ),
+    files: str = Form(
+        "",
+        description="Comma-separated Drive filenames to import (from GET "
+                    "/imports/drive-files). Blank imports every pending file.",
+    ),
     user: dict = Depends(get_company_user),
 ):
     """
-    Import every un-marked file sitting in the one configured Google Drive
-    folder (services/drive.py, config.DRIVE_FOLDER_ID) -- the other end of
+    Import files sitting in the one configured Google Drive folder
+    (services/drive.py, config.DRIVE_FOLDER_ID) -- the other end of
     the Gmail Apps Script that copies matching statement attachments there
     automatically, named "yyyymmdd SHORTNAME LAST4.ext".
+
+    `files` restricts the run to exactly the filenames named -- the Import
+    page always sends this, letting a person pick individual files (or
+    "select all") from the list GET /imports/drive-files returns rather than
+    this always sweeping the whole folder. Left blank, every pending file is
+    imported, same as before this picker existed.
 
     Which bank each file belongs to is read out of that filename, not
     chosen by hand -- SHORTNAME + the account's last 4 digits are matched
@@ -352,6 +382,7 @@ async def import_from_drive(
                             "this page first.")
 
     clean_batch_pages = PDF_BATCH_PAGES if batch_pages is None else batch_pages
+    selected = {n.strip() for n in files.split(",") if n.strip()} or None
 
     job_id = jobs.create(
         schema=user["schema"], username=user["username"],
@@ -364,7 +395,8 @@ async def import_from_drive(
         try:
             drive_files = await asyncio.to_thread(
                 drive.list_folder_files, folder_id)
-            pending = [f for f in drive_files if not _already_marked(f["name"])]
+            pending = [f for f in drive_files if not _already_marked(f["name"])
+                      and (selected is None or f["name"] in selected)]
 
             # One step per file, the same shape a workbook already reports one
             # step per sheet in -- this is what lets the frontend's existing
