@@ -196,7 +196,7 @@ def _split_ext(filename: str) -> tuple[str, str]:
 
 
 def _already_marked(filename: str) -> bool:
-    """True for a file this endpoint already finished with, last run.
+    """True for a file this endpoint should leave alone on a normal run.
 
     Checked against the stem, not the raw name, so "statement_done.pdf"
     matches regardless of case -- the same suffix this endpoint itself
@@ -204,9 +204,15 @@ def _already_marked(filename: str) -> bool:
     already been matched to a bank once and is waiting on a person to type a
     password via the retry endpoint below, not for this to guess again with
     the same missing password every run.
+
+    "_failed" deliberately does NOT count -- confirmed with the user. Unlike
+    the other two, a failure isn't necessarily permanent: the sender mapping
+    or a bank_master row can change after the fact, and once it does the
+    same file should be picked back up automatically rather than staying
+    stuck until someone finds and re-uploads it by hand.
     """
     stem, _ = _split_ext(filename)
-    return stem.lower().endswith(("_done", "_failed", "_needs_password"))
+    return stem.lower().endswith(("_done", "_needs_password"))
 
 
 # "yyyymmdd SHORTNAME LAST4" -- exactly what the Gmail Apps Script names a
@@ -374,6 +380,13 @@ async def import_from_drive(
                     job_id, index=i, total=len(pending), label=f["name"],
                     units=1, message=f"Importing {f['name']}...")
                 stem, ext = _split_ext(f["name"])
+                # A previously-failed file being retried still carries the
+                # suffix this endpoint wrote onto it last time -- strip it so
+                # parsing and every rename below work from the same clean
+                # base name as a file seeing this for the first time, instead
+                # of stacking a second "_failed"/"_done" onto the first.
+                if stem.lower().endswith("_failed"):
+                    stem = stem[: -len("_failed")]
 
                 if ext not in (".pdf", ".xlsx", ".xls", ".csv"):
                     results.append({"name": f["name"], "status": "skipped",
