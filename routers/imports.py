@@ -274,7 +274,10 @@ async def update_drive_settings(
 
     if config.APPS_SCRIPT_WEB_APP_URL:
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            # Apps Script web apps answer via a redirect to
+            # script.googleusercontent.com -- without follow_redirects the
+            # response body here is empty and resp.json() fails on it.
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
                 resp = await client.post(config.APPS_SCRIPT_WEB_APP_URL, json={
                     "secret": config.APPS_SCRIPT_SHARED_SECRET,
                     "folderId": folder_id,
