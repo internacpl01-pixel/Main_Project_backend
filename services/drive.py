@@ -136,3 +136,17 @@ def rename_file(file_id: str, new_name: str) -> None:
     service = _get_service()
     service.files().update(fileId=file_id, body={"name": new_name},
                            supportsAllDrives=True).execute()
+
+
+def trash_file(file_id: str) -> None:
+    """Moves a file to Drive's own Trash rather than deleting it outright.
+
+    This app's access to the Shared Drive is Editor-level, which Google only
+    allows to trash a file -- permanent deletion (files().delete()) needs
+    Organizer, a higher grant than this integration has been given. A
+    trashed file stays recoverable from Drive's own Trash for about 30 days
+    before Google purges it there on its own.
+    """
+    service = _get_service()
+    service.files().update(fileId=file_id, body={"trashed": True},
+                           supportsAllDrives=True).execute()

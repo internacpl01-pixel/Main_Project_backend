@@ -19,6 +19,7 @@ same tables but parsed synchronously in the event loop, dropped failed rows
 silently, and recorded a blank uploaded_by.
 """
 import asyncio
+import datetime
 import json
 import logging
 import re
@@ -329,6 +330,58 @@ async def get_drive_log(
         schema, status=status_filter, date_from=date_from, date_to=date_to,
         limit=limit, offset=offset)
     return {"rows": rows, "total": total}
+
+
+@router.post("/drive-cleanup")
+async def cleanup_drive_done_files(
+    older_than_days: int = Form(..., ge=1),
+    user: dict = Depends(require_manager),
+):
+    """
+    Moves every "_done" file in the configured Drive folder to Drive's own
+    Trash, once ITS OWN statement date -- the yyyymmdd embedded in its name,
+    not when it happened to be imported -- is at least this many days old.
+    Confirmed with the user: age is judged by the statement, not the import.
+
+    Only "_done" files are ever touched. "_failed" and "_needs_password"
+    still need a person's attention regardless of how old their statement
+    date is, and a file whose name doesn't parse at all is left alone rather
+    than guessed at -- the same "don't act without confidence" rule
+    /imports/from-drive itself follows when it can't match a bank.
+
+    Trash, not delete: this app's Drive access is Editor-level on the Shared
+    Drive, which Google only allows to trash a file -- permanent deletion
+    needs Organizer, a higher grant than this integration has. A trashed
+    file is recoverable from Drive's own Trash for about 30 days before
+    Google purges it there on its own. Manager+ only, the same tier as
+    discarding a batch or changing the Drive folder itself.
+    """
+    folder_id = await get_drive_folder_id(user["schema"])
+    if not folder_id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "No Drive folder is configured yet.")
+
+    cutoff = datetime.date.today() - datetime.timedelta(days=older_than_days)
+    drive_files = await asyncio.to_thread(drive.list_folder_files, folder_id)
+
+    trashed = []
+    for f in drive_files:
+        stem, ext = _split_ext(f["name"])
+        if not stem.lower().endswith("_done"):
+            continue
+        base_stem = stem[: -len("_done")]
+        if not _DRIVE_FILENAME_RE.match(base_stem):
+            continue
+        try:
+            statement_date = datetime.datetime.strptime(
+                base_stem[:8], "%Y%m%d").date()
+        except ValueError:
+            continue
+        if statement_date <= cutoff:
+            await asyncio.to_thread(drive.trash_file, f["id"])
+            trashed.append(f["name"])
+
+    return {"trashed": trashed, "count": len(trashed)}
 
 
 @router.get("/drive-files")
