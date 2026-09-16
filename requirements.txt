@@ -26,3 +26,8 @@ fpdf2==2.8.4
 google-api-python-client==2.200.0
 google-auth-httplib2==0.4.2
 google-auth-oauthlib==1.4.1
+
+# --- Drive settings sync (routers/imports.py PUT /imports/drive-settings) ----
+# Posts a folder-ID change to the Apps Script's own web app so both sides
+# stay in sync.
+httpx==0.28.1

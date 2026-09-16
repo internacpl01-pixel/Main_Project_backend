@@ -101,3 +101,14 @@ DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "")
 DRIVE_CREDENTIALS_PATH = os.getenv(
     "DRIVE_CREDENTIALS_PATH", "credentials/drive_credentials.json")
 DRIVE_TOKEN_PATH = os.getenv("DRIVE_TOKEN_PATH", "credentials/drive_token.json")
+
+# The Apps Script's own deployed web app URL (ends in /exec) and a secret
+# only it and this backend know. Changing the Drive folder ID from the UI
+# (routers/imports.py's PUT /imports/drive-settings) posts the new value to
+# this URL so the script's own copy (Script Properties) stays in sync with
+# the one this backend reads from the DB -- otherwise the two would silently
+# point at different folders. The secret is checked inside the script's
+# doPost, since the deployment has to allow "Anyone" to be reachable from a
+# server-to-server call at all.
+APPS_SCRIPT_WEB_APP_URL = os.getenv("APPS_SCRIPT_WEB_APP_URL", "")
+APPS_SCRIPT_SHARED_SECRET = os.getenv("APPS_SCRIPT_SHARED_SECRET", "")

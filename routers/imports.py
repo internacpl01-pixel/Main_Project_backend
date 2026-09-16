@@ -23,6 +23,7 @@ import json
 import logging
 import re
 
+import httpx
 from fastapi import (APIRouter, Depends, File, Form, HTTPException, Query,
                      UploadFile, status)
 
@@ -33,6 +34,7 @@ from routers.auth import get_company_user, get_current_schema, require_level
 from services import drive, jobs
 from services.pdf_import import (PDF_BATCH_PAGES, process_pdf_import,
                                  start_pdf_job)
+from services.settings import get_drive_folder_id, set_drive_folder_id
 from services.staging import DuplicateFileError, find_bank_by_hint
 from services.tabular_import import (READERS, inspect_tabular,
                                      process_tabular_import, start_tabular_job)
@@ -241,6 +243,56 @@ def _is_password_problem(message: str) -> bool:
     return bool(_PASSWORD_PROBLEM_RE.search(message or ""))
 
 
+@router.get("/drive-settings")
+async def get_drive_settings(user: dict = Depends(get_company_user)):
+    """The folder ID /imports/from-drive currently reads, for the settings
+    field on the Import page to show as its starting value."""
+    return {"folder_id": await get_drive_folder_id(user["schema"])}
+
+
+@router.put("/drive-settings")
+async def update_drive_settings(
+    folder_id: str = Form(...),
+    user: dict = Depends(require_manager),
+):
+    """
+    Change the Drive folder /imports/from-drive watches, from the UI instead
+    of editing config.DRIVE_FOLDER_ID / Render's env var by hand.
+
+    The Gmail Apps Script keeps its OWN copy of this id (it writes directly
+    into that folder, this backend only reads from it) -- so before saving
+    here, the new value is posted to the script's deployed web app
+    (config.APPS_SCRIPT_WEB_APP_URL) carrying a shared secret the script
+    checks in its doPost. If the two ever pointed at different folders, the
+    script would keep saving statements one place while this backend looked
+    in another, silently. Manager+ only, same tier as discarding a batch --
+    this changes where every future import looks.
+    """
+    folder_id = folder_id.strip()
+    if not folder_id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Folder ID cannot be empty.")
+
+    if config.APPS_SCRIPT_WEB_APP_URL:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(config.APPS_SCRIPT_WEB_APP_URL, json={
+                    "secret": config.APPS_SCRIPT_SHARED_SECRET,
+                    "folderId": folder_id,
+                })
+            body = resp.json()
+        except (httpx.HTTPError, ValueError) as e:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                f"Could not reach the Apps Script to update it: {e}")
+        if not body.get("ok"):
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                body.get("error") or "The Apps Script rejected the update.")
+
+    await set_drive_folder_id(user["schema"], folder_id)
+    return {"folder_id": folder_id}
+
+
 @router.post("/from-drive")
 async def import_from_drive(
     pages: str = Form("", description='PDF pages to read: "30", "31-65", or blank for all'),
@@ -284,9 +336,11 @@ async def import_from_drive(
     {"files": [{"name", "status", "row_count"|"error"}], "imported", "failed"}.
     status is one of "done", "failed", "password_required", or "skipped".
     """
-    if not config.DRIVE_FOLDER_ID:
+    folder_id = await get_drive_folder_id(user["schema"])
+    if not folder_id:
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
-                            "DRIVE_FOLDER_ID is not configured.")
+                            "No Drive folder is configured yet -- set one on "
+                            "this page first.")
 
     clean_batch_pages = PDF_BATCH_PAGES if batch_pages is None else batch_pages
 
@@ -300,7 +354,7 @@ async def import_from_drive(
         results = []
         try:
             drive_files = await asyncio.to_thread(
-                drive.list_folder_files, config.DRIVE_FOLDER_ID)
+                drive.list_folder_files, folder_id)
             pending = [f for f in drive_files if not _already_marked(f["name"])]
 
             # One step per file, the same shape a workbook already reports one
@@ -426,9 +480,10 @@ async def retry_drive_file_with_password(
     Synchronous, not a background job -- this is always exactly one file, the
     same shape as a plain (non-background) /imports/pdf call.
     """
-    if not config.DRIVE_FOLDER_ID:
+    folder_id = await get_drive_folder_id(user["schema"])
+    if not folder_id:
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
-                            "DRIVE_FOLDER_ID is not configured.")
+                            "No Drive folder is configured yet.")
 
     stem, ext = _split_ext(file_name)
     if not stem.lower().endswith("_needs_password"):
@@ -449,7 +504,7 @@ async def retry_drive_file_with_password(
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
                             "That bank match no longer resolves to exactly one account.")
 
-    drive_files = await asyncio.to_thread(drive.list_folder_files, config.DRIVE_FOLDER_ID)
+    drive_files = await asyncio.to_thread(drive.list_folder_files, folder_id)
     match = next((f for f in drive_files if f["name"] == file_name), None)
     if match is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND,
