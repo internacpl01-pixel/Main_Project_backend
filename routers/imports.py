@@ -392,6 +392,11 @@ async def list_drive_files(user: dict = Depends(get_company_user)):
     ("_failed" is included: see _already_marked). Powers the picker the
     Import page shows before a Drive run, so a person can select just one or
     a few files instead of always importing everything pending.
+
+    Returns {id, name} pairs, not bare names -- two files can legitimately
+    share a name (the Apps Script's own collision race, before it was fixed,
+    left some behind), and an id is the only way to act on one specific copy
+    rather than "every file called this".
     """
     folder_id = await get_drive_folder_id(user["schema"])
     if not folder_id:
@@ -399,8 +404,33 @@ async def list_drive_files(user: dict = Depends(get_company_user)):
                             "No Drive folder is configured yet -- set one on "
                             "this page first.")
     drive_files = await asyncio.to_thread(drive.list_folder_files, folder_id)
-    pending = [f["name"] for f in drive_files if not _already_marked(f["name"])]
+    pending = [{"id": f["id"], "name": f["name"]} for f in drive_files
+              if not _already_marked(f["name"])]
     return {"files": pending}
+
+
+@router.delete("/drive-files/{file_id}")
+async def delete_pending_drive_file(
+    file_id: str, user: dict = Depends(get_company_user),
+):
+    """
+    Moves one not-yet-imported Drive file to Trash -- for discarding a
+    duplicate copy (same name, from the pre-fix Apps Script race) directly
+    from the picker, without waiting for /imports/from-drive to mark it
+    "_failed" as a duplicate on its own. Same Trash-not-delete reasoning as
+    /imports/drive-cleanup: this app's Shared Drive access is Editor-level,
+    which can only trash a file, not permanently delete it.
+
+    Same permission level as starting a Drive import itself -- this only
+    ever touches a file nothing has processed yet, unlike drive-cleanup
+    which prunes already-imported ("_done") statements and is manager+.
+    """
+    folder_id = await get_drive_folder_id(user["schema"])
+    if not folder_id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "No Drive folder is configured yet.")
+    await asyncio.to_thread(drive.trash_file, file_id)
+    return {"status": "trashed"}
 
 
 @router.post("/from-drive")
@@ -413,8 +443,9 @@ async def import_from_drive(
     ),
     files: str = Form(
         "",
-        description="Comma-separated Drive filenames to import (from GET "
-                    "/imports/drive-files). Blank imports every pending file.",
+        description="Comma-separated Drive file IDs to import (the `id` "
+                    "field from GET /imports/drive-files). Blank imports "
+                    "every pending file.",
     ),
     user: dict = Depends(get_company_user),
 ):
@@ -424,11 +455,13 @@ async def import_from_drive(
     the Gmail Apps Script that copies matching statement attachments there
     automatically, named "yyyymmdd SHORTNAME LAST4.ext".
 
-    `files` restricts the run to exactly the filenames named -- the Import
+    `files` restricts the run to exactly the file IDs named -- the Import
     page always sends this, letting a person pick individual files (or
     "select all") from the list GET /imports/drive-files returns rather than
-    this always sweeping the whole folder. Left blank, every pending file is
-    imported, same as before this picker existed.
+    this always sweeping the whole folder. By id, not name: two files can
+    legitimately share a name, and matching by name would import both or
+    neither instead of just the one that was actually picked. Left blank,
+    every pending file is imported, same as before this picker existed.
 
     Which bank each file belongs to is read out of that filename, not
     chosen by hand -- SHORTNAME + the account's last 4 digits are matched
@@ -496,7 +529,7 @@ async def import_from_drive(
             drive_files = await asyncio.to_thread(
                 drive.list_folder_files, folder_id)
             pending = [f for f in drive_files if not _already_marked(f["name"])
-                      and (selected is None or f["name"] in selected)]
+                      and (selected is None or f["id"] in selected)]
 
             # One step per file, the same shape a workbook already reports one
             # step per sheet in -- this is what lets the frontend's existing
