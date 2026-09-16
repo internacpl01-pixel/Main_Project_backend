@@ -308,6 +308,8 @@ async def get_drive_log(
     status_filter: str = Query(
         None, alias="status",
         description="done / failed / password_required / skipped"),
+    date_from: str = Query(None, description="yyyy-mm-dd, inclusive"),
+    date_to: str = Query(None, description="yyyy-mm-dd, inclusive"),
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
     schema: str = Depends(get_current_schema),
@@ -318,9 +320,14 @@ async def get_drive_log(
     day to see what happened and why a specific file failed, after the run
     itself has scrolled off screen and the in-memory job (services/jobs.py)
     that drove it has long since been pruned.
+
+    Entries older than services.drive_log.RETENTION_DAYS are dropped on the
+    next write, not read here at all -- so this can never show an entry the
+    next import will have already deleted.
     """
     rows, total = await list_drive_log(
-        schema, status=status_filter, limit=limit, offset=offset)
+        schema, status=status_filter, date_from=date_from, date_to=date_to,
+        limit=limit, offset=offset)
     return {"rows": rows, "total": total}
 
 

@@ -7,7 +7,15 @@ last Tuesday". This table is that answer.
 """
 from __future__ import annotations
 
+import datetime
+
 from database import company_connection
+
+# How long an entry is worth keeping -- confirmed with the user. Pruned on
+# write rather than on a timer, the same reasoning as services/jobs.py's own
+# _prune_locked: there is no scheduler in this app, and a table that only
+# grows is the one way a permanent log like this turns into an unbounded one.
+RETENTION_DAYS = 30
 
 
 async def log_drive_result(
@@ -24,14 +32,33 @@ async def log_drive_result(
             """,
             file_name, status, error, row_count, bank_id, imported_by,
         )
+        await conn.execute(
+            "DELETE FROM drive_import_log WHERE created_at < now() - "
+            f"interval '{RETENTION_DAYS} days'")
 
 
 async def list_drive_log(
-    schema: str, *, status: str | None, limit: int, offset: int,
+    schema: str, *, status: str | None, date_from: str | None,
+    date_to: str | None, limit: int, offset: int,
 ) -> tuple[list[dict], int]:
-    where, params = "", []
+    clauses, params = [], []
     if status:
-        where, params = "WHERE l.status = $1", [status]
+        params.append(status)
+        clauses.append(f"l.status = ${len(params)}")
+    if date_from:
+        # asyncpg infers the bind's type from the query itself; since the SQL
+        # casts it to date, the value handed in has to already be a
+        # datetime.date, not the "yyyy-mm-dd" string the query param arrives
+        # as -- passing the string raises DataError deep in the driver.
+        params.append(datetime.date.fromisoformat(date_from))
+        clauses.append(f"l.created_at >= ${len(params)}::date")
+    if date_to:
+        # Inclusive of the whole "to" day, not just its midnight. Cast
+        # needed on both sides of the "+" -- left bare, Postgres can't tell
+        # $2's type from the bind alone and the interval arithmetic fails.
+        params.append(datetime.date.fromisoformat(date_to))
+        clauses.append(f"l.created_at < (${len(params)}::date + interval '1 day')")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
     async with company_connection(schema) as conn:
         total = await conn.fetchval(
