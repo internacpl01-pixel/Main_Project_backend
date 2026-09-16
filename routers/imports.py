@@ -34,6 +34,7 @@ from routers.auth import get_company_user, get_current_schema, require_level
 from services import drive, jobs
 from services.pdf_import import (PDF_BATCH_PAGES, process_pdf_import,
                                  start_pdf_job)
+from services.drive_log import list_drive_log, log_drive_result
 from services.settings import get_drive_folder_id, set_drive_folder_id
 from services.staging import DuplicateFileError, find_bank_by_hint
 from services.tabular_import import (READERS, inspect_tabular,
@@ -302,6 +303,27 @@ async def update_drive_settings(
     return {"folder_id": folder_id}
 
 
+@router.get("/drive-log")
+async def get_drive_log(
+    status_filter: str = Query(
+        None, alias="status",
+        description="done / failed / password_required / skipped"),
+    limit: int = Query(50, le=200),
+    offset: int = Query(0, ge=0),
+    schema: str = Depends(get_current_schema),
+):
+    """
+    Every file /imports/from-drive (or its retry-password endpoint) has ever
+    recorded an outcome for, newest first -- what a manager checks the next
+    day to see what happened and why a specific file failed, after the run
+    itself has scrolled off screen and the in-memory job (services/jobs.py)
+    that drove it has long since been pruned.
+    """
+    rows, total = await list_drive_log(
+        schema, status=status_filter, limit=limit, offset=offset)
+    return {"rows": rows, "total": total}
+
+
 @router.get("/drive-files")
 async def list_drive_files(user: dict = Depends(get_company_user)):
     """
@@ -392,6 +414,24 @@ async def import_from_drive(
     async def _runner():
         jobs.set_state(job_id, jobs.PARSING, "Listing the Drive folder...")
         results = []
+
+        # Records the outcome both in the in-memory job result (what this
+        # run's own poller/overlay reads) and in drive_import_log (what
+        # survives after the job is pruned) -- one call keeps the two from
+        # drifting apart the way two separate call sites eventually would.
+        async def _record(name, status_, *, error=None, row_count=None,
+                          bank_id=None):
+            entry = {"name": name, "status": status_}
+            if error is not None:
+                entry["error"] = error
+            if row_count is not None:
+                entry["row_count"] = row_count
+            results.append(entry)
+            await log_drive_result(
+                user["schema"], file_name=name, status=status_,
+                imported_by=user["username"], error=error,
+                row_count=row_count, bank_id=bank_id)
+
         try:
             drive_files = await asyncio.to_thread(
                 drive.list_folder_files, folder_id)
@@ -421,8 +461,8 @@ async def import_from_drive(
                     stem = stem[: -len("_failed")]
 
                 if ext not in (".pdf", ".xlsx", ".xls", ".csv"):
-                    results.append({"name": f["name"], "status": "skipped",
-                                    "error": "Unsupported file type."})
+                    await _record(f["name"], "skipped",
+                                  error="Unsupported file type.")
                     jobs.complete_step(job_id, rows=0)
                     continue
 
@@ -430,12 +470,11 @@ async def import_from_drive(
                 if hint is None:
                     await asyncio.to_thread(
                         drive.rename_file, f["id"], f"{stem}_failed{ext}")
-                    results.append({
-                        "name": f["name"], "status": "failed",
-                        "error": "Filename doesn't match the expected "
-                                "\"yyyymmdd BANK 1234\" pattern, so which "
-                                "account this belongs to can't be told.",
-                    })
+                    await _record(
+                        f["name"], "failed",
+                        error="Filename doesn't match the expected "
+                             "\"yyyymmdd BANK 1234\" pattern, so which "
+                             "account this belongs to can't be told.")
                     jobs.complete_step(job_id, rows=0)
                     continue
 
@@ -444,11 +483,10 @@ async def import_from_drive(
                 if matched_bank_id is None:
                     await asyncio.to_thread(
                         drive.rename_file, f["id"], f"{stem}_failed{ext}")
-                    results.append({
-                        "name": f["name"], "status": "failed",
-                        "error": f"No single active bank account matches "
-                                f"'{hint[0]}' ending {hint[1]}.",
-                    })
+                    await _record(
+                        f["name"], "failed",
+                        error=f"No single active bank account matches "
+                             f"'{hint[0]}' ending {hint[1]}.")
                     jobs.complete_step(job_id, rows=0)
                     continue
 
@@ -470,27 +508,28 @@ async def import_from_drive(
                         )
                     await asyncio.to_thread(
                         drive.rename_file, f["id"], f"{stem}_done{ext}")
-                    results.append({"name": f["name"], "status": "done",
-                                    "row_count": res.get("row_count", 0)})
+                    await _record(f["name"], "done",
+                                 row_count=res.get("row_count", 0),
+                                 bank_id=matched_bank_id)
                     jobs.complete_step(job_id, rows=res.get("row_count", 0))
                 except (DuplicateFileError, RuntimeError) as e:
                     if ext == ".pdf" and _is_password_problem(str(e)):
                         await asyncio.to_thread(
                             drive.rename_file, f["id"], f"{stem}_needs_password{ext}")
-                        results.append({"name": f["name"], "status": "password_required",
-                                        "error": str(e)})
+                        await _record(f["name"], "password_required",
+                                     error=str(e), bank_id=matched_bank_id)
                     else:
                         await asyncio.to_thread(
                             drive.rename_file, f["id"], f"{stem}_failed{ext}")
-                        results.append({"name": f["name"], "status": "failed",
-                                        "error": str(e)})
+                        await _record(f["name"], "failed", error=str(e),
+                                     bank_id=matched_bank_id)
                     jobs.complete_step(job_id, rows=0)
                 except Exception as e:                      # noqa: BLE001
                     logger.exception("Drive import: %s failed", f["name"])
                     await asyncio.to_thread(
                         drive.rename_file, f["id"], f"{stem}_failed{ext}")
-                    results.append({"name": f["name"], "status": "failed",
-                                    "error": str(e)})
+                    await _record(f["name"], "failed", error=str(e),
+                                 bank_id=matched_bank_id)
                     jobs.complete_step(job_id, rows=0)
 
             imported = sum(1 for r in results if r["status"] == "done")
@@ -565,9 +604,19 @@ async def retry_drive_file_with_password(
             username=user["username"], bank_id=bank_id, password=password, save=True,
         )
     except (DuplicateFileError, RuntimeError) as e:
+        # Still waiting on a password (this one was wrong too) rather than a
+        # hard failure -- the file itself hasn't moved, so a future retry
+        # against the same "_needs_password" name is still possible.
+        await log_drive_result(
+            user["schema"], file_name=file_name, status="password_required",
+            imported_by=user["username"], error=str(e), bank_id=bank_id)
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(e))
 
     await asyncio.to_thread(drive.rename_file, match["id"], f"{base_stem}_done{ext}")
+    await log_drive_result(
+        user["schema"], file_name=file_name, status="done",
+        imported_by=user["username"], row_count=res.get("row_count", 0),
+        bank_id=bank_id)
     return {"status": "done", "row_count": res.get("row_count", 0)}
 
 
