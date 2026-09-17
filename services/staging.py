@@ -408,6 +408,25 @@ async def find_bank_by_hint(conn, shortname: str, last4: str) -> int | None:
     return rows[0]["id"] if len(rows) == 1 else None
 
 
+async def bulk_bank_lookup(conn) -> dict[tuple[str, str], int | None]:
+    """{(SHORTNAME upper, last4): bank_id or None}, for every combination.
+
+    One query instead of one per file -- used by GET /imports/drive-files to
+    flag, before anyone commits to a Drive run, which pending filenames name
+    an account bank_master doesn't have (never set up, or deactivated since
+    the statement first arrived). find_bank_by_hint stays the one used by the
+    actual import, run per file inside its own job; this is the same
+    zero-or-many-is-None rule, just computed for a whole folder at once.
+    """
+    rows = await conn.fetch(
+        "SELECT upper(bank_name) AS name, right(account_number, 4) AS last4, id "
+        "FROM bank_master WHERE is_active = true")
+    counts: dict[tuple[str, str], list[int]] = {}
+    for r in rows:
+        counts.setdefault((r["name"], r["last4"]), []).append(r["id"])
+    return {key: (ids[0] if len(ids) == 1 else None) for key, ids in counts.items()}
+
+
 async def get_bank_password(conn, bank_id: int | None) -> str | None:
     """The PDF password saved on this bank_master row, or None.
 

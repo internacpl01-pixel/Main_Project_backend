@@ -37,7 +37,8 @@ from services.pdf_import import (PDF_BATCH_PAGES, process_pdf_import,
                                  start_pdf_job)
 from services.drive_log import list_drive_log, log_drive_result
 from services.settings import get_drive_folder_id, set_drive_folder_id
-from services.staging import DuplicateFileError, find_bank_by_hint
+from services.staging import (DuplicateFileError, bulk_bank_lookup,
+                              find_bank_by_hint)
 from services.tabular_import import (READERS, inspect_tabular,
                                      process_tabular_import, start_tabular_job)
 
@@ -393,10 +394,16 @@ async def list_drive_files(user: dict = Depends(get_company_user)):
     Import page shows before a Drive run, so a person can select just one or
     a few files instead of always importing everything pending.
 
-    Returns {id, name} pairs, not bare names -- two files can legitimately
-    share a name (the Apps Script's own collision race, before it was fixed,
-    left some behind), and an id is the only way to act on one specific copy
-    rather than "every file called this".
+    Returns {id, name, unmatched, reason} -- not bare names, since two files
+    can legitimately share a name (the Apps Script's own collision race,
+    before it was fixed, left some behind) and an id is the only way to act
+    on one specific copy rather than "every file called this".
+
+    unmatched is true for a file /imports/from-drive would mark "_failed" on
+    sight -- an unparseable filename, or one naming a bank_master account
+    that doesn't exist (never set up, or deactivated). Checked here, before
+    anyone commits to a run, so the picker can warn about them and offer to
+    discard them straight away instead of finding out only after importing.
     """
     folder_id = await get_drive_folder_id(user["schema"])
     if not folder_id:
@@ -404,8 +411,31 @@ async def list_drive_files(user: dict = Depends(get_company_user)):
                             "No Drive folder is configured yet -- set one on "
                             "this page first.")
     drive_files = await asyncio.to_thread(drive.list_folder_files, folder_id)
-    pending = [{"id": f["id"], "name": f["name"]} for f in drive_files
-              if not _already_marked(f["name"])]
+    candidates = [f for f in drive_files if not _already_marked(f["name"])]
+
+    async with company_connection(user["schema"]) as conn:
+        bank_lookup = await bulk_bank_lookup(conn)
+
+    pending = []
+    for f in candidates:
+        stem, ext = _split_ext(f["name"])
+        if stem.lower().endswith("_failed"):
+            stem = stem[: -len("_failed")]
+        hint = _parse_drive_filename(stem)
+        if hint is None:
+            pending.append({
+                "id": f["id"], "name": f["name"], "unmatched": True,
+                "reason": "Filename doesn't match the expected "
+                         "\"yyyymmdd BANK 1234\" pattern.",
+            })
+            continue
+        shortname, last4 = hint
+        bank_id = bank_lookup.get((shortname.upper(), last4))
+        pending.append({
+            "id": f["id"], "name": f["name"], "unmatched": bank_id is None,
+            "reason": None if bank_id is not None else
+                     f"No active bank account matches '{shortname}' ending {last4}.",
+        })
     return {"files": pending}
 
 
