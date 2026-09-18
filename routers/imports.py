@@ -215,9 +215,31 @@ def _already_marked(filename: str) -> bool:
     or a bank_master row can change after the fact, and once it does the
     same file should be picked back up automatically rather than staying
     stuck until someone finds and re-uploads it by hand.
+
+    Nor does "_bank_absent", for the same reason and more strongly: it means
+    exactly "no bank_master row matched this yet". Adding that account is
+    what un-hides it, so it has to be re-checked every listing rather than
+    filtered out here. See _retryable_stem and the bank test in
+    /imports/drive-files.
     """
     stem, _ = _split_ext(filename)
     return stem.lower().endswith(("_done", "_needs_password"))
+
+
+# Suffixes this app writes that a later run may legitimately reconsider.
+# Stripped before parsing so a retried file is read from the same clean base
+# name as one seeing this for the first time, instead of stacking a second
+# suffix onto the first.
+_RETRYABLE_SUFFIXES = ("_failed", "_bank_absent")
+
+
+def _retryable_stem(stem: str) -> tuple[str, bool]:
+    """(clean stem, was_skipped). was_skipped marks a "_bank_absent" file."""
+    lowered = stem.lower()
+    for suffix in _RETRYABLE_SUFFIXES:
+        if lowered.endswith(suffix):
+            return stem[: -len(suffix)], suffix == "_bank_absent"
+    return stem, False
 
 
 # "yyyymmdd SHORTNAME LAST4" -- exactly what the Gmail Apps Script names a
@@ -568,7 +590,14 @@ async def list_drive_files(
     sight -- an unparseable filename, or one naming a bank_master account
     that doesn't exist (never set up, or deactivated). Checked here, before
     anyone commits to a run, so the picker can warn about them and offer to
-    discard them straight away instead of finding out only after importing.
+    skip them straight away instead of finding out only after importing.
+
+    A file already skipped ("_bank_absent") is re-checked rather than
+    filtered out, and only hidden while the reason it was skipped still
+    holds. Adding that account to Master Data is therefore the whole of the
+    undo: the next time this list loads, the file is simply back in it. The
+    alternative -- hiding it permanently -- strands statements in Drive that
+    nothing in the app can see, which is how files get lost.
     """
     folder_id = await _import_folder_or_400(user["schema"])
     drive_files = await asyncio.to_thread(drive.list_folder_files, folder_id)
@@ -580,10 +609,14 @@ async def list_drive_files(
     pending = []
     for f in candidates:
         stem, ext = _split_ext(f["name"])
-        if stem.lower().endswith("_failed"):
-            stem = stem[: -len("_failed")]
+        stem, was_skipped = _retryable_stem(stem)
         hint = _parse_drive_filename(stem)
         if hint is None:
+            # A skipped file whose name never parsed cannot start matching
+            # later -- no Master Data change can fix an unreadable name --
+            # so it stays hidden rather than reappearing on every load.
+            if was_skipped:
+                continue
             pending.append({
                 "id": f["id"], "name": f["name"], "unmatched": True,
                 "reason": "Filename doesn't match the expected "
@@ -592,44 +625,71 @@ async def list_drive_files(
             continue
         shortname, last4 = hint
         bank_id = bank_lookup.get((shortname.upper(), last4))
+        if was_skipped and bank_id is None:
+            continue                    # still no bank -- stay skipped
         pending.append({
             "id": f["id"], "name": f["name"], "unmatched": bank_id is None,
             "reason": None if bank_id is not None else
                      f"No active bank account matches '{shortname}' ending {last4}.",
+            # True for a file that was skipped and has since become
+            # importable, so the picker can say so rather than having it
+            # silently reappear among files nobody has seen before.
+            "restored": was_skipped,
         })
     return {"files": pending}
 
 
-@router.delete("/drive-files/{file_id}")
-async def delete_pending_drive_file(
+@router.post("/drive-files/{file_id}/skip")
+async def skip_drive_file(
     file_id: str,
     user: dict = Depends(get_company_user),
 ):
     """
-    Moves one not-yet-imported Drive file to Trash -- for discarding a
-    duplicate copy (same name, from the pre-fix Apps Script race) directly
-    from the picker, without waiting for /imports/from-drive to mark it
-    "_failed" as a duplicate on its own. Same Trash-not-delete reasoning as
-    /imports/drive-cleanup: this app's Shared Drive access is Editor-level,
-    which can only trash a file, not permanently delete it.
+    Set a not-yet-imported file aside: rename it "..._bank_absent.ext" so it
+    stops appearing in the picker, while leaving it exactly where it is in
+    Drive.
 
-    Same permission level as starting a Drive import itself -- this only
-    ever touches a file nothing has processed yet, unlike drive-cleanup
-    which prunes already-imported ("_done") statements and is manager+.
+    This replaced a delete button. Deleting is the wrong answer to "no bank
+    account matches this yet", because that sentence is about Master Data
+    and not about the file -- the statement itself is perfectly good, and
+    throwing it away to clear a warning loses real data to fix a bookkeeping
+    gap. Renaming keeps the statement and clears the warning.
+
+    Nothing has to be undone by hand afterwards: /imports/drive-files
+    re-reads the bank out of the name every time it lists, so adding the
+    missing account to Master Data brings the file straight back into the
+    list. See _already_marked for why "_bank_absent" is deliberately not
+    treated as permanently handled the way "_done" is.
+
+    Same permission level as starting a Drive import -- this only ever
+    touches a file nothing has processed yet, and it destroys nothing.
     """
     folder_id = await _import_folder_or_400(user["schema"])
 
-    # Confirm the file is actually in that folder before trashing it. The id
+    # Confirm the file is actually in that folder before renaming it. The id
     # arrives from the caller, and this app's Drive grant reaches far more
-    # than one folder -- without this, a wrong (or invented) id would trash
+    # than one folder -- without this, a wrong (or invented) id would rename
     # whatever it happened to name, somewhere nobody was looking at.
     drive_files = await asyncio.to_thread(drive.list_folder_files, folder_id)
-    if not any(f["id"] == file_id for f in drive_files):
+    match = next((f for f in drive_files if f["id"] == file_id), None)
+    if match is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND,
                             "That file isn't in this Drive folder.")
 
-    await asyncio.to_thread(drive.trash_file, file_id)
-    return {"status": "trashed"}
+    stem, ext = _split_ext(match["name"])
+    if stem.lower().endswith("_bank_absent"):
+        return {"status": "skipped", "name": match["name"]}
+    # Strip a stale "_failed" first, so a file that failed once and is now
+    # being set aside doesn't end up as "..._failed_bank_absent.ext".
+    stem, _ = _retryable_stem(stem)
+    new_name = f"{stem}_bank_absent{ext}"
+
+    await asyncio.to_thread(drive.rename_file, file_id, new_name)
+    await log_drive_result(
+        user["schema"], file_name=match["name"], status="skipped",
+        imported_by=user["username"],
+        error="Set aside — no matching account in Master Data.")
+    return {"status": "skipped", "name": new_name}
 
 
 @router.post("/from-drive")
@@ -751,8 +811,10 @@ async def import_from_drive(
                 # parsing and every rename below work from the same clean
                 # base name as a file seeing this for the first time, instead
                 # of stacking a second "_failed"/"_done" onto the first.
-                if stem.lower().endswith("_failed"):
-                    stem = stem[: -len("_failed")]
+                # "_bank_absent" is stripped here too: a file only reaches
+                # this run once its account exists, and it should then be
+                # named as though it had never been set aside.
+                stem, was_skipped = _retryable_stem(stem)
 
                 if ext not in (".pdf", ".xlsx", ".xls", ".csv"):
                     await _record(f["name"], "skipped",
@@ -775,6 +837,21 @@ async def import_from_drive(
                 async with company_connection(user["schema"]) as conn:
                     matched_bank_id = await find_bank_by_hint(conn, *hint)
                 if matched_bank_id is None:
+                    # A file someone had already set aside, swept up again by
+                    # a blank "import everything" run while its account still
+                    # doesn't exist. Put the "_bank_absent" mark back rather
+                    # than downgrading it to "_failed": nothing new has been
+                    # learned about it, and losing that mark would make it
+                    # reappear in the picker on the next load.
+                    if was_skipped:
+                        await asyncio.to_thread(
+                            drive.rename_file, f["id"], f"{stem}_bank_absent{ext}")
+                        await _record(
+                            f["name"], "skipped",
+                            error=f"Still set aside — no active bank account "
+                                 f"matches '{hint[0]}' ending {hint[1]}.")
+                        jobs.complete_step(job_id, rows=0)
+                        continue
                     await asyncio.to_thread(
                         drive.rename_file, f["id"], f"{stem}_failed{ext}")
                     await _record(
