@@ -317,6 +317,35 @@ async def _verify_folder(folder_id: str) -> str:
             "folder is shared with the Google account this app signs in as.")
 
 
+@router.post("/drive-folder/verify")
+async def verify_drive_folder(
+    url: str = Form(..., description="A Drive folder URL, or a bare folder id"),
+    user: dict = Depends(require_manager),
+):
+    """
+    Check a pasted Drive link WITHOUT saving anything.
+
+    Purely a read: pull the id out of the link, open the folder, and report
+    its name and how many files are sitting in it. Nothing is written, so
+    this is safe to call as often as someone edits the box.
+
+    The point is that "the folder ID is correct" and "this is the folder I
+    meant" are different questions. A well-formed link to the wrong folder
+    passes every check the save path can make on its own -- only the folder's
+    real name and file count let a person see they pasted last year's
+    archive instead of this month's statements, and see it before the
+    setting is live rather than after an import comes back empty.
+
+    Manager+, matching the two settings it serves -- it opens an arbitrary
+    folder using this app's own Drive grant, which is not something a staff
+    account should be able to probe with.
+    """
+    folder_id = _folder_id_or_400(url)
+    name = await _verify_folder(folder_id)
+    files = await asyncio.to_thread(drive.list_folder_files, folder_id)
+    return {"folder_id": folder_id, "name": name, "file_count": len(files)}
+
+
 async def _import_folder_or_400(schema: str) -> str:
     """The folder Drive imports read, refusing clearly when none is set."""
     folder_id = await get_import_folder_id(schema)
