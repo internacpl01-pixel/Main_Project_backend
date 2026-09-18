@@ -26,6 +26,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import threading
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -41,7 +42,26 @@ import config
 # the account's whole Drive.
 _SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-_service = None
+_lock = threading.Lock()
+
+# Every Drive call in this module runs inside asyncio.to_thread, on whatever
+# worker thread FastAPI's default executor happens to hand it -- and two
+# imports running close together (a background job plus someone opening the
+# picker, say) genuinely land on two different threads at once.
+#
+# httplib2's connections are NOT thread-safe: googleapiclient's own docs say
+# so explicitly. A single shared `_service` meant every thread reused the
+# same underlying socket, and two threads reading/writing that socket at the
+# same moment corrupts the TLS record -- exactly the
+# "DECRYPTION_FAILED_OR_BAD_RECORD_MAC" seen in production. It is silent
+# until two calls genuinely overlap, which is why it did not show up in the
+# single-call verification this feature was tested with.
+#
+# Fixed with one client per thread rather than a lock around every call:
+# serialising every Drive call through one lock would turn a Drive import of
+# 300 files back into one call at a time, which is the slowness this whole
+# feature exists to avoid.
+_thread_local = threading.local()
 
 
 def _load_credentials() -> Credentials:
@@ -85,10 +105,26 @@ def _load_credentials() -> Credentials:
 
 
 def _get_service():
-    global _service
-    if _service is None:
-        _service = build("drive", "v3", credentials=_load_credentials())
-    return _service
+    """One Drive client PER THREAD, not one for the whole process.
+
+    See the note on _thread_local above: sharing a single httplib2-backed
+    service across threads is what produced the SSL "bad record mac"
+    errors. threading.local() gives each worker thread its own instance the
+    first time it calls in, and every call after that on the same thread
+    reuses it -- so this is not "a fresh client every request", just "never
+    a client two threads touch at once".
+    """
+    service = getattr(_thread_local, "service", None)
+    if service is None:
+        # The lock is only around building credentials, not around using
+        # them: two threads racing to refresh an expired token at the same
+        # moment could otherwise both write DRIVE_TOKEN_PATH at once. It is
+        # not held while a request is in flight, so this does not serialise
+        # the Drive calls themselves.
+        with _lock:
+            service = build("drive", "v3", credentials=_load_credentials())
+        _thread_local.service = service
+    return service
 
 
 def list_folder_files(folder_id: str) -> list[dict]:
