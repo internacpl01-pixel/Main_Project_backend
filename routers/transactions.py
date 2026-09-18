@@ -1279,13 +1279,20 @@ _EXPORT_KINDS = {
 
 async def _build_farvision_export(
     *, schema: str, user: dict, kind: str, batch_id, classified, date_from,
-    date_to, account, company, search, rule_conflicts,
+    date_to, account, company, search, rule_conflicts, job_id: str | None = None,
 ) -> tuple[bytes, str]:
     """The actual work behind export-farvision: fetch, match, and render.
 
     Split out so it can run either inline (background=false, the original
     behaviour) or inside a jobs.py background task (background=true) without
     two copies of the same body.
+
+    job_id, when given, is what turns the export's own spinner into a real
+    percentage: a cheap COUNT first (same WHERE, so it costs nothing extra
+    that fetch_rows wasn't already going to do) tells services.jobs how many
+    rows this export will actually match, and fetch_rows' on_row ticks one
+    per row matched -- the same real, row-by-row progress the Farvision
+    Verify listing already shows, not a number invented to fill the wait.
     """
     filter_fn, sheets, filename = _EXPORT_KINDS[kind]
     async with company_connection(schema) as conn:
@@ -1294,7 +1301,16 @@ async def _build_farvision_export(
             date_from=date_from, date_to=date_to, account=account,
             company=company, search=search, rule_conflicts=rule_conflicts,
         )
-        rows = await farvision.fetch_rows(conn, where, params, schema=schema)
+        on_row = None
+        if job_id is not None:
+            total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
+            jobs.start_step(
+                job_id, index=1, total=1, label="Farvision export",
+                units=max(1, total),
+                message="Matching rows against the Account Head master...",
+            )
+            on_row = lambda i, n: jobs.tick(job_id)              # noqa: E731
+        rows = await farvision.fetch_rows(conn, where, params, schema=schema, on_row=on_row)
 
     content = farvision.to_xlsx_bytes(filter_fn(rows), sheets)
     return content, filename
@@ -1363,13 +1379,12 @@ async def export_farvision(
     )
 
     async def _runner():
-        jobs.set_state(job_id, jobs.PARSING, "Building the Farvision workbook...")
         try:
             content, filename = await _build_farvision_export(
                 schema=user["schema"], user=user, kind=kind, batch_id=batch_id,
                 classified=classified, date_from=date_from, date_to=date_to,
                 account=account, company=company, search=search,
-                rule_conflicts=rule_conflicts,
+                rule_conflicts=rule_conflicts, job_id=job_id,
             )
             jobs.finish(job_id, {
                 "filename": filename,
@@ -1397,6 +1412,13 @@ async def farvision_verify_rows(
     search: str = Query(""),
     rule_conflicts: str = Query(None),
     page: int = Query(1, ge=1),
+    page_size: int = Query(_FARVISION_VERIFY_PAGE_SIZE, ge=1, le=500),
+    background: bool = Query(
+        False,
+        description="true returns a job id immediately; poll GET /imports/jobs/{id} "
+                    "for a real row-by-row percent and read result.rows/.columns/"
+                    ".total once state is 'done'",
+    ),
     user: dict = Depends(get_company_user),
 ):
     """Every row export-farvision's own filters would include, with its
@@ -1418,20 +1440,70 @@ async def farvision_verify_rows(
     response for a 253-row batch. Export is unaffected: it never passes
     page/limit and still matches and writes the entire filtered set, exactly
     as before.
-    """
-    async with company_connection(user["schema"]) as conn:
-        where, params, _columns, _term, _idx = await _temp_filters(
-            conn, user, batch_id=batch_id, classified=classified,
-            date_from=date_from, date_to=date_to, account=account,
-            company=company, search=search, rule_conflicts=rule_conflicts,
-        )
-        total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
-        rows = await farvision.fetch_rows(
-            conn, where, params, schema=user["schema"],
-            limit=_FARVISION_VERIFY_PAGE_SIZE,
-            offset=(page - 1) * _FARVISION_VERIFY_PAGE_SIZE,
-        )
 
+    background=true hands the page's matching to services.jobs, the same
+    registry /imports/pdf and export-farvision's own background mode already
+    use -- and, unlike either of those, actually ticks it once per row (see
+    services.farvision.fetch_rows' on_row), so the Farvision Verify page's
+    loading spinner can show a real percentage rather than none at all or one
+    invented to fill the wait -- this app's standing rule for a progress
+    number (see ImportProgressOverlay.jsx).
+    """
+    if not background:
+        async with company_connection(user["schema"]) as conn:
+            where, params, _columns, _term, _idx = await _temp_filters(
+                conn, user, batch_id=batch_id, classified=classified,
+                date_from=date_from, date_to=date_to, account=account,
+                company=company, search=search, rule_conflicts=rule_conflicts,
+            )
+            total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
+            rows = await farvision.fetch_rows(
+                conn, where, params, schema=user["schema"],
+                limit=page_size, offset=(page - 1) * page_size,
+            )
+        return _shape_farvision_verify_rows(rows, total=total, page=page, page_size=page_size)
+
+    job_id = jobs.create(
+        schema=user["schema"], username=user["username"],
+        filename="Farvision Verify", total_units=page_size, total_pages=None,
+    )
+
+    async def _runner():
+        try:
+            async with company_connection(user["schema"]) as conn:
+                where, params, _columns, _term, _idx = await _temp_filters(
+                    conn, user, batch_id=batch_id, classified=classified,
+                    date_from=date_from, date_to=date_to, account=account,
+                    company=company, search=search, rule_conflicts=rule_conflicts,
+                )
+                total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
+                # jobs.create defaults step_units to 1 -- start_step is what
+                # actually sets it to this page's own row count, which is
+                # what makes tick()'s step_done/step_units percent (jobs.get's
+                # "percent" field) track one row at a time instead of jumping
+                # straight to 100 on the very first tick.
+                page_rows = max(0, min(page_size, total - (page - 1) * page_size))
+                jobs.start_step(
+                    job_id, index=1, total=1, label="Farvision rows",
+                    units=max(1, page_rows),
+                    message="Matching rows against the Account Head master...",
+                )
+                rows = await farvision.fetch_rows(
+                    conn, where, params, schema=user["schema"],
+                    limit=page_size, offset=(page - 1) * page_size,
+                    on_row=lambda i, n: jobs.tick(job_id),
+                )
+            jobs.finish(job_id, _shape_farvision_verify_rows(
+                rows, total=total, page=page, page_size=page_size))
+        except Exception as exc:                      # noqa: BLE001
+            logger.warning("[Farvision verify] job %s failed: %s", job_id, exc)
+            jobs.fail(job_id, str(exc))
+
+    jobs.attach_task(job_id, asyncio.create_task(_runner()))
+    return {"job_id": job_id, "state": jobs.QUEUED}
+
+
+def _shape_farvision_verify_rows(rows: list, *, total: int, page: int, page_size: int) -> dict:
     # Every Farvision export column, not just Narration/Account Head --
     # confirmed with the user: this page reviews the row the export will
     # actually write, so it should look like that row, not a narrow summary
@@ -1452,7 +1524,7 @@ async def farvision_verify_rows(
         ],
         "total": total,
         "page": page,
-        "page_size": _FARVISION_VERIFY_PAGE_SIZE,
+        "page_size": page_size,
     }
 
 

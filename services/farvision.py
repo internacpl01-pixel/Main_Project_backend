@@ -81,6 +81,7 @@ endpoints), which writes the chosen text back onto that temp_trans row
 company/037_farvision_account_master.sql's sibling migration 044). Once set,
 an override always wins over re-matching -- see fetch_rows.
 """
+import asyncio
 import re
 import time
 
@@ -721,11 +722,18 @@ async def candidate_pools(conn, schema: str) -> dict:
 async def fetch_rows(
     conn, where: str, params: list, schema: str,
     limit: int | None = None, offset: int | None = None,
+    on_row=None,
 ) -> list[dict]:
     """limit/offset page the query itself -- used only by the Farvision Verify
     listing, which reviews a batch a page at a time rather than matching every
     row up front. export-farvision never passes these: an export is the whole
     filtered set by definition, confirmed with the user as unchanged behaviour.
+
+    on_row(index, total), if given, is called after each row is matched --
+    the Farvision Verify listing's background-job path (routers.transactions'
+    farvision_verify_rows) ticks services.jobs with it, so the spinner shown
+    while a page loads can report a real, row-by-row percentage instead of
+    either nothing or a number invented to fill the wait.
 
     p/bn are joined here too even though this function never reads them,
     solely so the count query and this one can share exactly the same alias
@@ -784,16 +792,26 @@ async def fetch_rows(
 
     # One candidate list per distinct company seen in this batch, fetched
     # once rather than per row -- a batch is usually one bank account and
-    # therefore one company, but nothing here assumes that.
-    candidates_by_company: dict[str | None, list[dict]] = {}
-    dup_options_by_company: dict[str | None, dict[str, list[str]]] = {}
+    # therefore one company, but nothing here assumes that. Prefetched for
+    # every company actually present up front, rather than lazily on first
+    # encounter inside the row loop below: the loop itself is now plain
+    # synchronous Python (see _build_row/on_row below) with no `await` of its
+    # own, so anything it needs has to already be in hand before it starts.
     bank_name_candidates = await _cached(
         (schema, "bank_names"), lambda: _bank_name_candidates(conn))
     bank_short_codes = await _cached(
         (schema, "bank_codes"), lambda: _bank_short_codes(conn))
+    candidates_by_company: dict[str | None, list[dict]] = {}
+    dup_options_by_company: dict[str | None, dict[str, list[str]]] = {}
+    for company in {r["company"] for r in rows}:
+        candidates_by_company[company] = await _cached(
+            (schema, "account_heads", company),
+            lambda company=company: _account_head_candidates(conn, company))
+        dup_options_by_company[company] = await _cached(
+            (schema, "dup_options", company),
+            lambda company=company: _duplicate_options_map(conn, company))
 
-    out = []
-    for i, r in enumerate(rows, start=1):
+    def _build_row(i: int, r) -> dict:
         internal = _is_internal(r["head_name"])
         skip_doc_type = _skip_document_type(r["head_name"])
         if skip_doc_type:
@@ -815,10 +833,6 @@ async def fetch_rows(
         if internal:
             pool = bank_name_candidates
         else:
-            if company not in candidates_by_company:
-                candidates_by_company[company] = await _cached(
-                    (schema, "account_heads", company),
-                    lambda company=company: _account_head_candidates(conn, company))
             pool = [c["account_head"] for c in candidates_by_company[company]]
 
         account_head_options = None
@@ -840,10 +854,6 @@ async def fetch_rows(
                 r["desc_text"], bank_name_candidates, bank_short_codes)
             parent_account_head = None
         else:
-            if company not in dup_options_by_company:
-                dup_options_by_company[company] = await _cached(
-                    (schema, "dup_options", company),
-                    lambda company=company: _duplicate_options_map(conn, company))
             account_head, parent_account_head = _match_account_head(
                 r["desc_text"], candidates_by_company[company])
 
@@ -883,7 +893,7 @@ async def fetch_rows(
         # shows every row either way, confirmed with the user.
         account_head_matched = account_head is not None
 
-        out.append({
+        return {
             # Not real columns -- to_xlsx_bytes only ever reads COLUMNS, so
             # these ride along harmlessly for callers that want them (the
             # Farvision Verify endpoint, to show every row's current state).
@@ -946,8 +956,22 @@ async def fetch_rows(
                 (r["debit_amount"] or r["credit_amount"])
                 if parent_account_head else None
             ),
-        })
-    return out
+        }
+
+    def _build_all() -> list[dict]:
+        # Run off the event loop (see fetch_rows's own asyncio.to_thread call
+        # below) -- matching a page of rows against a ~7,900-row master is
+        # real CPU work (measured ~40ms/row), and doing it inline on the loop
+        # would block every other request, including a caller polling this
+        # same job's progress, for the whole page.
+        out = []
+        for i, r in enumerate(rows, start=1):
+            out.append(_build_row(i, r))
+            if on_row is not None:
+                on_row(i, len(rows))
+        return out
+
+    return await asyncio.to_thread(_build_all)
 
 
 _DATE_COLUMNS = {"Document Date", "Date", "Invoice Date"}
