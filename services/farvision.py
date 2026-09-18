@@ -464,6 +464,32 @@ async def _bank_short_codes(conn) -> list[str]:
 
 _ACCOUNT_NUMBER_RE = re.compile(r"\d{6,}")
 
+# A masked/partial account number -- all some rows ever give. Confirmed
+# against real DWARKADHIS-internal-transfer rows whose DESC ends
+# "...BANK OF MAHARASHTRA9675" or "...BANK OF MAHARASHTRAx9675": no 6+ digit
+# run exists anywhere (so _ACCOUNT_NUMBER_RE above never fires), but the
+# trailing 4 digits are the real account's own last 4 -- the same tail
+# _match_bank_name already trusts for BankName. The 'x' is an occasional
+# masking character seen live between the bank's name and the digits.
+_TRAILING_LAST4_RE = re.compile(r"(\d{4})\D{0,3}$")
+
+# A bank sometimes writes its own full name in DESC rather than the short
+# code bank_master and Farvision's own Bank Name entries use -- confirmed
+# against real rows reading "...BANK OF MAHARASHTRA" with the word
+# "MAHARASHTRA" spelled out in full and no "BOM" anywhere in the text, which
+# the plain code-substring check below could never recognise. Matched as a
+# whole phrase, not a shared word, so "MAHARASHTRA" turning up in some
+# unrelated context does not tag a row that has nothing to do with this bank.
+# Only the banks this app's own Apps Script (Code.gs's BANK_SENDERS) and
+# bank_master actually know about -- a bank never seen here has no short
+# code to translate a spelled-out name into anyway.
+_BANK_NAME_ALIASES = {
+    "BANK OF MAHARASHTRA": "BOM",
+    "AXIS BANK": "AXIS",
+    "YES BANK": "YES",
+    "KARUR VYSYA BANK": "KVB",
+}
+
 
 def _match_internal_account_head(
     desc_text: str | None, bank_names: list[str], short_codes: list[str],
@@ -482,9 +508,12 @@ def _match_internal_account_head(
          _match_bank_name already matches BankName -- confident, filled
          directly. More than one distinct bank matched this way is offered
          as a dropdown instead of guessing between them.
-      2. A short bank code found in DESC -- offered as a dropdown of every
-         Farvision Bank Name sharing that code, since several accounts can.
-      3. Every Farvision Bank Name, as a last-resort dropdown, when DESC gave
+      2. A masked account number's last 4 digits, trailing DESC -- the only
+         signal some rows give at all (see _TRAILING_LAST4_RE above).
+      3. A short bank code, or one of its spelled-out full-name aliases,
+         found in DESC -- offered as a dropdown of every Farvision Bank Name
+         sharing that code, since several accounts can.
+      4. Every Farvision Bank Name, as a last-resort dropdown, when DESC gave
          no usable hint at all.
     """
     if not bank_names:
@@ -511,9 +540,33 @@ def _match_internal_account_head(
     if len(by_number) > 1:
         return None, sorted(by_number)
 
+    m = _TRAILING_LAST4_RE.search(compact.strip())
+    if m:
+        last4 = m.group(1)
+        by_last4 = {b for b in bank_names if re.sub(r"\D", "", b).endswith(last4)}
+        if len(by_last4) == 1:
+            head = next(iter(by_last4))
+            return head, (_closest_matches(desc_text, bank_names) or [head])
+        if len(by_last4) > 1:
+            return None, sorted(by_last4)
+
     desc_upper = (desc_text or "").upper()
+    # \b, not a bare substring -- confirmed against real data that every one
+    # of these NEFT rows' DESC starts "YIB-NEFT-YESME<utr>...", Yes Bank's
+    # own UTR reference prefix on the SENDING side, present regardless of
+    # which bank the transfer is actually going to. A plain `"YES" in
+    # desc_upper` matched that prefix's "YES" on every single row here, not
+    # just a real "Yes Bank" mention -- \b requires a real word boundary, so
+    # it still matches "...YES BANK..." (space before/after) but not "YESME"
+    # (no boundary between the "S" and the "M" that follows).
+    matched_codes = {
+        code for code in short_codes
+        if code and re.search(rf"\b{re.escape(code.upper())}\b", desc_upper)
+    }
+    matched_codes.update(
+        code for phrase, code in _BANK_NAME_ALIASES.items() if phrase in desc_upper)
     by_code = {
-        b for code in short_codes if code and code.upper() in desc_upper
+        b for code in matched_codes
         for b in bank_names if code.upper() in b.upper()
     }
     if by_code:
@@ -532,15 +585,81 @@ def _match_internal_account_head(
 _ACCOUNT_TABLES = {"DPL": "farvision_account_master_dpl", "AMB": "farvision_account_master_amb"}
 
 
-async def _account_head_candidates(conn, company: str | None) -> list[dict]:
-    """This company's Account Heads, longest name first.
+# What counts as a trailing internal reference code -- "AH000349",
+# "AH003677", "CR0080", "E1000283", "E1000283_D" -- 1-4 letters then 3+
+# digits, an optional trailing "_" + a letter -- or a bare number ("710",
+# the whole of "Rahul Aggarwal(710)"'s own trailing word once punctuation is
+# stripped). Deliberately NOT "any word with a digit in it": an early cut of
+# this tried that and stripped "HEAD2" off a genuine two-word head "SALARY
+# HEAD2", collapsing it to the bare word "SALARY" -- generic enough to match
+# almost any salary-related DESC and turn a should-stay-blank row into a
+# confident, wrong one. Requiring 3+ digits (or an all-digit token) is what a
+# real ledger id looks like; "HEAD2" (four letters, one digit) does not,
+# and is correctly left alone.
+_CODE_WORD_RE = re.compile(r"^[A-Z]{1,4}\d{3,}(?:_[A-Z])?$|^\d{2,}$")
 
-    Longest-first means the first substring hit while scanning in order is
-    also the most specific one -- the same reasoning the Rules engine uses:
-    a bare, generic head name should not win over one that actually names the
-    party. Looked up from the row's own company's table, so 'INTEREST' in
-    DPL's books cannot match an AMB row and vice versa. A company that isn't
-    DPL or AMB has no table to match against.
+
+def _strip_trailing_code(words: list[str]) -> list[str]:
+    """Drop a trailing internal reference code from an Account Head's own
+    normalized words -- "RAHUL KUMAR SHARMA AH003677", "MAHIPAL SINGH
+    YADAV CR0080", "RAHUL AGGARWAL 710" all carry one, and it is this app's
+    own ledger id, not text a bank's narration could ever spell out.
+    Confirmed against real data: ~48% of AMB's own Account Head master ends
+    in a word containing a digit, and the plain substring match below never
+    matched any of them for exactly this reason -- the candidate's FULL
+    normalized text, code included, had to appear verbatim in DESC, which it
+    structurally never can.
+
+    Only trailing words are dropped, one at a time, stopping at the first
+    real (non-code) word from the end -- a code embedded earlier in a name is
+    not this pattern and is left alone. See _CODE_WORD_RE above for what
+    counts as a code.
+
+    Stops at 2 words remaining, not 1: "RAHUL - E1000283_D" is a bare first
+    name plus a code, and stripping the code down to the single word "RAHUL"
+    would make it match almost any DESC mentioning anyone named Rahul --
+    confirmed live, where this collapsed several such entries to "RAHUL" and
+    one of them (arbitrarily, whichever the DB happened to return first) won
+    a row that named a "Rahul Kumar" with no such entry in the master at all.
+    A genuinely single-word head to begin with ("Rahul", no code) is
+    unaffected either way -- there is nothing after its one word to strip.
+
+    A numeric code is sometimes followed by its own short bracketed tag --
+    "RAHUL KUMAR - CR0198(AR)" normalizes to four words ending "... CR0198
+    AR", and "AR" alone does not look like a code (no digit at all), so
+    popping only the last word would stop one word too early and leave
+    "AR" stuck onto the core. Both go together only when the short tag
+    directly follows a word that IS code-shaped -- a real trailing initial
+    or short surname elsewhere is never touched, since nothing code-shaped
+    precedes it.
+    """
+    out = list(words)
+    while len(out) > 2:
+        if (len(out) > 3 and _CODE_WORD_RE.match(out[-2])
+                and out[-1].isalpha() and len(out[-1]) <= 3):
+            out = out[:-2]
+            continue
+        if _CODE_WORD_RE.match(out[-1]):
+            out.pop()
+            continue
+        break
+    return out
+
+
+async def _account_head_candidates(conn, company: str | None) -> list[dict]:
+    """This company's Account Heads, most specific (longest matchable core)
+    first.
+
+    Longest-first means the first hit while scanning in order is also the
+    most specific one -- the same reasoning the Rules engine uses: a bare,
+    generic head name should not win over one that actually names the party.
+    Sorted by the CORE text (trailing reference code stripped), not the raw
+    normalized text, so a short name padded out by a long code ("RAHUL -
+    AH003677_D") does not rank above a genuinely longer name with no code at
+    all purely because its own text happens to be longer. Looked up from the
+    row's own company's table, so 'INTEREST' in DPL's books cannot match an
+    AMB row and vice versa. A company that isn't DPL or AMB has no table to
+    match against.
     """
     table = _ACCOUNT_TABLES.get((company or "").strip().upper())
     if not table:
@@ -549,7 +668,16 @@ async def _account_head_candidates(conn, company: str | None) -> list[dict]:
     candidates = [dict(r) for r in rows]
     for c in candidates:
         c["_norm"] = _normalize_party_name(c["account_head"])
-    return sorted(candidates, key=lambda r: -len(r["_norm"]))
+        core_words = _strip_trailing_code(c["_norm"].split())
+        c["_core"] = " ".join(core_words)
+        # Every space removed -- used only as a second-chance match (see
+        # _match_account_head) against DESC with its own spaces removed too,
+        # so a stray space a PDF extraction inserted INSIDE a real word
+        # ("RAHU L KUMAR" for "RAHUL KUMAR", confirmed live) does not hide an
+        # otherwise-exact match.
+        c["_core_blob"] = "".join(core_words)
+        c["_core_word_count"] = len(core_words)
+    return sorted(candidates, key=lambda r: -len(r["_core"]))
 
 
 def _duplicate_key(account_head: str) -> str:
@@ -645,6 +773,25 @@ def _closest_matches(desc_text: str | None, texts: list[str], limit: int = 20) -
     return [text for _, _, text in scored[:limit]]
 
 
+def _same_letter_options(desc_text: str | None, texts: list[str], limit: int = 30) -> list[str]:
+    """Last resort when even _closest_matches shares no whole keyword at
+    all: every candidate whose own first letter matches some real (4+
+    letter) word in DESC.
+
+    Confirmed with the user as their own explicit ask for exactly this
+    situation -- a PDF-extraction stray space can break a name badly enough
+    that not one whole word survives to overlap on ("RAHU L KUMAR" shares no
+    4+-letter word with any "RAHUL ..." head, since "RAHU" and "L" are both
+    on their own). Not a match, and not scored or ranked -- just a narrower
+    "possibility" list than the entire master, on the one signal that
+    survives almost any mid-word split: the first letter.
+    """
+    letters = {w[0] for w in _normalize_party_name(desc_text).split() if len(w) >= _KEYWORD_MIN_LEN}
+    if not letters:
+        return []
+    return sorted({t for t in texts if t and t[0].upper() in letters})[:limit]
+
+
 # Below this normalized length, a head name is too generic to trust as a
 # plain substring match -- confirmed against two real false positives once
 # punctuation-stripping was added: "CR--" (normalizes to "CR", 2 chars)
@@ -656,7 +803,9 @@ def _closest_matches(desc_text: str | None, texts: list[str], limit: int = 20) -
 _MIN_MATCH_LENGTH = 5
 
 
-def _match_account_head(desc_text: str | None, candidates: list[dict]) -> tuple[str | None, str | None]:
+def _match_account_head(
+    desc_text: str | None, candidates: list[dict],
+) -> tuple[str | None, str | None, list[str] | None]:
     """Search temp_trans's own DESC field (field_text_1), the real bank text.
 
     NARRATION (field_text_11) looked like it should be the search source, but
@@ -669,16 +818,57 @@ def _match_account_head(desc_text: str | None, candidates: list[dict]) -> tuple[
     confirmed by the user's own screenshot of it, and is searched whole --
     there is no "To:"/"Purpose:" structure in DESC to isolate a party
     segment from, unlike the synthetic Narration.
+
+    Returns (account_head, parent_account_head, options): options is only
+    ever non-None for the second pass below, where more than one candidate's
+    name reassembles from the same broken text -- callers should treat a
+    non-None options exactly like the existing duplicate-spelling case
+    (leave account_head/parent blank, offer options instead).
     """
     if not desc_text:
-        return None, None
+        return None, None, None
     search_text = _normalize_party_name(desc_text)
     if not search_text:
-        return None, None
+        return None, None, None
+
+    # Pass 1: the CORE text (trailing "- AH003677"-style reference code
+    # stripped, see _strip_trailing_code) has to appear in DESC as a whole,
+    # word-ordered phrase -- a bank's own narration can name the party but
+    # never this app's internal ledger id for them. The most precise check,
+    # tried first.
     for c in candidates:
-        if len(c["_norm"]) >= _MIN_MATCH_LENGTH and c["_norm"] in search_text:
-            return c["account_head"], c["parent_account_head"]
-    return None, None
+        if len(c["_core"]) >= _MIN_MATCH_LENGTH and c["_core"] in search_text:
+            return c["account_head"], c["parent_account_head"], None
+
+    # Pass 2: every space removed from both sides, tolerating a stray space a
+    # PDF extraction sometimes inserts INSIDE a real word -- confirmed live,
+    # "RAHU L KUMAR" in DESC for a master entry reading "RAHUL KUMAR - ...",
+    # which Pass 1 can never find since "RAHUL" (one word there) never
+    # appears as one word here. Restricted to a real multi-word core (2+
+    # words) -- a single generic word run together with unrelated
+    # surrounding text is far more likely to collide by accident once word
+    # boundaries are gone, the same reasoning _strip_trailing_code already
+    # applies to what it will even strip down to.
+    search_blob = "".join(search_text.split())
+    hits = [
+        c for c in candidates
+        if c["_core_word_count"] >= 2
+        and len(c["_core_blob"]) >= _MIN_MATCH_LENGTH
+        and c["_core_blob"] in search_blob
+    ]
+    if len(hits) == 1:
+        c = hits[0]
+        return c["account_head"], c["parent_account_head"], None
+    if hits:
+        # More than one candidate's name reassembles from the same broken
+        # text -- often just the same person typed with different
+        # punctuation (the existing duplicate-spelling map two lines below
+        # this function's only caller already catches that shape); a
+        # genuinely different second person is possible too, so this is left
+        # for a human either way rather than guessed.
+        return None, None, sorted({c["account_head"] for c in hits})
+
+    return None, None, None
 
 
 async def lookup_parent_account_head(conn, account_head: str) -> str | None:
@@ -854,21 +1044,28 @@ async def fetch_rows(
                 r["desc_text"], bank_name_candidates, bank_short_codes)
             parent_account_head = None
         else:
-            account_head, parent_account_head = _match_account_head(
+            account_head, parent_account_head, despaced_options = _match_account_head(
                 r["desc_text"], candidates_by_company[company])
 
-            # A match that landed on a head with known duplicates ("India
-            # Pride Com" / "INDIA PRIDE.COM") is left blank rather than
-            # guessed -- the Farvision Verify page offers every spelling in
-            # the group instead, confirmed with the user.
-            account_head_options = dup_options_by_company[company].get(account_head)
-            if account_head_options:
-                # Parent Account Head can differ between spellings in the
-                # same group (confirmed live -- two duplicate rows for the
-                # same party carried different Parent text), so it is just as
-                # ambiguous as Account Head itself and left blank the same way.
-                account_head = None
-                parent_account_head = None
+            if despaced_options:
+                # More than one candidate's name reassembled from the same
+                # broken DESC text (see _match_account_head's second pass) --
+                # already a genuine ambiguity list, same shape as the
+                # duplicate-spelling case just below.
+                account_head_options = despaced_options
+            else:
+                # A match that landed on a head with known duplicates ("India
+                # Pride Com" / "INDIA PRIDE.COM") is left blank rather than
+                # guessed -- the Farvision Verify page offers every spelling in
+                # the group instead, confirmed with the user.
+                account_head_options = dup_options_by_company[company].get(account_head)
+                if account_head_options:
+                    # Parent Account Head can differ between spellings in the
+                    # same group (confirmed live -- two duplicate rows for the
+                    # same party carried different Parent text), so it is just as
+                    # ambiguous as Account Head itself and left blank the same way.
+                    account_head = None
+                    parent_account_head = None
 
         # Whenever there's no strict ambiguous list already (a confident
         # match that still deserves a "Not correct?" override, or a
@@ -885,8 +1082,19 @@ async def fetch_rows(
         # pool once (GET .../farvision-verify/candidates, fetched separately
         # and cached), and falls back to that itself when a row's own
         # "options" comes back empty.
+        #
+        # When even that shares no whole keyword at all -- a name broken
+        # badly enough by a stray extraction space that no complete word
+        # survives on either side ("RAHU L KUMAR") -- _same_letter_options
+        # is one narrower tier below the full pool: candidates sharing just
+        # the first letter of some real word in DESC, confirmed with the
+        # user as their own ask for exactly this situation.
         if not account_head_options:
-            account_head_options = _closest_matches(r["desc_text"], pool) or None
+            account_head_options = (
+                _closest_matches(r["desc_text"], pool)
+                or _same_letter_options(r["desc_text"], pool)
+                or None
+            )
 
         # Whether this row needs a decision on the Farvision Verify page, or
         # is only offered for an optional "Not correct?" override -- the page
