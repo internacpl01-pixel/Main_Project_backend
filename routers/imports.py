@@ -36,10 +36,9 @@ from services import drive, jobs
 from services.pdf_import import (PDF_BATCH_PAGES, process_pdf_import,
                                  start_pdf_job)
 from services.drive_log import list_drive_log, log_drive_result
-from services.settings import (UnknownDriveFolder, add_extra_drive_folder,
-                               delete_extra_drive_folder, get_drive_folder_id,
-                               list_extra_drive_folders, resolve_drive_folder,
-                               set_drive_folder_id)
+from services.settings import (get_drive_folder_id, get_import_folder_id,
+                               get_raw_import_folder_id, set_drive_folder_id,
+                               set_import_folder_id)
 from services.staging import (DuplicateFileError, bulk_bank_lookup,
                               find_bank_by_hint)
 from services.tabular_import import (READERS, inspect_tabular,
@@ -286,58 +285,8 @@ def _extract_folder_id(value: str) -> str | None:
     return None
 
 
-async def _folder_for(schema: str, folder_id: str | None) -> str:
-    """resolve_drive_folder, with its two failure modes as HTTP errors.
-
-    Blank means the configured folder; anything else must already be saved
-    (see services.settings.resolve_drive_folder for why that check exists).
-    """
-    try:
-        resolved = await resolve_drive_folder(schema, folder_id)
-    except UnknownDriveFolder:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "That Drive folder isn't one of this company's saved folders. "
-            "Add it under Settings first.")
-    if not resolved:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "No Drive folder is configured yet -- set one under Settings first.")
-    return resolved
-
-
-@router.get("/drive-folders")
-async def get_drive_folders(user: dict = Depends(get_company_user)):
-    """
-    The extra folders saved for this company, for the source dropdown on the
-    Import page and the list on the Settings page. The configured Gmail
-    folder is NOT in here -- it comes from /imports/drive-settings, is the
-    one the Apps Script writes into, and is always available as a source
-    whether or not anyone has saved an extra.
-    """
-    return {"folders": await list_extra_drive_folders(user["schema"])}
-
-
-@router.post("/drive-folders")
-async def add_drive_folder(
-    url: str = Form(..., description="A Drive folder URL, or a bare folder id"),
-    label: str = Form("", description="What to call it in the source list; "
-                                      "defaults to the folder's own name"),
-    user: dict = Depends(require_manager),
-):
-    """
-    Save another Drive folder to import from, by pasting its URL.
-
-    The folder is opened before it is saved, so a link that was mistyped, is
-    a file rather than a folder, or was never shared with this app's Google
-    account fails here with something a person can act on -- rather than
-    being stored and failing later, mid-import, looking like the import
-    itself was broken.
-
-    Manager+, the same tier as changing the Gmail folder: both decide where
-    statements may be read from. Using a saved folder afterwards is not
-    restricted, matching /imports/from-drive's own level.
-    """
+def _folder_id_or_400(url: str) -> str:
+    """_extract_folder_id, with the "that isn't a folder link" case as a 400."""
     folder_id = _extract_folder_id(url)
     if not folder_id:
         raise HTTPException(
@@ -345,9 +294,19 @@ async def add_drive_folder(
             "That doesn't look like a Drive folder link. Open the folder in "
             "Drive and copy the address bar, e.g. "
             "https://drive.google.com/drive/folders/1AbC...")
+    return folder_id
 
+
+async def _verify_folder(folder_id: str) -> str:
+    """Open the folder and return its name, or raise a 400 saying why not.
+
+    Every folder is checked before it is saved rather than after. A link
+    that was mistyped, points at a file, or was never shared with this
+    app's Google account otherwise stores fine and fails later, mid-import,
+    where it looks like the import itself is broken.
+    """
     try:
-        name = await asyncio.to_thread(drive.get_folder_name, folder_id)
+        return await asyncio.to_thread(drive.get_folder_name, folder_id)
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
     except Exception:                                  # noqa: BLE001
@@ -357,53 +316,107 @@ async def add_drive_folder(
             "Couldn't open that folder. Check the link, and make sure the "
             "folder is shared with the Google account this app signs in as.")
 
-    row = await add_extra_drive_folder(
-        user["schema"], folder_id, (label.strip() or name), user["username"])
-    return row
 
-
-@router.delete("/drive-folders/{row_id}")
-async def remove_drive_folder(
-    row_id: int, user: dict = Depends(require_manager),
-):
-    """
-    Forget a saved folder. Only this app's bookmark of it is removed --
-    nothing in Drive is renamed, trashed or unshared, and anything already
-    imported from it stays imported.
-    """
-    if not await delete_extra_drive_folder(user["schema"], row_id):
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "No such saved folder.")
-    return {"status": "removed"}
+async def _import_folder_or_400(schema: str) -> str:
+    """The folder Drive imports read, refusing clearly when none is set."""
+    folder_id = await get_import_folder_id(schema)
+    if not folder_id:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "No Drive folder is set up yet -- set one under Settings first.")
+    return folder_id
 
 
 @router.get("/drive-settings")
 async def get_drive_settings(user: dict = Depends(get_company_user)):
-    """The folder ID /imports/from-drive currently reads, for the settings
-    field on the Import page to show as its starting value."""
-    return {"folder_id": await get_drive_folder_id(user["schema"])}
+    """
+    Both Drive folders, for the Settings screen.
+
+    export_folder_id is where the Gmail Apps Script saves attachments.
+    import_folder_id is what every Drive import actually reads -- null when
+    it simply follows the export folder, which is the usual setup and is
+    why the two are reported separately rather than resolved into one. The
+    UI needs to be able to say "same as the export folder" rather than echo
+    the export folder's id back as though someone had typed it in.
+
+    folder_id is the export folder under its old name, kept so an older
+    frontend build still reads the field it expects.
+    """
+    export_id = await get_drive_folder_id(user["schema"])
+    return {
+        "folder_id": export_id,
+        "export_folder_id": export_id,
+        "import_folder_id": await get_raw_import_folder_id(user["schema"]),
+    }
+
+
+@router.put("/import-folder")
+async def update_import_folder(
+    url: str = Form("", description="A Drive folder URL, or a bare folder id. "
+                                    "Blank means follow the export folder."),
+    user: dict = Depends(require_manager),
+):
+    """
+    Set the folder this software imports FROM.
+
+    Deliberately not the same setting as the export folder: that one is
+    shared with the Gmail Apps Script and changing it redirects where
+    statements are collected. This one is read-only as far as the script is
+    concerned, so pointing it at a folder of statements that never came
+    through Gmail changes nothing about the automatic collection.
+
+    Blank clears it, putting imports back to reading the export folder --
+    which is the usual setup, and is also what pasting the export folder's
+    own URL here amounts to. Both are accepted; the same folder in both
+    fields is a perfectly ordinary configuration, not a mistake to reject.
+
+    Manager+, the same tier as changing the export folder: both decide where
+    statements are read from.
+    """
+    if not url.strip():
+        await set_import_folder_id(user["schema"], None)
+        return {"import_folder_id": None, "folder_name": None}
+
+    folder_id = _folder_id_or_400(url)
+    name = await _verify_folder(folder_id)
+    await set_import_folder_id(user["schema"], folder_id)
+    return {"import_folder_id": folder_id, "folder_name": name}
 
 
 @router.put("/drive-settings")
 async def update_drive_settings(
-    folder_id: str = Form(...),
+    folder_id: str = Form("", description="A Drive folder URL, or a bare "
+                                          "folder id. Alias: url."),
+    url: str = Form("", description="Same thing under a clearer name."),
     user: dict = Depends(require_manager),
 ):
     """
-    Change the Drive folder /imports/from-drive watches, from the UI instead
-    of editing config.DRIVE_FOLDER_ID / Render's env var by hand.
+    Change the EXPORT folder -- where the Gmail Apps Script saves statement
+    attachments -- from the UI instead of editing config.DRIVE_FOLDER_ID /
+    Render's env var by hand.
 
-    The Gmail Apps Script keeps its OWN copy of this id (it writes directly
-    into that folder, this backend only reads from it) -- so before saving
-    here, the new value is posted to the script's deployed web app
+    Takes a pasted Drive folder URL as readily as a bare id: the id is the
+    part of a Drive link nobody picks out reliably by eye, and getting it
+    subtly wrong produces a 404 that reads like a permission problem.
+
+    The script keeps its OWN copy of this id (it writes directly into that
+    folder, this backend only reads from it) -- so before saving here, the
+    new value is posted to the script's deployed web app
     (config.APPS_SCRIPT_WEB_APP_URL) carrying a shared secret the script
     checks in its doPost. If the two ever pointed at different folders, the
     script would keep saving statements one place while this backend looked
-    in another, silently. Manager+ only, same tier as discarding a batch --
-    this changes where every future import looks.
+    in another, silently.
+
+    Note what this does NOT touch: the import folder. Somebody who only
+    wants to read a one-off folder of statements should set that instead
+    (PUT /imports/import-folder) -- changing this field would redirect the
+    collection itself, which is rarely what was meant.
+
+    Manager+ only, same tier as discarding a batch -- this changes where
+    every future statement is filed.
     """
-    folder_id = folder_id.strip()
-    if not folder_id:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Folder ID cannot be empty.")
+    folder_id = _folder_id_or_400(url.strip() or folder_id.strip())
+    await _verify_folder(folder_id)
 
     if config.APPS_SCRIPT_WEB_APP_URL:
         try:
@@ -426,7 +439,7 @@ async def update_drive_settings(
                 body.get("error") or "The Apps Script rejected the update.")
 
     await set_drive_folder_id(user["schema"], folder_id)
-    return {"folder_id": folder_id}
+    return {"folder_id": folder_id, "export_folder_id": folder_id}
 
 
 @router.get("/drive-log")
@@ -460,8 +473,6 @@ async def get_drive_log(
 @router.post("/drive-cleanup")
 async def cleanup_drive_done_files(
     older_than_days: int = Form(..., ge=1),
-    folder_id: str = Form("", description="A saved folder to clean instead of "
-                                          "the configured one. Blank = configured."),
     user: dict = Depends(require_manager),
 ):
     """
@@ -483,7 +494,7 @@ async def cleanup_drive_done_files(
     Google purges it there on its own. Manager+ only, the same tier as
     discarding a batch or changing the Drive folder itself.
     """
-    folder_id = await _folder_for(user["schema"], folder_id)
+    folder_id = await _import_folder_or_400(user["schema"])
 
     cutoff = datetime.date.today() - datetime.timedelta(days=older_than_days)
     drive_files = await asyncio.to_thread(drive.list_folder_files, folder_id)
@@ -510,8 +521,6 @@ async def cleanup_drive_done_files(
 
 @router.get("/drive-files")
 async def list_drive_files(
-    folder_id: str = Query("", description="A saved folder to list instead of "
-                                           "the configured one. Blank = configured."),
     user: dict = Depends(get_company_user),
 ):
     """
@@ -532,7 +541,7 @@ async def list_drive_files(
     anyone commits to a run, so the picker can warn about them and offer to
     discard them straight away instead of finding out only after importing.
     """
-    folder_id = await _folder_for(user["schema"], folder_id)
+    folder_id = await _import_folder_or_400(user["schema"])
     drive_files = await asyncio.to_thread(drive.list_folder_files, folder_id)
     candidates = [f for f in drive_files if not _already_marked(f["name"])]
 
@@ -565,8 +574,6 @@ async def list_drive_files(
 @router.delete("/drive-files/{file_id}")
 async def delete_pending_drive_file(
     file_id: str,
-    folder_id: str = Query("", description="The saved folder the file is in. "
-                                           "Blank = configured folder."),
     user: dict = Depends(get_company_user),
 ):
     """
@@ -581,7 +588,7 @@ async def delete_pending_drive_file(
     ever touches a file nothing has processed yet, unlike drive-cleanup
     which prunes already-imported ("_done") statements and is manager+.
     """
-    folder_id = await _folder_for(user["schema"], folder_id)
+    folder_id = await _import_folder_or_400(user["schema"])
 
     # Confirm the file is actually in that folder before trashing it. The id
     # arrives from the caller, and this app's Drive grant reaches far more
@@ -610,25 +617,19 @@ async def import_from_drive(
                     "field from GET /imports/drive-files). Blank imports "
                     "every pending file.",
     ),
-    folder_id: str = Form(
-        "",
-        description="A saved folder (GET /imports/drive-folders) to import "
-                    "from instead of the configured one. Blank = configured.",
-    ),
     user: dict = Depends(get_company_user),
 ):
     """
-    Import files sitting in a Google Drive folder -- by default the one
-    configured folder (services/drive.py, config.DRIVE_FOLDER_ID), which is
-    the other end of the Gmail Apps Script that copies matching statement
-    attachments there automatically, named "yyyymmdd SHORTNAME LAST4.ext".
+    Import files sitting in this company's IMPORT folder (Settings, or PUT
+    /imports/import-folder).
 
-    `folder_id` runs the same import against one of this company's saved
-    extra folders instead (POST /imports/drive-folders) -- a folder of
-    statements that never came through Gmail. Everything below applies
-    unchanged there: same filename-to-bank matching, same auto-password,
-    and the same _done/_failed/_needs_password marking, confirmed with the
-    user, so a part-finished run resumes the same way the Gmail folder does.
+    That is normally the same folder the Gmail Apps Script exports into --
+    the other end of the script that copies matching statement attachments
+    there automatically, named "yyyymmdd SHORTNAME LAST4.ext". It can also
+    be pointed somewhere else entirely, to take in a folder of statements
+    that never came through Gmail; everything below applies unchanged
+    either way, including the _done/_failed/_needs_password marking, so a
+    part-finished run resumes identically wherever it is reading from.
 
     `files` restricts the run to exactly the file IDs named -- the Import
     page always sends this, letting a person pick individual files (or
@@ -665,7 +666,7 @@ async def import_from_drive(
     {"files": [{"name", "status", "row_count"|"error"}], "imported", "failed"}.
     status is one of "done", "failed", "password_required", or "skipped".
     """
-    folder_id = await _folder_for(user["schema"], folder_id)
+    folder_id = await _import_folder_or_400(user["schema"])
 
     clean_batch_pages = PDF_BATCH_PAGES if batch_pages is None else batch_pages
     selected = {n.strip() for n in files.split(",") if n.strip()} or None
@@ -816,8 +817,6 @@ async def retry_drive_file_with_password(
     file_name: str = Form(..., description="The file's current name in Drive, "
                                             "e.g. \"20260415 YES 2477_needs_password.pdf\""),
     password: str = Form(...),
-    folder_id: str = Form("", description="The saved folder the file is in. "
-                                          "Blank = configured folder."),
     user: dict = Depends(get_company_user),
 ):
     """
@@ -833,7 +832,7 @@ async def retry_drive_file_with_password(
     Synchronous, not a background job -- this is always exactly one file, the
     same shape as a plain (non-background) /imports/pdf call.
     """
-    folder_id = await _folder_for(user["schema"], folder_id)
+    folder_id = await _import_folder_or_400(user["schema"])
 
     stem, ext = _split_ext(file_name)
     if not stem.lower().endswith("_needs_password"):
