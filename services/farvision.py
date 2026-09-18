@@ -615,14 +615,15 @@ def _strip_trailing_code(words: list[str]) -> list[str]:
     not this pattern and is left alone. See _CODE_WORD_RE above for what
     counts as a code.
 
-    Stops at 2 words remaining, not 1: "RAHUL - E1000283_D" is a bare first
-    name plus a code, and stripping the code down to the single word "RAHUL"
-    would make it match almost any DESC mentioning anyone named Rahul --
-    confirmed live, where this collapsed several such entries to "RAHUL" and
-    one of them (arbitrarily, whichever the DB happened to return first) won
-    a row that named a "Rahul Kumar" with no such entry in the master at all.
-    A genuinely single-word head to begin with ("Rahul", no code) is
-    unaffected either way -- there is nothing after its one word to strip.
+    Stripped all the way to a single word when that is genuinely all that is
+    left -- "Santosh(419)" is only ever going to be two tokens, name and
+    code, and stopping short of the code would leave it permanently
+    unmatchable (confirmed live). The risk that motivated an earlier, more
+    conservative version of this function -- several bare-name-plus-code
+    entries ("RAHUL - E1000283_D", "RAHUL - E1000283", ...) collapsing to the
+    same generic "RAHUL" and one being picked arbitrarily -- is handled where
+    it belongs instead: _match_account_head now checks for exactly this kind
+    of tie and offers every tied candidate rather than guessing one.
 
     A numeric code is sometimes followed by its own short bracketed tag --
     "RAHUL KUMAR - CR0198(AR)" normalizes to four words ending "... CR0198
@@ -634,8 +635,8 @@ def _strip_trailing_code(words: list[str]) -> list[str]:
     precedes it.
     """
     out = list(words)
-    while len(out) > 2:
-        if (len(out) > 3 and _CODE_WORD_RE.match(out[-2])
+    while len(out) > 1:
+        if (len(out) > 2 and _CODE_WORD_RE.match(out[-2])
                 and out[-1].isalpha() and len(out[-1]) <= 3):
             out = out[:-2]
             continue
@@ -670,13 +671,14 @@ async def _account_head_candidates(conn, company: str | None) -> list[dict]:
         c["_norm"] = _normalize_party_name(c["account_head"])
         core_words = _strip_trailing_code(c["_norm"].split())
         c["_core"] = " ".join(core_words)
-        # Every space removed -- used only as a second-chance match (see
-        # _match_account_head) against DESC with its own spaces removed too,
-        # so a stray space a PDF extraction inserted INSIDE a real word
-        # ("RAHU L KUMAR" for "RAHUL KUMAR", confirmed live) does not hide an
-        # otherwise-exact match.
-        c["_core_blob"] = "".join(core_words)
-        c["_core_word_count"] = len(core_words)
+        # As a set, not just the joined string -- used by _match_account_head's
+        # second pass, which checks a candidate's words against DESC's own
+        # words PLUS every adjacent pair of them re-joined, to survive a
+        # stray space a PDF extraction inserted INSIDE a real word ("RAHU L
+        # KUMAR" for "RAHUL KUMAR", "SANTO SH" for "SANTOSH", both confirmed
+        # live) -- order no longer matters once a word has already been
+        # split apart by whatever broke it.
+        c["_core_words"] = frozenset(core_words)
     return sorted(candidates, key=lambda r: -len(r["_core"]))
 
 
@@ -819,10 +821,9 @@ def _match_account_head(
     there is no "To:"/"Purpose:" structure in DESC to isolate a party
     segment from, unlike the synthetic Narration.
 
-    Returns (account_head, parent_account_head, options): options is only
-    ever non-None for the second pass below, where more than one candidate's
-    name reassembles from the same broken text -- callers should treat a
-    non-None options exactly like the existing duplicate-spelling case
+    Returns (account_head, parent_account_head, options): options is
+    non-None whenever more than one candidate ties for the win -- callers
+    should treat that exactly like the existing duplicate-spelling case
     (leave account_head/parent blank, offer options instead).
     """
     if not desc_text:
@@ -836,36 +837,76 @@ def _match_account_head(
     # word-ordered phrase -- a bank's own narration can name the party but
     # never this app's internal ledger id for them. The most precise check,
     # tried first.
-    for c in candidates:
-        if len(c["_core"]) >= _MIN_MATCH_LENGTH and c["_core"] in search_text:
+    #
+    # candidates is sorted longest-core-first (_account_head_candidates), so
+    # the first match found is also the most specific -- but a code fully
+    # stripped down to a bare, common first name ("RAHUL - E1000283_D" and
+    # "RAHUL - E1000283" both reduce to plain "RAHUL") can tie with other
+    # candidates at that SAME core length. Rather than the first of them
+    # winning arbitrarily (confirmed live as a real, wrong outcome), every
+    # match is collected as long as it shares the winning tier's exact core
+    # length; more than one is offered as options instead of picked.
+    for i, c in enumerate(candidates):
+        if not (len(c["_core"]) >= _MIN_MATCH_LENGTH and c["_core"] in search_text):
+            continue
+        tie_length = len(c["_core"])
+        tied = [c]
+        for other in candidates[i + 1:]:
+            if len(other["_core"]) != tie_length:
+                break
+            if other["_core"] in search_text:
+                tied.append(other)
+        if len(tied) == 1:
             return c["account_head"], c["parent_account_head"], None
+        return None, None, sorted({t["account_head"] for t in tied})
 
-    # Pass 2: every space removed from both sides, tolerating a stray space a
-    # PDF extraction sometimes inserts INSIDE a real word -- confirmed live,
-    # "RAHU L KUMAR" in DESC for a master entry reading "RAHUL KUMAR - ...",
-    # which Pass 1 can never find since "RAHUL" (one word there) never
-    # appears as one word here. Restricted to a real multi-word core (2+
-    # words) -- a single generic word run together with unrelated
-    # surrounding text is far more likely to collide by accident once word
-    # boundaries are gone, the same reasoning _strip_trailing_code already
-    # applies to what it will even strip down to.
-    search_blob = "".join(search_text.split())
+    # Pass 2: rejoin every adjacent pair of DESC's own words and add that to
+    # the pool a candidate's core can draw from, then check as a SET of
+    # words rather than one ordered phrase -- tolerates a stray space a PDF
+    # extraction sometimes inserts INSIDE a real word. Confirmed live on two
+    # different shapes: "RAHU L KUMAR" for a two-word head "RAHUL KUMAR"
+    # (Pass 1 needs "RAHUL" as one word, which it never is here), and
+    # "SANTO SH" for a bare one-word head "SANTOSH" (no surname anywhere in
+    # that DESC at all, so a whole-string blob match could never work
+    # either -- only the specific adjacent pair "SANTO"+"SH" reconstructs
+    # it). Order stops mattering here on purpose: once a word has already
+    # been split apart by whatever broke it, DESC's own word order around
+    # the break is not something to keep trusting.
+    #
+    # Not restricted to multi-word cores the way an earlier version of this
+    # was: a bare single-word head matching is an accepted, pre-existing
+    # risk in this codebase (Pass 1 already allows it for a word already
+    # sitting in DESC unbroken), and here it can only happen via a
+    # RECONSTRUCTED pair, not any word merely floating in the text -- two
+    # adjacent fragments happening to coincidentally reassemble into some
+    # specific real master name is a narrow enough coincidence to accept.
+    desc_words = search_text.split()
+    reconstructed = set(desc_words)
+    for i in range(len(desc_words) - 1):
+        merged = desc_words[i] + desc_words[i + 1]
+        if len(merged) >= _MIN_MATCH_LENGTH:
+            reconstructed.add(merged)
     hits = [
         c for c in candidates
-        if c["_core_word_count"] >= 2
-        and len(c["_core_blob"]) >= _MIN_MATCH_LENGTH
-        and c["_core_blob"] in search_blob
+        if len(c["_core"]) >= _MIN_MATCH_LENGTH and c["_core_words"] <= reconstructed
     ]
-    if len(hits) == 1:
-        c = hits[0]
-        return c["account_head"], c["parent_account_head"], None
     if hits:
-        # More than one candidate's name reassembles from the same broken
-        # text -- often just the same person typed with different
-        # punctuation (the existing duplicate-spelling map two lines below
-        # this function's only caller already catches that shape); a
-        # genuinely different second person is possible too, so this is left
-        # for a human either way rather than guessed.
+        # Most-specific tier only, same reasoning as Pass 1's tie handling:
+        # a DESC that reconstructs to "RAHUL KUMAR" (surname present) should
+        # not have that clean 2-word match diluted by also listing every
+        # bare "RAHUL"-alone placeholder entry -- those matched too (a
+        # single word is trivially a subset of any set containing it), but
+        # they are strictly less specific than one that used every
+        # reconstructed word. Only when the BEST tier itself has more than
+        # one candidate (several different "Santosh ..." people, say, with
+        # no more specific tier to prefer) is that genuine ambiguity handed
+        # to a human -- confirmed with the user as their own explicit ask
+        # for exactly this situation.
+        best = max(len(c["_core"]) for c in hits)
+        hits = [c for c in hits if len(c["_core"]) == best]
+        if len(hits) == 1:
+            c = hits[0]
+            return c["account_head"], c["parent_account_head"], None
         return None, None, sorted({c["account_head"] for c in hits})
 
     return None, None, None
