@@ -94,13 +94,27 @@ app.include_router(transactions.router)
 app.include_router(export.router)
 
 
-@app.get("/", tags=["meta"])
+@app.api_route("/", methods=["GET", "HEAD"], tags=["meta"])
 async def root():
-    """Liveness probe and a pointer to the docs."""
+    """Liveness probe and a pointer to the docs.
+
+    HEAD as well as GET for the same reason as /health below: a monitor
+    pointed here rather than there would otherwise get 405 and report the
+    service as down.
+    """
     return {"status": "ok", "service": "Company Ledger API", "docs": "/docs"}
 
 
-@app.get("/health", tags=["meta"])
+@app.api_route("/health", methods=["GET", "HEAD"], tags=["meta"])
 async def health():
-    """Kept from the overwritten skeleton — deployment probes may point at it."""
+    """Kept from the overwritten skeleton — deployment probes may point at it.
+
+    HEAD as well as GET: uptime monitors (UptimeRobot among them) default to
+    HEAD, since they only need the status line, not the body. FastAPI does
+    NOT add HEAD to a plain @app.get the way bare Starlette does — measured,
+    not assumed — so this answered 405 Method Not Allowed, which a monitor
+    reports as the service being down. Hence api_route with both spelled
+    out. The body below is discarded on a HEAD by the ASGI server itself,
+    so there is nothing to special-case here.
+    """
     return {"status": "ok"}
