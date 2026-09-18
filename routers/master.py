@@ -258,10 +258,13 @@ _TABLES = {
         'required': ['account_head'],
         'columns': ['id', 'account_head', 'parent_account_head',
                     'is_active', 'created_at', 'updated_at'],
-        # id, not account_head: the user wants the imported sheet's own row
-        # order preserved, and id is assigned in insertion order, which the
-        # import already inserts in the sheet's row order.
-        'order_by': 'id',
+        # lower(account_head), not id: alphabetical, confirmed with the user
+        # -- this used to preserve the imported sheet's own row order
+        # instead, a prior, now-superseded request. lower() rather than the
+        # bare column so mixed-case entries ("Rahul Mamtani" vs "RAHUL
+        # MAMTANI") interleave the way a person reading the list expects,
+        # instead of every all-caps entry sorting before every non-caps one.
+        'order_by': 'lower(account_head)',
         'label_field': 'account_head',
     },
     'farvision_account_amb': {
@@ -276,7 +279,7 @@ _TABLES = {
         'required': ['account_head'],
         'columns': ['id', 'account_head', 'parent_account_head',
                     'is_active', 'created_at', 'updated_at'],
-        'order_by': 'id',
+        'order_by': 'lower(account_head)',
         'label_field': 'account_head',
     },
     'farvision_bank_name': {
