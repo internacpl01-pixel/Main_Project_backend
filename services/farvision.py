@@ -728,9 +728,25 @@ async def _duplicate_options_map(conn, company: str) -> dict[str, list[str]]:
 _SUFFIX_MAP = {"LIMITED": "LTD", "PRIVATE": "PVT"}
 
 
+# A period-joined run of single letters ("R.K.", "A.K.", "M.R.") is
+# initials, and the punctuation-stripping below would otherwise scatter it
+# into separate one-letter words ("R", "K") no bank text would ever spell
+# out that way -- confirmed against real vendor entries in the master
+# ("A.K.TRADERS", "M.R.Traders", "R.K. TRADERS") that a bank's own DESC
+# writes without any periods at all ("RK Traders"). Collapsed before the
+# general punctuation-stripping runs, and only when the periods sit directly
+# between the letters with no space -- "A N Filling Station", where "A" and
+# "N" are already separate words in the source, is a different shape (an
+# initial-letter business name, not dotted initials) and is deliberately
+# left alone; merging that too turned out to eat an unrelated "M/S" prefix
+# sitting next to it as well.
+_INITIALS_RE = re.compile(r"(?:[A-Za-z]\.){2,}")
+
+
 def _normalize_party_name(text: str | None) -> str:
     if not text:
         return ""
+    text = _INITIALS_RE.sub(lambda m: m.group(0).replace(".", ""), text)
     words = re.sub(r"[^\w\s]", " ", text.upper()).split()
     out = []
     for w in words:
@@ -803,6 +819,79 @@ def _same_letter_options(desc_text: str | None, texts: list[str], limit: int = 3
 # still match fine; a genuine match this short just isn't distinguishable
 # from an accidental one and is left blank instead of guessed.
 _MIN_MATCH_LENGTH = 5
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Single-character edits (insert/delete/substitute) to turn a into b.
+
+    A small, dependency-free DP -- both strings here are single normalized
+    words, at most a couple dozen characters, so the classic O(len(a)*len(b))
+    table costs nothing worth optimizing further.
+    """
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            cur[j] = min(
+                prev[j] + 1,        # delete from a
+                cur[j - 1] + 1,     # insert into a
+                prev[j - 1] + (0 if ca == cb else 1),  # match or substitute
+            )
+        prev = cur
+    return prev[-1]
+
+
+# A word shorter than this only ever gets an exact match (see
+# _fuzzy_word_in) -- distance 1 on a 4-letter word is a quarter of it
+# wrong, which stops being distinguishable from a genuinely different short
+# word ("RAM" vs "RAN"). Real names long enough to carry a spelling slip
+# without becoming a different plausible word still get the tolerance.
+_FUZZY_MIN_WORD_LEN = 5
+_FUZZY_MAX_DISTANCE = 1
+
+
+def _fuzzy_lookup(pool: set[str]):
+    """A `word in pool-ish` test tolerant of one character's difference, for
+    a long enough word -- built once per row (see _match_account_head's Pass
+    3) rather than re-scanning the whole pool from scratch for each of the
+    thousands of candidates checked against it.
+
+    Confirmed against real data: six real transactions for one account all
+    spell it "Ramabati Devi", the master's only matching entry reads
+    "Ramavati Devi(411)" -- one letter different, evidently a typo in one of
+    the two independent sources, not a PDF-extraction artifact at all (there
+    is no stray space to reconstruct here).
+
+    Bucketed by length so a check only ever compares against pool words
+    within one character of its own length -- most of `pool` differs enough
+    in length to rule out on sight, and doing that once here (an index) is
+    far cheaper than doing it inline for every candidate word (a linear
+    scan), which is what made an earlier version of this measurably double
+    the time to match a page of rows.
+    """
+    by_len: dict[int, list[str]] = {}
+    for w in pool:
+        by_len.setdefault(len(w), []).append(w)
+
+    def lookup(word: str) -> bool:
+        if word in pool:
+            return True
+        if len(word) < _FUZZY_MIN_WORD_LEN:
+            return False
+        nearby = (
+            by_len.get(len(word) - 1, [])
+            + by_len.get(len(word), [])
+            + by_len.get(len(word) + 1, [])
+        )
+        return any(_levenshtein(word, w) <= _FUZZY_MAX_DISTANCE for w in nearby)
+
+    return lookup
 
 
 def _match_account_head(
@@ -908,6 +997,31 @@ def _match_account_head(
             c = hits[0]
             return c["account_head"], c["parent_account_head"], None
         return None, None, sorted({c["account_head"] for c in hits})
+
+    # Pass 3: the same reconstructed word pool, but each of a candidate's
+    # words is now allowed to be a fuzzy match (see _fuzzy_lookup) rather
+    # than requiring the exact letters -- confirmed live and genuinely
+    # different from the two passes above: a one-character spelling slip
+    # between the bank's own text and this app's master data ("Ramabati
+    # Devi" in six real transactions on one account, "Ramavati Devi(411)"
+    # the only entry anywhere in either master), not a PDF-extraction stray
+    # space at all -- there is nothing to reconstruct, the letters
+    # themselves differ. Tried only after every exact-word option is
+    # exhausted, so a genuinely exact match is never displaced by a fuzzy
+    # one.
+    fuzzy_in = _fuzzy_lookup(reconstructed)
+    fuzzy_hits = [
+        c for c in candidates
+        if len(c["_core"]) >= _MIN_MATCH_LENGTH
+        and all(fuzzy_in(w) for w in c["_core"].split())
+    ]
+    if fuzzy_hits:
+        best = max(len(c["_core"]) for c in fuzzy_hits)
+        fuzzy_hits = [c for c in fuzzy_hits if len(c["_core"]) == best]
+        if len(fuzzy_hits) == 1:
+            c = fuzzy_hits[0]
+            return c["account_head"], c["parent_account_head"], None
+        return None, None, sorted({c["account_head"] for c in fuzzy_hits})
 
     return None, None, None
 
