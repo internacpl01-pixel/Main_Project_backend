@@ -121,6 +121,27 @@ def list_folder_files(folder_id: str) -> list[dict]:
     return files
 
 
+def get_folder_name(folder_id: str) -> str:
+    """The folder's own name, used to confirm a pasted URL before saving it.
+
+    Raises googleapiclient.errors.HttpError (404) when the id isn't a real
+    file, or when it is one this account cannot reach -- Google reports both
+    the same way on purpose, so a caller can only ever report "can't open
+    it", never "it exists but isn't yours".
+
+    A ValueError instead means the id resolved to something that isn't a
+    folder at all, which a URL pointing at a single file would do.
+    """
+    service = _get_service()
+    meta = service.files().get(
+        fileId=folder_id, fields="id, name, mimeType",
+        supportsAllDrives=True,
+    ).execute()
+    if meta.get("mimeType") != "application/vnd.google-apps.folder":
+        raise ValueError("That link points at a file, not a folder.")
+    return meta.get("name") or folder_id
+
+
 def download_file(file_id: str) -> bytes:
     service = _get_service()
     request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
