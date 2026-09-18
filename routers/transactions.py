@@ -1383,6 +1383,9 @@ async def export_farvision(
     return {"job_id": job_id, "state": jobs.QUEUED}
 
 
+_FARVISION_VERIFY_PAGE_SIZE = 50
+
+
 @router.get("/temp-trans/farvision-verify")
 async def farvision_verify_rows(
     batch_id: int = None,
@@ -1393,6 +1396,7 @@ async def farvision_verify_rows(
     company: str = Query(None),
     search: str = Query(""),
     rule_conflicts: str = Query(None),
+    page: int = Query(1, ge=1),
     user: dict = Depends(get_company_user),
 ):
     """Every row export-farvision's own filters would include, with its
@@ -1407,6 +1411,13 @@ async def farvision_verify_rows(
     that endpoint takes the Imported Rows table's own filters: the Farvision
     Verify page is a review step in front of that export, so what it reviews
     and what gets downloaded have to be the same set.
+
+    Paged, unlike export-farvision -- matching every row against a ~7,900-row
+    Account Head master is real work, and doing it for a whole batch just to
+    show one screen of it was measured at 10+ seconds and a multi-megabyte
+    response for a 253-row batch. Export is unaffected: it never passes
+    page/limit and still matches and writes the entire filtered set, exactly
+    as before.
     """
     async with company_connection(user["schema"]) as conn:
         where, params, _columns, _term, _idx = await _temp_filters(
@@ -1414,7 +1425,12 @@ async def farvision_verify_rows(
             date_from=date_from, date_to=date_to, account=account,
             company=company, search=search, rule_conflicts=rule_conflicts,
         )
-        rows = await farvision.fetch_rows(conn, where, params, schema=user["schema"])
+        total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
+        rows = await farvision.fetch_rows(
+            conn, where, params, schema=user["schema"],
+            limit=_FARVISION_VERIFY_PAGE_SIZE,
+            offset=(page - 1) * _FARVISION_VERIFY_PAGE_SIZE,
+        )
 
     # Every Farvision export column, not just Narration/Account Head --
     # confirmed with the user: this page reviews the row the export will
@@ -1428,11 +1444,29 @@ async def farvision_verify_rows(
                 "id": r["_temp_trans_id"],
                 "matched": r["_account_head_matched"],
                 "options": r["_account_head_options"],
+                "internal": r["_internal"],
+                "company": r["_company"],
                 **{col: r.get(col) for col in farvision.COLUMNS},
             }
             for r in rows
         ],
+        "total": total,
+        "page": page,
+        "page_size": _FARVISION_VERIFY_PAGE_SIZE,
     }
+
+
+@router.get("/temp-trans/farvision-verify/candidates")
+async def farvision_verify_candidates(user: dict = Depends(get_company_user)):
+    """Every Farvision Bank Name and, per company, every Account Head --
+    fetched once and cached (see services.farvision._cached), for the
+    Farvision Verify page to fall back on when a row's own "options" is None.
+
+    Split out from the row listing itself so paging through a batch fetches
+    this exactly once (the frontend caches it) instead of once per page.
+    """
+    async with company_connection(user["schema"]) as conn:
+        return await farvision.candidate_pools(conn, schema=user["schema"])
 
 
 @router.post("/temp-trans/farvision-verify/resolve")

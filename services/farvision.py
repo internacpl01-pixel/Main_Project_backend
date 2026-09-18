@@ -518,8 +518,14 @@ def _match_internal_account_head(
     if by_code:
         return None, sorted(by_code)
 
+    # No signal at all -- leave options None (not the whole bank-name pool,
+    # which is small here but would still be the same needless per-row copy
+    # the account-head case below was fixed for). fetch_rows's own generic
+    # fallback picks up right after this and, finding nothing better, leaves
+    # it None too -- the caller (the Farvision Verify page) already has the
+    # full pool once, fetched separately, and falls back to that itself.
     closest = _closest_matches(desc_text, bank_names)
-    return None, (closest or sorted(bank_names))
+    return None, (closest or None)
 
 
 _ACCOUNT_TABLES = {"DPL": "farvision_account_master_dpl", "AMB": "farvision_account_master_amb"}
@@ -693,9 +699,50 @@ async def lookup_parent_account_head(conn, account_head: str) -> str | None:
     return None
 
 
-async def fetch_rows(conn, where: str, params: list, schema: str) -> list[dict]:
+async def candidate_pools(conn, schema: str) -> dict:
+    """Every Farvision Bank Name and, per company, every Account Head --
+    fetched (and cached -- see _cached above) once, not once per row.
+
+    The Farvision Verify page's own listing (fetch_rows above) leaves a
+    row's "options" None when it has no better candidate list of its own;
+    this is what a blank row falls back to client-side, requested and
+    cached separately so paging through a batch never re-downloads it.
+    """
+    bank_names = await _cached((schema, "bank_names"), lambda: _bank_name_candidates(conn))
+    account_heads = {}
+    for company in _ACCOUNT_TABLES:
+        candidates = await _cached(
+            (schema, "account_heads", company),
+            lambda company=company: _account_head_candidates(conn, company))
+        account_heads[company] = sorted(c["account_head"] for c in candidates)
+    return {"bank_names": sorted(bank_names), "account_heads": account_heads}
+
+
+async def fetch_rows(
+    conn, where: str, params: list, schema: str,
+    limit: int | None = None, offset: int | None = None,
+) -> list[dict]:
+    """limit/offset page the query itself -- used only by the Farvision Verify
+    listing, which reviews a batch a page at a time rather than matching every
+    row up front. export-farvision never passes these: an export is the whole
+    filtered set by definition, confirmed with the user as unchanged behaviour.
+
+    p/bn are joined here too even though this function never reads them,
+    solely so the count query and this one can share exactly the same alias
+    set as _TEMP_JOINS -- the search filter _temp_filters can build references
+    p.name/bn.name, and a WHERE naming a table this query never joined would
+    fail with "column does not exist" the moment a search term reached this
+    endpoint. Same failure shape as the p/h/rh/ih/bn joins the staging list
+    already carries for the same reason.
+    """
     company_col = await staging.company_column(conn)
     company_select = f"t.{company_col} AS company," if company_col else "NULL AS company,"
+
+    page_params = list(params)
+    limit_clause = ""
+    if limit is not None:
+        limit_clause = f"LIMIT ${len(page_params) + 1} OFFSET ${len(page_params) + 2}"
+        page_params.extend([limit, offset or 0])
 
     rows = await conn.fetch(
         f"""
@@ -714,9 +761,11 @@ async def fetch_rows(conn, where: str, params: list, schema: str) -> list[dict]:
                {company_select}
                t.id AS temp_trans_id
           FROM temp_trans t
-          LEFT JOIN head_master      h  ON h.id  = t.head_id
-          LEFT JOIN rera_head_master rh ON rh.id = t.rera_head_id
-          LEFT JOIN idw_head_master  ih ON ih.id = t.idw_head_id
+          LEFT JOIN projects            p  ON p.id  = t.project_id
+          LEFT JOIN head_master         h  ON h.id  = t.head_id
+          LEFT JOIN rera_head_master    rh ON rh.id = t.rera_head_id
+          LEFT JOIN idw_head_master     ih ON ih.id = t.idw_head_id
+          LEFT JOIN beneficiary_master  bn ON bn.id = t.beneficiary_id
           LEFT JOIN LATERAL (
                  SELECT b.bank_name
                    FROM bank_master b
@@ -728,8 +777,9 @@ async def fetch_rows(conn, where: str, params: list, schema: str) -> list[dict]:
                ) bm ON true
          WHERE {where}
          ORDER BY t.batch_id, t.row_number
+         {limit_clause}
         """,
-        *params,
+        *page_params,
     )
 
     # One candidate list per distinct company seen in this batch, fetched
@@ -815,12 +865,18 @@ async def fetch_rows(conn, where: str, params: list, schema: str) -> list[dict]:
         # genuinely blank row with no duplicate/number/code signal at all),
         # fall back to the closest keyword matches against DESC -- confirmed
         # with the user as the general answer, rather than either free-text
-        # search or the full company-wide master. A row with no keyword
-        # overlap at all (an already-resolved row's override text rarely
-        # echoes its own DESC, for one) still gets the full pool rather than
-        # an empty dropdown with nothing to re-pick from.
+        # search or the full company-wide master.
+        #
+        # A row with no keyword overlap at all used to fall back to the FULL
+        # pool (up to ~7,900 Account Heads) copied onto that one row -- with
+        # a batch of a few hundred rows landing here, that meant megabytes of
+        # duplicate strings and, worse, re-scoring the whole master per row.
+        # Left None instead: the Farvision Verify page already has the full
+        # pool once (GET .../farvision-verify/candidates, fetched separately
+        # and cached), and falls back to that itself when a row's own
+        # "options" comes back empty.
         if not account_head_options:
-            account_head_options = _closest_matches(r["desc_text"], pool) or sorted(pool)
+            account_head_options = _closest_matches(r["desc_text"], pool) or None
 
         # Whether this row needs a decision on the Farvision Verify page, or
         # is only offered for an optional "Not correct?" override -- the page
@@ -834,6 +890,11 @@ async def fetch_rows(conn, where: str, params: list, schema: str) -> list[dict]:
             "_temp_trans_id": r["temp_trans_id"],
             "_account_head_matched": account_head_matched,
             "_account_head_options": account_head_options,
+            # So a caller whose row got None above knows which shared pool to
+            # fall back to: the bank-name pool for an Internal row, this
+            # row's own company's Account Head pool otherwise.
+            "_internal": internal,
+            "_company": company,
             "Link Ref Code": i,
             "Business Unit": _format_business_unit(r["business_unit"]),
             "Financial Year": _format_financial_year(r["financial_year"]),
