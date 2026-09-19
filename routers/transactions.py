@@ -1575,6 +1575,36 @@ async def farvision_verify_resolve(
     return {"id": id, "account_head": account_head, "parent_account_head": parent_account_head}
 
 
+@router.post("/temp-trans/farvision-verify/resolve-description")
+async def farvision_verify_resolve_description(
+    id: int = Body(...),
+    description: str = Body(...),
+    user: dict = Depends(get_company_user),
+):
+    """Override the Farvision Verify page's auto-computed Description for one
+    row -- e.g. the row's existing head implies "TDS ON CONTRACTORS" but no
+    TDS is actually due this time, and the real answer is "TDS PAYABLE
+    (NIL)". Written straight onto the temp_trans row
+    (farvision_description_override), same pattern as the Account Head
+    override just above, so it sticks across later exports of the same
+    batch. Deduction Type is not stored separately -- farvision.py always
+    derives it from whether Description ends up set at all.
+    """
+    async with company_connection(user["schema"]) as conn:
+        updated = await conn.fetchval(
+            """
+            UPDATE temp_trans
+               SET farvision_description_override = $1
+             WHERE id = $2
+         RETURNING id
+            """,
+            description, id,
+        )
+    if updated is None:
+        raise HTTPException(404, f"No staged row with id={id}.")
+    return {"id": id, "description": description}
+
+
 @router.get("/temp-trans/filters")
 async def temp_trans_filter_options(user: dict = Depends(get_company_user)):
     """The values the Date, Account Number and Company filters can offer.

@@ -324,6 +324,15 @@ _TDS_DESCRIPTION = {
     "INTEREST": "TDS ON INTEREST OTHER THAN SECURITIES",
 }
 
+# Every Description value the Farvision Verify page's own dropdown offers --
+# every keyword-derived value above, plus "TDS PAYABLE (NIL)", confirmed with
+# the user as a real Description with no head keyword of its own (it isn't
+# implied by any particular head, it's a person's own call that no TDS is
+# actually due on a row that would otherwise guess a keyword match). Used
+# only for that manual override; _TDS_DESCRIPTION above is still the only
+# thing that auto-fills a row before anyone touches it.
+DESCRIPTION_OPTIONS = sorted(set(_TDS_DESCRIPTION.values()) | {"TDS PAYABLE (NIL)"})
+
 # Read-only reference material for the Master Data page's Farvision Account
 # tabs: the format/example values found in the original master sheet for
 # columns that carry no genuine per-Account-Head data, so a person filling
@@ -1103,7 +1112,11 @@ async def candidate_pools(conn, schema: str) -> dict:
             (schema, "account_heads", company),
             lambda company=company: _account_head_candidates(conn, company))
         account_heads[company] = sorted(c["account_head"] for c in candidates)
-    return {"bank_names": sorted(bank_names), "account_heads": account_heads}
+    return {
+        "bank_names": sorted(bank_names),
+        "account_heads": account_heads,
+        "descriptions": DESCRIPTION_OPTIONS,
+    }
 
 
 async def fetch_rows(
@@ -1153,6 +1166,7 @@ async def fetch_rows(
                bm.bank_name AS bank_name,
                t.farvision_account_head_override AS account_head_override,
                t.farvision_parent_account_head_override AS parent_account_head_override,
+               t.farvision_description_override AS description_override,
                {company_select}
                t.id AS temp_trans_id
           FROM temp_trans t
@@ -1209,6 +1223,11 @@ async def fetch_rows(
         tds_description = None
         if r["head_name"]:
             tds_description = _TDS_DESCRIPTION.get(r["head_name"].strip().upper())
+        if r["description_override"]:
+            # Resolved for good on the Farvision Verify page, same as an
+            # Account Head override just below -- always wins over the
+            # keyword guess above, confirmed with the user.
+            tds_description = r["description_override"]
 
         company = r["company"]
         bank_name = _match_bank_name(r["account_number"], bank_name_candidates) or r["bank_name"]
