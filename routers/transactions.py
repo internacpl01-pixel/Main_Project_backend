@@ -1362,6 +1362,15 @@ async def _build_farvision_export(
             company=company, search=search, rule_conflicts=rule_conflicts,
         )
         where = _farvision_where(where, debit_credit=debit_credit)
+        # A row already exported (Export Status = "Yes") is excluded here so
+        # clicking Export Farvision again for the same filters does not hand
+        # out the same rows a second time -- confirmed with the user: the
+        # Reset Export Status button on the Verify page is the only way to
+        # make an already-exported row exportable again.
+        export_status_col = await staging.export_status_column(conn)
+        if export_status_col:
+            where = f"({where}) AND coalesce(t.{export_status_col}, '') <> ${len(params) + 1}"
+            params = params + [farvision.EXPORT_STATUS_ON]
         on_row = None
         if job_id is not None:
             total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
