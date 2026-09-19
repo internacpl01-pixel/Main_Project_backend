@@ -1372,8 +1372,13 @@ async def _build_farvision_export(
             )
             on_row = lambda i, n: jobs.tick(job_id)              # noqa: E731
         rows = await farvision.fetch_rows(conn, where, params, schema=schema, on_row=on_row)
+        filtered_rows = filter_fn(rows)
+        # Only the rows actually written below -- a Credit leg
+        # filter_deposit_withdrawal excluded, say, was never exported and
+        # must not be marked as if it had been.
+        await farvision.mark_exported(conn, [r["_temp_trans_id"] for r in filtered_rows])
 
-    content = farvision.to_xlsx_bytes(filter_fn(rows), sheets)
+    content = farvision.to_xlsx_bytes(filtered_rows, sheets)
     return content, filename
 
 
@@ -1591,6 +1596,7 @@ def _shape_farvision_verify_rows(
                 "company": r["_company"],
                 "desc": r["_desc_text"],
                 "tds_rate": r["_tds_rate"],
+                "export_status": r["_export_status"],
                 **{col: r.get(col) for col in farvision.COLUMNS},
                 # Overrides the page-local Link Ref Code _build_row assigned
                 # (just this call's own 1..page_size) with the row's real,
@@ -1742,6 +1748,38 @@ async def farvision_verify_resolve_tds_rate(
         "debit_amount": updated.get("Debit Amount"),
         "adjustment_amount": updated.get("Adjustment Amount"),
     }
+
+
+@router.post("/temp-trans/farvision-verify/reset-export-status")
+async def farvision_verify_reset_export_status(
+    batch_id: int = None,
+    classified: bool = None,
+    date_from: str = Query(None),
+    date_to: str = Query(None),
+    account: str = Query(None),
+    company: str = Query(None),
+    search: str = Query(""),
+    rule_conflicts: str = Query(None),
+    debit_credit: str = Query(None),
+    document_type: str = Query(None),
+    user: dict = Depends(get_company_user),
+):
+    """Turn Export Status back off for every row the Verify page's current
+    filters cover, so a batch already exported can be exported again on
+    purpose -- confirmed with the user. Takes the exact same filters the
+    listing itself takes, same reason as everywhere else in this file: reset
+    is a decision about what's on screen right now, not a blanket wipe of
+    every row this company has ever exported.
+    """
+    async with company_connection(user["schema"]) as conn:
+        where, params, _columns, _term, _idx = await _temp_filters(
+            conn, user, batch_id=batch_id, classified=classified,
+            date_from=date_from, date_to=date_to, account=account,
+            company=company, search=search, rule_conflicts=rule_conflicts,
+        )
+        where = _farvision_where(where, debit_credit=debit_credit, document_type=document_type)
+        changed = await farvision.reset_export_status(conn, where, params)
+    return {"reset": changed}
 
 
 @router.get("/temp-trans/filters")

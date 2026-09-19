@@ -15,7 +15,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import random
 import re
+import string
 from datetime import date as _date
 from decimal import Decimal, InvalidOperation
 
@@ -343,6 +345,41 @@ def _coerce(value, data_type: str):
     return str(value).strip() or None
 
 
+# The one custom field this module knows to auto-fill rather than leave to
+# the usual "found it in raw_data" rule below -- confirmed with the user.
+# Looked up by display name rather than a hardcoded field_text_N: the number
+# depends on creation order and can differ per company schema, and the field
+# could be deleted, in which case import behaves exactly as it did before it
+# existed.
+_EXPORT_UID_FIELD_NAME = "Export UID"
+
+
+def _generate_export_uid() -> str:
+    """"EXFV" + one random uppercase letter + 11 random digits, e.g.
+    "EXFVE62590067860" -- confirmed with the user as a UTR-style id,
+    generated once per transaction at import time. Purely random, not
+    derived from the row's own bank UTR/date/anything else, so two
+    unrelated transactions can never look connected by a shared id.
+    """
+    letter = random.choice(string.ascii_uppercase)
+    digits = "".join(random.choices(string.digits, k=11))
+    return f"EXFV{letter}{digits}"
+
+
+async def _export_uid_column(conn, live: dict) -> str | None:
+    """The real column backing the "Export UID" custom field, if it still
+    exists, is active, and its column wasn't dropped straight from Postgres
+    without deleting the fieldmap row too.
+    """
+    row = await conn.fetchrow(
+        "SELECT fieldname FROM fieldmap WHERE displayname = $1 AND is_active",
+        _EXPORT_UID_FIELD_NAME,
+    )
+    if row is None or row["fieldname"] not in live:
+        return None
+    return row["fieldname"]
+
+
 async def insert_temp_rows(conn, batch_id: int, normalized: list) -> int:
     """Insert normalized rows into temp_trans for one batch.
 
@@ -386,6 +423,13 @@ async def insert_temp_rows(conn, batch_id: int, normalized: list) -> int:
 
     columns = derived + extra
 
+    # "Export UID" has no header alias -- nothing on a bank statement will
+    # ever fill it via the "seen in raw_data" rule above -- so it is
+    # appended and filled separately, one random id generated per row below.
+    export_uid_col = await _export_uid_column(conn, live)
+    if export_uid_col and export_uid_col not in columns:
+        columns = columns + [export_uid_col]
+
     missing = {"txn_date", "description", "balance"} - set(derived)
     if missing:
         logger.warning(
@@ -401,6 +445,7 @@ async def insert_temp_rows(conn, batch_id: int, normalized: list) -> int:
     )
 
     records = []
+    seen_uids = set()
     for i, r in enumerate(normalized, start=1):
         raw = r["raw_data"] or {}
         source = {
@@ -414,6 +459,12 @@ async def insert_temp_rows(conn, batch_id: int, normalized: list) -> int:
         # column name, so the lookup is direct. Coerced to the column's declared
         # type, exactly as DPL did from live_cols.
         record.extend(_coerce(raw.get(name), live[name]) for name in extra)
+        if export_uid_col:
+            uid = _generate_export_uid()
+            while uid in seen_uids:            # astronomically rare; guards
+                uid = _generate_export_uid()   # only against this one batch
+            seen_uids.add(uid)
+            record.append(uid)
         records.append(tuple(record))
 
     await conn.executemany(

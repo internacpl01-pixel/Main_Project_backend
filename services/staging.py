@@ -45,6 +45,11 @@ _COMPANY_ALIASES = {"company", "company name", "group company"}
 # the same way the two above are. "acc remarks" and "crm remarks" deliberately
 # do not match — they are separate columns this company fills in elsewhere.
 _NARRATION_ALIASES = {"narration", "narrations", "remark", "remarks", "note", "notes"}
+# Tracks whether a Farvision export has already written this row -- set by
+# _build_farvision_export, cleared in bulk by the Verify page's own "Reset
+# Export Status" button, confirmed with the user. A custom field like the two
+# above, found the same way.
+_EXPORT_STATUS_ALIASES = {"export status", "export_status", "exportstatus"}
 
 # A fieldmap row names a physical column and that name is interpolated into the
 # UPDATE below -- Postgres has no placeholder for an identifier. The fieldmap is
@@ -119,6 +124,12 @@ async def company_column(conn) -> str | None:
 async def narration_column(conn) -> str | None:
     """The free-text column the row editor lets people type into, or None."""
     return await _resolve_field(conn, _NARRATION_ALIASES)
+
+
+async def export_status_column(conn) -> str | None:
+    """The column tracking whether Farvision has already exported this row,
+    or None if the field doesn't exist in this schema."""
+    return await _resolve_field(conn, _EXPORT_STATUS_ALIASES)
 
 
 # ── Financial year, derived from the row's own date ──────────────────────────

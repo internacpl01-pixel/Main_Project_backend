@@ -1250,6 +1250,10 @@ async def fetch_rows(
     """
     company_col = await staging.company_column(conn)
     company_select = f"t.{company_col} AS company," if company_col else "NULL AS company,"
+    export_status_col = await staging.export_status_column(conn)
+    export_status_select = (
+        f"t.{export_status_col} AS export_status," if export_status_col else "NULL AS export_status,"
+    )
 
     page_params = list(params)
     limit_clause = ""
@@ -1275,6 +1279,7 @@ async def fetch_rows(
                t.farvision_tds_rate_override AS tds_rate,
                t.farvision_debit_amount_override AS debit_amount_override,
                {company_select}
+               {export_status_select}
                t.id AS temp_trans_id
           FROM temp_trans t
           LEFT JOIN projects            p  ON p.id  = t.project_id
@@ -1445,6 +1450,11 @@ async def fetch_rows(
             # an export column either, purely a Farvision Verify page field,
             # confirmed with the user.
             "_tds_rate": r["tds_rate"],
+            # Whether Farvision has already exported this row -- also not a
+            # real export column, just what the Verify page shows so nobody
+            # re-exports the same row twice by accident, confirmed with the
+            # user.
+            "_export_status": r["export_status"],
             "Link Ref Code": i,
             "Business Unit": _format_business_unit(r["business_unit"]),
             "Financial Year": _format_financial_year(r["financial_year"]),
@@ -1560,6 +1570,78 @@ def filter_deposit_withdrawal(rows: list[dict]) -> list[dict]:
         r for r in rows
         if r["Document Type"] == "Deposit/withdrawal" and r["Debit/Credit"] != "Credit"
     ])
+
+
+EXPORT_STATUS_ON = "Exported"
+
+
+async def mark_exported(conn, temp_trans_ids: list[int]) -> None:
+    """Flip the Export Status custom field on for exactly the rows that were
+    actually written to an export file -- called right after
+    _build_farvision_export renders one, with that render's own final
+    (filtered, renumbered) row list's ids, confirmed with the user. A row
+    the export left out (a Credit leg excluded from Deposit Withdrawal, or
+    one an active Debit/Credit filter excluded) is correctly not marked --
+    it was not exported.
+
+    A no-op, not an error, when the field doesn't exist in this schema --
+    the same "callers handle None" contract staging.company_column already
+    uses for an optional custom field.
+    """
+    if not temp_trans_ids:
+        return
+    col = await staging.export_status_column(conn)
+    if col is None:
+        return
+    await conn.execute(
+        f"UPDATE temp_trans SET {col} = $1 WHERE id = ANY($2::bigint[])",
+        EXPORT_STATUS_ON, temp_trans_ids,
+    )
+
+
+async def reset_export_status(conn, where: str, params: list) -> int:
+    """Turn Export Status back off for every row the Farvision Verify page's
+    current filters cover -- the "Reset Export Status" button, for
+    re-exporting a batch on purpose. Scoped to the same WHERE the page
+    itself is filtered by, not the whole schema, confirmed with the user:
+    resetting is a decision about what's on screen, not a blanket wipe of
+    every row this company has ever exported.
+
+    Returns how many rows changed (0, harmlessly, when the field doesn't
+    exist in this schema).
+
+    where can reference p/h/rh/ih/bn (a project, head, or beneficiary
+    filter) -- those aliases don't exist on a bare "UPDATE temp_trans t SET
+    ... WHERE {where}", and joining them directly into the UPDATE would turn
+    _TEMP_JOINS' LEFT JOINs into an implicit INNER JOIN, wrongly dropping
+    any row whose head_id/project_id/beneficiary_id is NULL. The subquery
+    keeps the same LEFT JOIN semantics fetch_rows/COUNT already use, and the
+    UPDATE only ever touches temp_trans by id.
+    """
+    col = await staging.export_status_column(conn)
+    if col is None:
+        return 0
+    result = await conn.execute(
+        f"""
+        UPDATE temp_trans t
+           SET {col} = NULL
+          FROM (
+                SELECT t.id
+                  FROM temp_trans t
+                  LEFT JOIN projects            p  ON p.id  = t.project_id
+                  LEFT JOIN head_master         h  ON h.id  = t.head_id
+                  LEFT JOIN rera_head_master    rh ON rh.id = t.rera_head_id
+                  LEFT JOIN idw_head_master     ih ON ih.id = t.idw_head_id
+                  LEFT JOIN beneficiary_master  bn ON bn.id = t.beneficiary_id
+                 WHERE {where}
+               ) matched
+         WHERE t.id = matched.id AND t.{col} IS NOT NULL
+        """,
+        *params,
+    )
+    # asyncpg's execute() returns "UPDATE <n>" -- the count is the only thing
+    # worth parsing back out of it.
+    return int(result.split()[-1])
 
 
 def to_xlsx_bytes(rows: list[dict], sheets: dict[str, list[str]] = SHEETS) -> bytes:
