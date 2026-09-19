@@ -361,11 +361,16 @@ def gross_up_debit_amount(
     input is missing: a row with no Debit Amount (a Credit-side row) has
     nothing to gross up, confirmed with the user as a case where the TDS Rate
     note is still saved but the reverse calculation does nothing.
+
+    Rounded to the nearest whole rupee, not 2 decimal places -- confirmed
+    with the user against a real example (net 15,331 at 1% divides out to
+    15,485.858585..., which must round to 15,486, not stay 15,485.86).
+    ROUND_HALF_UP is exactly ".50 rounds up, below .50 rounds down".
     """
     if not debit_amount or rate_fraction is None:
         return None
     gross = debit_amount / (decimal.Decimal(1) - rate_fraction)
-    return gross.quantize(decimal.Decimal("0.01"), rounding=decimal.ROUND_HALF_UP)
+    return gross.quantize(decimal.Decimal("1"), rounding=decimal.ROUND_HALF_UP)
 
 # Read-only reference material for the Master Data page's Farvision Account
 # tabs: the format/example values found in the original master sheet for
