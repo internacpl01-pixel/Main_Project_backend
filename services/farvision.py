@@ -381,17 +381,21 @@ def _format_business_unit(business_unit: str | None) -> str | None:
 
 
 def _debit_or_credit(debit_amount, credit_amount) -> str | None:
-    """"Debit" when the row has a debit amount, "Credit" otherwise.
+    """"Debit" when the row has a real debit amount, "Credit" otherwise.
 
     field_text_19 (temp_trans's own Debit/Credit text) is often blank --
-    confirmed against a real batch where it was NULL on every row. Debit
-    Amount and Credit Amount are never both set and never both blank on a
-    real row, so which one is present already says which this is; no
-    guessing needed when field_text_19 is missing.
+    confirmed against a real batch where it was NULL on every row. Which of
+    Debit Amount / Credit Amount actually holds the row's real amount already
+    says which this is -- but "holds an amount" means non-zero, not merely
+    non-NULL: a real row was found (id 23974, an Internal Fund Transfer) with
+    debit_amount explicitly 0.00 and credit_amount 450000.00, which an
+    `is not None` check wrongly called "Debit". Checked by truthiness instead
+    so a zero placeholder alongside the row's real amount falls through to
+    the side that actually holds it.
     """
-    if debit_amount is not None:
+    if debit_amount:
         return "Debit"
-    if credit_amount is not None:
+    if credit_amount:
         return "Credit"
     return None
 
@@ -1428,7 +1432,15 @@ def filter_receipt_payment(rows: list[dict]) -> list[dict]:
 
 
 def filter_deposit_withdrawal(rows: list[dict]) -> list[dict]:
-    return _renumbered([r for r in rows if r["Document Type"] == "Deposit/withdrawal"])
+    # An internal transfer between the company's own bank accounts is two
+    # temp_trans rows -- a Debit leg out of the source account and a Credit
+    # leg into the destination account -- both "Deposit/withdrawal". Only the
+    # Debit leg belongs in this export, confirmed with the user: the Credit
+    # leg is not wanted here at all, not even as a row to review.
+    return _renumbered([
+        r for r in rows
+        if r["Document Type"] == "Deposit/withdrawal" and r["Debit/Credit"] != "Credit"
+    ])
 
 
 def to_xlsx_bytes(rows: list[dict], sheets: dict[str, list[str]] = SHEETS) -> bytes:
