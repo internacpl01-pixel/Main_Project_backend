@@ -1250,10 +1250,6 @@ async def fetch_rows(
     """
     company_col = await staging.company_column(conn)
     company_select = f"t.{company_col} AS company," if company_col else "NULL AS company,"
-    export_status_col = await staging.export_status_column(conn)
-    export_status_select = (
-        f"t.{export_status_col} AS export_status," if export_status_col else "NULL AS export_status,"
-    )
 
     page_params = list(params)
     limit_clause = ""
@@ -1279,7 +1275,6 @@ async def fetch_rows(
                t.farvision_tds_rate_override AS tds_rate,
                t.farvision_debit_amount_override AS debit_amount_override,
                {company_select}
-               {export_status_select}
                t.id AS temp_trans_id
           FROM temp_trans t
           LEFT JOIN projects            p  ON p.id  = t.project_id
@@ -1450,11 +1445,6 @@ async def fetch_rows(
             # an export column either, purely a Farvision Verify page field,
             # confirmed with the user.
             "_tds_rate": r["tds_rate"],
-            # Whether Farvision has already exported this row -- also not a
-            # real export column, just what the Verify page shows so nobody
-            # re-exports the same row twice by accident, confirmed with the
-            # user.
-            "_export_status": r["export_status"],
             "Link Ref Code": i,
             "Business Unit": _format_business_unit(r["business_unit"]),
             "Financial Year": _format_financial_year(r["financial_year"]),
@@ -1572,7 +1562,8 @@ def filter_deposit_withdrawal(rows: list[dict]) -> list[dict]:
     ])
 
 
-EXPORT_STATUS_ON = "Exported"
+EXPORT_STATUS_ON = "Yes"
+EXPORT_STATUS_OFF = "No"
 
 
 async def mark_exported(conn, temp_trans_ids: list[int]) -> None:
@@ -1621,10 +1612,16 @@ async def reset_export_status(conn, where: str, params: list) -> int:
     col = await staging.export_status_column(conn)
     if col is None:
         return 0
+    # EXPORT_STATUS_OFF is bound as the placeholder *after* params, not
+    # before -- where's own $1.. references already assume that exact
+    # position (they were numbered against params when _temp_filters built
+    # it), so binding anything ahead of them would shift every one of those
+    # references onto the wrong value.
+    off_placeholder = f"${len(params) + 1}"
     result = await conn.execute(
         f"""
         UPDATE temp_trans t
-           SET {col} = NULL
+           SET {col} = {off_placeholder}
           FROM (
                 SELECT t.id
                   FROM temp_trans t
@@ -1635,9 +1632,9 @@ async def reset_export_status(conn, where: str, params: list) -> int:
                   LEFT JOIN beneficiary_master  bn ON bn.id = t.beneficiary_id
                  WHERE {where}
                ) matched
-         WHERE t.id = matched.id AND t.{col} IS NOT NULL
+         WHERE t.id = matched.id AND t.{col} IS DISTINCT FROM {off_placeholder}
         """,
-        *params,
+        *params, EXPORT_STATUS_OFF,
     )
     # asyncpg's execute() returns "UPDATE <n>" -- the count is the only thing
     # worth parsing back out of it.

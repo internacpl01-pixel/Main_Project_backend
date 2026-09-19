@@ -1596,7 +1596,6 @@ def _shape_farvision_verify_rows(
                 "company": r["_company"],
                 "desc": r["_desc_text"],
                 "tds_rate": r["_tds_rate"],
-                "export_status": r["_export_status"],
                 **{col: r.get(col) for col in farvision.COLUMNS},
                 # Overrides the page-local Link Ref Code _build_row assigned
                 # (just this call's own 1..page_size) with the row's real,

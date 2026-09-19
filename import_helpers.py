@@ -352,6 +352,8 @@ def _coerce(value, data_type: str):
 # could be deleted, in which case import behaves exactly as it did before it
 # existed.
 _EXPORT_UID_FIELD_NAME = "Export UID"
+_EXPORT_STATUS_FIELD_NAME = "Export Status"
+_EXPORT_STATUS_DEFAULT = "No"
 
 
 def _generate_export_uid() -> str:
@@ -366,14 +368,13 @@ def _generate_export_uid() -> str:
     return f"EXFV{letter}{digits}"
 
 
-async def _export_uid_column(conn, live: dict) -> str | None:
-    """The real column backing the "Export UID" custom field, if it still
-    exists, is active, and its column wasn't dropped straight from Postgres
-    without deleting the fieldmap row too.
+async def _column_by_display_name(conn, live: dict, displayname: str) -> str | None:
+    """The real column backing a custom field found by display name, if it
+    still exists, is active, and its column wasn't dropped straight from
+    Postgres without deleting the fieldmap row too.
     """
     row = await conn.fetchrow(
-        "SELECT fieldname FROM fieldmap WHERE displayname = $1 AND is_active",
-        _EXPORT_UID_FIELD_NAME,
+        "SELECT fieldname FROM fieldmap WHERE displayname = $1 AND is_active", displayname,
     )
     if row is None or row["fieldname"] not in live:
         return None
@@ -423,12 +424,17 @@ async def insert_temp_rows(conn, batch_id: int, normalized: list) -> int:
 
     columns = derived + extra
 
-    # "Export UID" has no header alias -- nothing on a bank statement will
-    # ever fill it via the "seen in raw_data" rule above -- so it is
-    # appended and filled separately, one random id generated per row below.
-    export_uid_col = await _export_uid_column(conn, live)
+    # Neither "Export UID" nor "Export Status" has a header alias -- nothing
+    # on a bank statement will ever fill them via the "seen in raw_data" rule
+    # above -- so both are appended and filled separately below: a random id
+    # per row for the first, a fixed "No" for the second (confirmed with the
+    # user: never blank, "No" until an export or reset says otherwise).
+    export_uid_col = await _column_by_display_name(conn, live, _EXPORT_UID_FIELD_NAME)
     if export_uid_col and export_uid_col not in columns:
         columns = columns + [export_uid_col]
+    export_status_col = await _column_by_display_name(conn, live, _EXPORT_STATUS_FIELD_NAME)
+    if export_status_col and export_status_col not in columns:
+        columns = columns + [export_status_col]
 
     missing = {"txn_date", "description", "balance"} - set(derived)
     if missing:
@@ -465,6 +471,8 @@ async def insert_temp_rows(conn, batch_id: int, normalized: list) -> int:
                 uid = _generate_export_uid()   # only against this one batch
             seen_uids.add(uid)
             record.append(uid)
+        if export_status_col:
+            record.append(_EXPORT_STATUS_DEFAULT)
         records.append(tuple(record))
 
     await conn.executemany(
