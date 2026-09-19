@@ -1840,6 +1840,15 @@ async def prepare_farvision_export(
     still be reviewable and downloadable on THIS visit despite having just
     been marked. A later, ordinary visit to Verify without include_ids hides
     them like any other already-exported row.
+
+    Also reports already_exported: how many farvision-eligible rows these
+    same filters cover that were EXCLUDED because they were already "Yes"
+    before this call. When ids comes back empty, this is what tells the
+    caller whether that's because every matching row is already exported
+    (already_exported > 0 -- confirmed with the user as worth its own clear
+    message, not the generic "nothing here" the Verify page would otherwise
+    show) or because the filters simply match no farvision-eligible rows at
+    all (already_exported == 0).
     """
     async with company_connection(user["schema"]) as conn:
         where, params, _columns, _term, _idx = await _temp_filters(
@@ -1848,11 +1857,12 @@ async def prepare_farvision_export(
             company=company, search=search, rule_conflicts=rule_conflicts,
         )
         where = _farvision_where(where)
+        total_eligible = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
         where, params = await _exclude_exported(conn, where, params)
         rows = await conn.fetch(f"SELECT t.id {_TEMP_JOINS} WHERE {where}", *params)
         ids = [r["id"] for r in rows]
         await farvision.mark_exported(conn, ids)
-    return {"ids": ids}
+    return {"ids": ids, "already_exported": total_eligible - len(ids)}
 
 
 @router.post("/temp-trans/reset-export-status")
