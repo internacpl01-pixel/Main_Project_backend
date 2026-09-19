@@ -1018,18 +1018,35 @@ _TEMP_JOINS = """
 """
 
 
+_FARVISION_BALANCE_ROW_RE = r"^(b/f|b/fwd|c/f|c/fwd|opening balance|closing balance)"
+
+
 def _farvision_where(where: str) -> str:
     """Narrow a _temp_filters WHERE for the three Farvision-only call sites
     below (the Verify listing and the export, both counting and fetching).
 
-    Zero and NULL are the same "no real amount" here -- a temp_trans row
-    with both Debit and Credit blank (0 or NULL) has no real transaction
-    value and should not appear in Farvision Verify or its export at all,
-    confirmed with the user. Deliberately not folded into _temp_filters
-    itself: the general Imported Rows page and every other consumer of it
-    still see these rows.
+    Two rules, neither folded into _temp_filters itself -- the general
+    Imported Rows page and every other consumer of it still see these rows
+    exactly as before; only Farvision Verify and its export do not:
+
+    - Zero and NULL are the same "no real amount" -- a row with both Debit
+      and Credit blank (0 or NULL) has no real transaction value.
+    - A statement's own opening/closing-balance carry-forward line (real
+      example found live: desc_text "B/F ...", dated, with a real Credit
+      Amount -- parsers.py's own _FOOTER_KEYWORDS only catches this shape on
+      a date-less row, so a dated B/F line reaches temp_trans as if it were
+      a real transaction). Matched at the start of Description or Narration
+      so a real transaction whose text merely contains one of these words
+      elsewhere is not touched.
+
+    Both confirmed with the user.
     """
-    return f"({where}) AND (coalesce(t.field_num_1, 0) <> 0 OR coalesce(t.field_num_2, 0) <> 0)"
+    return (
+        f"({where}) "
+        "AND (coalesce(t.field_num_1, 0) <> 0 OR coalesce(t.field_num_2, 0) <> 0) "
+        f"AND coalesce(t.field_text_1, '')  !~* '{_FARVISION_BALANCE_ROW_RE}' "
+        f"AND coalesce(t.field_text_11, '') !~* '{_FARVISION_BALANCE_ROW_RE}'"
+    )
 
 
 async def _temp_filters(
@@ -1536,6 +1553,7 @@ def _shape_farvision_verify_rows(rows: list, *, total: int, page: int, page_size
                 "internal": r["_internal"],
                 "company": r["_company"],
                 "desc": r["_desc_text"],
+                "tds_rate": r["_tds_rate"],
                 **{col: r.get(col) for col in farvision.COLUMNS},
             }
             for r in rows
@@ -1620,6 +1638,66 @@ async def farvision_verify_resolve_description(
     if updated is None:
         raise HTTPException(404, f"No staged row with id={id}.")
     return {"id": id, "description": description}
+
+
+@router.post("/temp-trans/farvision-verify/resolve-tds-rate")
+async def farvision_verify_resolve_tds_rate(
+    id: int = Body(...),
+    tds_rate: str = Body(...),
+    user: dict = Depends(get_company_user),
+):
+    """Save the Farvision Verify page's own "TDS Rate" note for one row --
+    e.g. "1%", "2%", "10%", or anything else typed by hand -- and reverse-
+    calculate what it implies for Debit Amount and Adjustment Amount.
+
+    The note itself (farvision_tds_rate_override) is never read back by
+    farvision.py's export -- it isn't one of COLUMNS. But picking a rate is
+    also the trigger for grossing up the row's Debit Amount (currently the
+    net amount actually paid, after TDS) into the gross amount: Debit Amount
+    and Adjustment Amount both become that gross figure, Credit Amount is
+    never touched. Confirmed with the user with a worked example (98,000 net
+    at 2% -> 100,000 gross for both fields). The result rides on a second
+    column, farvision_debit_amount_override, which farvision.py's _build_row
+    does read -- clearing the rate (empty string) clears this too, so Debit
+    Amount/Adjustment Amount fall back to their normal computed values. A row
+    with no Debit Amount at all (a Credit-side row) has nothing to gross up;
+    the rate note is still saved, the reverse calculation just does nothing.
+    """
+    async with company_connection(user["schema"]) as conn:
+        row = await conn.fetchrow(
+            "SELECT field_num_1 AS debit_amount FROM temp_trans WHERE id = $1", id,
+        )
+        if row is None:
+            raise HTTPException(404, f"No staged row with id={id}.")
+
+        rate_fraction = farvision.parse_tds_rate(tds_rate)
+        debit_amount_override = farvision.gross_up_debit_amount(
+            row["debit_amount"], rate_fraction)
+
+        await conn.execute(
+            """
+            UPDATE temp_trans
+               SET farvision_tds_rate_override = $1,
+                   farvision_debit_amount_override = $2
+             WHERE id = $3
+            """,
+            tds_rate, debit_amount_override, id,
+        )
+        # Re-run this one row through the real pipeline rather than
+        # re-deriving Debit Amount/Adjustment Amount's fallback rules here a
+        # second time -- the response then always matches exactly what the
+        # export would write, including when clearing the rate falls back to
+        # the ordinary (non-override) computation.
+        updated_rows = await farvision.fetch_rows(
+            conn, "t.id = $1", [id], schema=user["schema"])
+
+    updated = updated_rows[0] if updated_rows else {}
+    return {
+        "id": id,
+        "tds_rate": tds_rate,
+        "debit_amount": updated.get("Debit Amount"),
+        "adjustment_amount": updated.get("Adjustment Amount"),
+    }
 
 
 @router.get("/temp-trans/filters")

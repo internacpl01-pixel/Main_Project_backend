@@ -82,6 +82,7 @@ company/037_farvision_account_master.sql's sibling migration 044). Once set,
 an override always wins over re-matching -- see fetch_rows.
 """
 import asyncio
+import decimal
 import re
 import time
 
@@ -332,6 +333,39 @@ _TDS_DESCRIPTION = {
 # only for that manual override; _TDS_DESCRIPTION above is still the only
 # thing that auto-fills a row before anyone touches it.
 DESCRIPTION_OPTIONS = sorted(set(_TDS_DESCRIPTION.values()) | {"TDS PAYABLE (NIL)"})
+
+_TDS_RATE_NUMBER_RE = re.compile(r"(\d+(?:\.\d+)?)")
+
+
+def parse_tds_rate(text: str | None) -> decimal.Decimal | None:
+    """Pull a percentage out of a typed TDS Rate ("2%", "10", "2 %") as a 0-1
+    fraction, or None when there's nothing usable -- no digits, or a number
+    outside (0, 100) (0% needs no grossing-up at all; 100% divides by zero).
+    """
+    if not text:
+        return None
+    m = _TDS_RATE_NUMBER_RE.search(text)
+    if not m:
+        return None
+    value = decimal.Decimal(m.group(1))
+    if not (0 < value < 100):
+        return None
+    return value / decimal.Decimal(100)
+
+
+def gross_up_debit_amount(
+    debit_amount: decimal.Decimal | None, rate_fraction: decimal.Decimal | None,
+) -> decimal.Decimal | None:
+    """Reverse-calculate the gross amount from a net Debit Amount and a TDS
+    Rate fraction -- e.g. net 98,000 at 2% -> gross 100,000. None when either
+    input is missing: a row with no Debit Amount (a Credit-side row) has
+    nothing to gross up, confirmed with the user as a case where the TDS Rate
+    note is still saved but the reverse calculation does nothing.
+    """
+    if not debit_amount or rate_fraction is None:
+        return None
+    gross = debit_amount / (decimal.Decimal(1) - rate_fraction)
+    return gross.quantize(decimal.Decimal("0.01"), rounding=decimal.ROUND_HALF_UP)
 
 # Read-only reference material for the Master Data page's Farvision Account
 # tabs: the format/example values found in the original master sheet for
@@ -1171,6 +1205,8 @@ async def fetch_rows(
                t.farvision_account_head_override AS account_head_override,
                t.farvision_parent_account_head_override AS parent_account_head_override,
                t.farvision_description_override AS description_override,
+               t.farvision_tds_rate_override AS tds_rate,
+               t.farvision_debit_amount_override AS debit_amount_override,
                {company_select}
                t.id AS temp_trans_id
           FROM temp_trans t
@@ -1338,6 +1374,10 @@ async def fetch_rows(
             # on demand next to Narration so the user can sanity-check a
             # match without it ever reaching the exported sheet.
             "_desc_text": r["desc_text"],
+            # A person's own manually-typed TDS Rate note (e.g. "1%") -- not
+            # an export column either, purely a Farvision Verify page field,
+            # confirmed with the user.
+            "_tds_rate": r["tds_rate"],
             "Link Ref Code": i,
             "Business Unit": _format_business_unit(r["business_unit"]),
             "Financial Year": _format_financial_year(r["financial_year"]),
@@ -1354,8 +1394,11 @@ async def fetch_rows(
             # 0 is treated the same as NULL here, same as _debit_or_credit --
             # a placeholder zero alongside the row's real amount on the other
             # side should export blank, not a literal 0, confirmed with the
-            # user.
-            "Debit Amount": r["debit_amount"] or None,
+            # user. A TDS Rate override (farvision_debit_amount_override,
+            # computed by the resolve-tds-rate endpoint) wins over the raw
+            # amount when set -- the reverse-calculated gross, not the net
+            # actually paid. Credit Amount is never touched by it.
+            "Debit Amount": r["debit_amount_override"] or r["debit_amount"] or None,
             "Credit Amount": r["credit_amount"] or None,
             "Payment Mode": "Direct",
             "Cheque No": None,
@@ -1386,12 +1429,17 @@ async def fetch_rows(
             "Invoice Date": r["document_date"],
             "Bill Amount": None,
             "Balance Amount": None,
-            # Skipped when Parent Account Head is blank -- there is nothing to
-            # adjust against. Otherwise whichever of Debit/Credit is the row's
-            # real amount (only one of the two is ever set).
+            # A TDS Rate override always wins here too, and unconditionally --
+            # not gated on Parent Account Head like the fallback below --
+            # confirmed with the user: Adjustment Amount must equal the same
+            # grossed-up figure as Debit Amount above whenever a rate was
+            # picked. Otherwise unchanged: skipped when Parent Account Head
+            # is blank (nothing to adjust against), else whichever of
+            # Debit/Credit is the row's real amount.
             "Adjustment Amount": (
-                (r["debit_amount"] or r["credit_amount"])
-                if parent_account_head else None
+                r["debit_amount_override"] if r["debit_amount_override"] is not None
+                else (r["debit_amount"] or r["credit_amount"]) if parent_account_head
+                else None
             ),
         }
 
