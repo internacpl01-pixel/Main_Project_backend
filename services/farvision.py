@@ -751,7 +751,18 @@ def _normalize_party_name(text: str | None) -> str:
     out = []
     for w in words:
         w = _SUFFIX_MAP.get(w, w)
-        if len(w) > 3 and w.endswith("S") and w not in ("LTD", "PVT"):
+        # >=6, not >3: confirmed live that the shorter threshold corrupts a
+        # real name fragment that merely happens to end in "S" rather than
+        # actually being a plural -- "SATIS" (half of "SATIS H", itself
+        # "SATISH" split by a stray extraction space) was being singularized
+        # to "SATI" here, before Pass 2's own stray-space reconstruction
+        # ever got a chance to see the real word and rejoin it, so it never
+        # found "SATISH" at all. Every genuine case this was built for
+        # ("INFOSYSTEMS", "PROJECTS", "SERVICES", ...) is well past 6
+        # letters on its own; a short word this aggressive fold could still
+        # mis-singularize just stays exactly as it came from the bank
+        # instead, which only costs a possible match, never a wrong one.
+        if len(w) >= 6 and w.endswith("S") and w not in ("LTD", "PVT"):
             w = w[:-1]
         out.append(w)
     return " ".join(out)
@@ -894,81 +905,113 @@ def _fuzzy_lookup(pool: set[str]):
     return lookup
 
 
-def _match_account_head(
-    desc_text: str | None, candidates: list[dict],
-) -> tuple[str | None, str | None, list[str] | None]:
-    """Search temp_trans's own DESC field (field_text_1), the real bank text.
+# NARRATION's own "To: <party>" segment, when it has one -- confirmed with
+# the user as the new preferred first look: Narration is built from other
+# already-classified fields (see _match_account_head's own note on it below)
+# and that classification has typically already isolated the party name in
+# one clean field, no hyphen-joined bank codes and reference numbers around
+# it the way DESC always has. Only the "To:" segment itself, not the whole
+# line -- "Purpose:", "Ref:", "BU:" and "Head:" are never a party name and
+# would only add noise to search on.
+_NARRATION_TO_RE = re.compile(r"\bTo:\s*([^|]+)", re.IGNORECASE)
 
-    NARRATION (field_text_11) looked like it should be the search source, but
-    it is a synthetic field -- confirmed against real data where it was
-    frequently just the literal placeholder text "Remarks Compulsory For
-    Narration", not the bank's actual description, and even when populated it
-    is built from other classified fields, so matching against it would be
-    circular. DESC is the raw hyphen-joined bank text (e.g. "YIB-NEFT-
-    YESME62170041087-INDIA PRIDE COM-CNRB0001565-VENDOR- CANARA BANK")
-    confirmed by the user's own screenshot of it, and is searched whole --
-    there is no "To:"/"Purpose:" structure in DESC to isolate a party
-    segment from, unlike the synthetic Narration.
+
+def _narration_to_name(narration: str | None) -> str | None:
+    if not narration:
+        return None
+    m = _NARRATION_TO_RE.search(narration)
+    if not m:
+        return None
+    name = m.group(1).strip()
+    return name or None
+
+
+def _match_account_head(
+    desc_text: str | None, candidates: list[dict], narration: str | None = None,
+) -> tuple[str | None, str | None, list[str] | None]:
+    """Search temp_trans's own DESC field (field_text_1) for the party a
+    non-Internal row's Account Head should be, checking NARRATION's own
+    "To: <party>" segment first and DESC only if that finds nothing at all.
+
+    NARRATION (field_text_11) is a synthetic field, built from other already-
+    classified fields rather than typed by the bank -- confirmed against real
+    data where it was frequently just the literal placeholder text "Remarks
+    Compulsory For Narration" instead. That still makes it circular to trust
+    on its own (a bad classification elsewhere would make it look confident
+    when it is just repeating the mistake), which is why DESC -- the bank's
+    own raw hyphen-joined text ("YIB-NEFT-YESME62170041087-INDIA PRIDE COM-
+    CNRB0001565-VENDOR- CANARA BANK") -- is still tried whenever the
+    NARRATION attempt below comes back with nothing, and remains the only
+    source for an Internal row's bank-side matching entirely (see
+    _match_internal_account_head, which never sees NARRATION).
+    But when NARRATION does have a real "To:" segment, confirmed with the
+    user as worth trying FIRST: it is usually a clean, already-isolated party
+    name with none of DESC's surrounding bank codes and reference numbers to
+    confuse a keyword match, which is exactly the noise the three passes
+    below exist to filter through in the first place.
 
     Returns (account_head, parent_account_head, options): options is
     non-None whenever more than one candidate ties for the win -- callers
     should treat that exactly like the existing duplicate-spelling case
     (leave account_head/parent blank, offer options instead).
     """
-    if not desc_text:
+    to_name = _narration_to_name(narration)
+    if to_name:
+        result = _match_text_against_candidates(to_name, candidates)
+        if result != (None, None, None):
+            return result
+    return _match_text_against_candidates(desc_text, candidates)
+
+
+def _match_text_against_candidates(
+    text: str | None, candidates: list[dict],
+) -> tuple[str | None, str | None, list[str] | None]:
+    """The two-pass search itself, run against whichever text
+    _match_account_head decided to try -- NARRATION's "To:" segment first,
+    DESC if that found nothing.
+    """
+    if not text:
         return None, None, None
-    search_text = _normalize_party_name(desc_text)
+    search_text = _normalize_party_name(text)
     if not search_text:
         return None, None, None
 
-    # Pass 1: the CORE text (trailing "- AH003677"-style reference code
-    # stripped, see _strip_trailing_code) has to appear in DESC as a whole,
-    # word-ordered phrase -- a bank's own narration can name the party but
-    # never this app's internal ledger id for them. The most precise check,
-    # tried first.
-    #
-    # candidates is sorted longest-core-first (_account_head_candidates), so
-    # the first match found is also the most specific -- but a code fully
-    # stripped down to a bare, common first name ("RAHUL - E1000283_D" and
-    # "RAHUL - E1000283" both reduce to plain "RAHUL") can tie with other
-    # candidates at that SAME core length. Rather than the first of them
-    # winning arbitrarily (confirmed live as a real, wrong outcome), every
-    # match is collected as long as it shares the winning tier's exact core
-    # length; more than one is offered as options instead of picked.
-    for i, c in enumerate(candidates):
-        if not (len(c["_core"]) >= _MIN_MATCH_LENGTH and c["_core"] in search_text):
-            continue
-        tie_length = len(c["_core"])
-        tied = [c]
-        for other in candidates[i + 1:]:
-            if len(other["_core"]) != tie_length:
-                break
-            if other["_core"] in search_text:
-                tied.append(other)
-        if len(tied) == 1:
-            return c["account_head"], c["parent_account_head"], None
-        return None, None, sorted({t["account_head"] for t in tied})
-
-    # Pass 2: rejoin every adjacent pair of DESC's own words and add that to
-    # the pool a candidate's core can draw from, then check as a SET of
-    # words rather than one ordered phrase -- tolerates a stray space a PDF
-    # extraction sometimes inserts INSIDE a real word. Confirmed live on two
-    # different shapes: "RAHU L KUMAR" for a two-word head "RAHUL KUMAR"
-    # (Pass 1 needs "RAHUL" as one word, which it never is here), and
+    # Pass 1+2, combined: rejoin every adjacent pair of DESC's own words and
+    # add that to the pool a candidate's core can draw from, then check as a
+    # SET of words rather than one ordered phrase -- tolerates a stray space
+    # a PDF extraction sometimes inserts INSIDE a real word. Confirmed live
+    # on two different shapes: "RAHU L KUMAR" for a two-word head "RAHUL
+    # KUMAR" (needs "RAHUL" as one word, which it never is here), and
     # "SANTO SH" for a bare one-word head "SANTOSH" (no surname anywhere in
     # that DESC at all, so a whole-string blob match could never work
     # either -- only the specific adjacent pair "SANTO"+"SH" reconstructs
-    # it). Order stops mattering here on purpose: once a word has already
-    # been split apart by whatever broke it, DESC's own word order around
-    # the break is not something to keep trusting.
+    # it).
     #
-    # Not restricted to multi-word cores the way an earlier version of this
-    # was: a bare single-word head matching is an accepted, pre-existing
-    # risk in this codebase (Pass 1 already allows it for a word already
-    # sitting in DESC unbroken), and here it can only happen via a
-    # RECONSTRUCTED pair, not any word merely floating in the text -- two
-    # adjacent fragments happening to coincidentally reassemble into some
-    # specific real master name is a narrow enough coincidence to accept.
+    # An exact, word-ordered substring match (the more precise check this
+    # started out as two separate passes for) is just a special case of this
+    # same set check -- every word an ordered substring needs is trivially
+    # already in `reconstructed`, since that always contains DESC's own
+    # words verbatim before any pair-merging is even added on top. Keeping
+    # them separate, ordered-substring first, was what caused a real bug:
+    # "SATIS H" (half of "SATIS H" reconstructing to "SATISH") has a
+    # DIFFERENT, unrelated candidate literally spelled "Satis" -- a shorter,
+    # plainer coincidental substring match that the old ordered-first pass
+    # returned immediately, before the better "SATISH" reconstruction two
+    # words later ever got a chance to be compared against it. Running both
+    # as one set of hits and keeping only the single most-specific (longest
+    # core) tier is what makes "SATISH" correctly outrank "SATIS" -- the
+    # same specificity rule already applied below, just no longer blocked
+    # from ever being reached.
+    #
+    # Not restricted to multi-word cores: a bare single-word head matching
+    # is an accepted, pre-existing risk in this codebase, and reaching a
+    # SPECIFIC one this way still requires either an unbroken word already
+    # in DESC or a RECONSTRUCTED pair -- not any word merely floating in the
+    # text -- so a coincidental hit is a narrow enough risk to accept, and a
+    # code fully stripped down to a bare, common first name ("RAHUL -
+    # E1000283_D" and "RAHUL - E1000283" both reduce to plain "RAHUL") tying
+    # with other candidates at the SAME core length is exactly the ambiguity
+    # this hands to a human instead of picking one arbitrarily.
     desc_words = search_text.split()
     reconstructed = set(desc_words)
     for i in range(len(desc_words) - 1):
@@ -980,17 +1023,16 @@ def _match_account_head(
         if len(c["_core"]) >= _MIN_MATCH_LENGTH and c["_core_words"] <= reconstructed
     ]
     if hits:
-        # Most-specific tier only, same reasoning as Pass 1's tie handling:
-        # a DESC that reconstructs to "RAHUL KUMAR" (surname present) should
-        # not have that clean 2-word match diluted by also listing every
-        # bare "RAHUL"-alone placeholder entry -- those matched too (a
-        # single word is trivially a subset of any set containing it), but
-        # they are strictly less specific than one that used every
-        # reconstructed word. Only when the BEST tier itself has more than
-        # one candidate (several different "Santosh ..." people, say, with
-        # no more specific tier to prefer) is that genuine ambiguity handed
-        # to a human -- confirmed with the user as their own explicit ask
-        # for exactly this situation.
+        # Most-specific tier only: a DESC that reconstructs to "RAHUL KUMAR"
+        # (surname present) should not have that clean 2-word match diluted
+        # by also listing every bare "RAHUL"-alone placeholder entry --
+        # those matched too (a single word is trivially a subset of any set
+        # containing it), but they are strictly less specific than one that
+        # used every reconstructed word. Only when the BEST tier itself has
+        # more than one candidate (several different "Santosh ..." people,
+        # say, with no more specific tier to prefer) is that genuine
+        # ambiguity handed to a human -- confirmed with the user as their
+        # own explicit ask for exactly this situation.
         best = max(len(c["_core"]) for c in hits)
         hits = [c for c in hits if len(c["_core"]) == best]
         if len(hits) == 1:
@@ -998,10 +1040,10 @@ def _match_account_head(
             return c["account_head"], c["parent_account_head"], None
         return None, None, sorted({c["account_head"] for c in hits})
 
-    # Pass 3: the same reconstructed word pool, but each of a candidate's
+    # Pass 2: the same reconstructed word pool, but each of a candidate's
     # words is now allowed to be a fuzzy match (see _fuzzy_lookup) rather
     # than requiring the exact letters -- confirmed live and genuinely
-    # different from the two passes above: a one-character spelling slip
+    # different from the pass above: a one-character spelling slip
     # between the bank's own text and this app's master data ("Ramabati
     # Devi" in six real transactions on one account, "Ramavati Devi(411)"
     # the only entry anywhere in either master), not a PDF-extraction stray
@@ -1200,7 +1242,7 @@ async def fetch_rows(
             parent_account_head = None
         else:
             account_head, parent_account_head, despaced_options = _match_account_head(
-                r["desc_text"], candidates_by_company[company])
+                r["desc_text"], candidates_by_company[company], narration=r["narration"])
 
             if despaced_options:
                 # More than one candidate's name reassembled from the same
