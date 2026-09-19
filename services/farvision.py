@@ -1162,6 +1162,68 @@ async def candidate_pools(conn, schema: str) -> dict:
     }
 
 
+async def link_ref_codes(conn, where: str, params: list) -> dict[int, int | None]:
+    """Every row's own Link Ref Code, matching exactly what it will get in
+    its real export file -- a running count per Document Type (Payment/
+    Reciept counts every one of its own rows; Deposit/withdrawal counts only
+    its own Debit leg, mirroring filter_deposit_withdrawal's own Credit-leg
+    exclusion), continuing across the *whole* filtered batch rather than
+    resetting every 50-row Verify page. Confirmed with the user after two
+    false-alarm "wrong sheet" reports that both traced back to the Verify
+    page showing one global counter while each export renumbers its own two
+    groups independently starting at 1 -- this makes the number shown on
+    Verify the exact number that row will carry in its export, so the two
+    can always be cross-referenced directly.
+
+    A row this numbering skips entirely (a Credit leg, or a skipped document
+    type -- _skip_document_type) maps to None: it will not appear in either
+    export at all, so it gets no Link Ref Code to show.
+
+    Deliberately cheap: only head_name/debit_amount/credit_amount, none of
+    fetch_rows' Account Head matching -- the whole filtered batch is a few
+    hundred rows even though a Verify page only ever shows 50 of them.
+
+    p/bn are joined here too, unread, for the same reason fetch_rows joins
+    them -- so a WHERE built by _temp_filters can reference p.name/bn.name
+    (a project or beneficiary filter) without "missing FROM-clause entry".
+    """
+    rows = await conn.fetch(
+        f"""
+        SELECT t.id AS temp_trans_id,
+               coalesce(h.name, rh.name, ih.name, t.field_text_5) AS head_name,
+               t.field_num_1 AS debit_amount,
+               t.field_num_2 AS credit_amount
+          FROM temp_trans t
+          LEFT JOIN projects            p  ON p.id  = t.project_id
+          LEFT JOIN head_master         h  ON h.id  = t.head_id
+          LEFT JOIN rera_head_master    rh ON rh.id = t.rera_head_id
+          LEFT JOIN idw_head_master     ih ON ih.id = t.idw_head_id
+          LEFT JOIN beneficiary_master  bn ON bn.id = t.beneficiary_id
+         WHERE {where}
+         ORDER BY t.batch_id, t.row_number
+        """,
+        *params,
+    )
+    rp_counter = 0
+    dw_counter = 0
+    out: dict[int, int | None] = {}
+    for r in rows:
+        head_name = r["head_name"]
+        if _skip_document_type(head_name):
+            out[r["temp_trans_id"]] = None
+            continue
+        if _is_internal(head_name):
+            if _debit_or_credit(r["debit_amount"], r["credit_amount"]) == "Credit":
+                out[r["temp_trans_id"]] = None
+                continue
+            dw_counter += 1
+            out[r["temp_trans_id"]] = dw_counter
+        else:
+            rp_counter += 1
+            out[r["temp_trans_id"]] = rp_counter
+    return out
+
+
 async def fetch_rows(
     conn, where: str, params: list, schema: str,
     limit: int | None = None, offset: int | None = None,

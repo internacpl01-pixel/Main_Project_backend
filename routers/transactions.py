@@ -1490,11 +1490,13 @@ async def farvision_verify_rows(
             )
             where = _farvision_where(where)
             total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
+            link_ref_map = await farvision.link_ref_codes(conn, where, params)
             rows = await farvision.fetch_rows(
                 conn, where, params, schema=user["schema"],
                 limit=page_size, offset=(page - 1) * page_size,
             )
-        return _shape_farvision_verify_rows(rows, total=total, page=page, page_size=page_size)
+        return _shape_farvision_verify_rows(
+            rows, total=total, page=page, page_size=page_size, link_ref_map=link_ref_map)
 
     job_id = jobs.create(
         schema=user["schema"], username=user["username"],
@@ -1511,6 +1513,7 @@ async def farvision_verify_rows(
                 )
                 where = _farvision_where(where)
                 total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
+                link_ref_map = await farvision.link_ref_codes(conn, where, params)
                 # jobs.create defaults step_units to 1 -- start_step is what
                 # actually sets it to this page's own row count, which is
                 # what makes tick()'s step_done/step_units percent (jobs.get's
@@ -1528,7 +1531,7 @@ async def farvision_verify_rows(
                     on_row=lambda i, n: jobs.tick(job_id),
                 )
             jobs.finish(job_id, _shape_farvision_verify_rows(
-                rows, total=total, page=page, page_size=page_size))
+                rows, total=total, page=page, page_size=page_size, link_ref_map=link_ref_map))
         except Exception as exc:                      # noqa: BLE001
             logger.warning("[Farvision verify] job %s failed: %s", job_id, exc)
             jobs.fail(job_id, str(exc))
@@ -1537,7 +1540,9 @@ async def farvision_verify_rows(
     return {"job_id": job_id, "state": jobs.QUEUED}
 
 
-def _shape_farvision_verify_rows(rows: list, *, total: int, page: int, page_size: int) -> dict:
+def _shape_farvision_verify_rows(
+    rows: list, *, total: int, page: int, page_size: int, link_ref_map: dict,
+) -> dict:
     # Every Farvision export column, not just Narration/Account Head --
     # confirmed with the user: this page reviews the row the export will
     # actually write, so it should look like that row, not a narrow summary
@@ -1555,6 +1560,13 @@ def _shape_farvision_verify_rows(rows: list, *, total: int, page: int, page_size
                 "desc": r["_desc_text"],
                 "tds_rate": r["_tds_rate"],
                 **{col: r.get(col) for col in farvision.COLUMNS},
+                # Overrides the page-local Link Ref Code _build_row assigned
+                # (just this call's own 1..page_size) with the row's real,
+                # per-Document-Type number -- see farvision.link_ref_codes.
+                # None for a row excluded from both exports entirely (a
+                # Credit leg, or a skipped document type).
+                "Link Ref Code": link_ref_map.get(r["_temp_trans_id"]),
+                "Detail Link Ref Code": link_ref_map.get(r["_temp_trans_id"]),
             }
             for r in rows
         ],
