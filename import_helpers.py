@@ -424,16 +424,22 @@ async def insert_temp_rows(conn, batch_id: int, normalized: list) -> int:
 
     columns = derived + extra
 
-    # Neither "Export UID" nor "Export Status" has a header alias -- nothing
-    # on a bank statement will ever fill them via the "seen in raw_data" rule
-    # above -- so both are appended and filled separately below: a random id
-    # per row for the first, a fixed "No" for the second (confirmed with the
-    # user: never blank, "No" until an export or reset says otherwise).
+    # Neither "Export UID" nor "Export Status" has a header alias on an
+    # ordinary bank statement -- but re-importing a file that was itself
+    # exported earlier (its header row literally reads "Export UID" /
+    # "Export Status") DOES match one by display name, landing it in `extra`
+    # already. In that case the column must not be appended a second time
+    # here, and -- the part that was missed -- the per-row loop below must
+    # not append a SECOND value for it either, or every record ends up one
+    # (or two) items longer than `columns`, exactly the "N+1 arguments"
+    # asyncpg error this produced on such a file.
     export_uid_col = await _column_by_display_name(conn, live, _EXPORT_UID_FIELD_NAME)
-    if export_uid_col and export_uid_col not in columns:
+    export_uid_needs_fill = bool(export_uid_col) and export_uid_col not in columns
+    if export_uid_needs_fill:
         columns = columns + [export_uid_col]
     export_status_col = await _column_by_display_name(conn, live, _EXPORT_STATUS_FIELD_NAME)
-    if export_status_col and export_status_col not in columns:
+    export_status_needs_fill = bool(export_status_col) and export_status_col not in columns
+    if export_status_needs_fill:
         columns = columns + [export_status_col]
 
     missing = {"txn_date", "description", "balance"} - set(derived)
@@ -465,13 +471,13 @@ async def insert_temp_rows(conn, batch_id: int, normalized: list) -> int:
         # column name, so the lookup is direct. Coerced to the column's declared
         # type, exactly as DPL did from live_cols.
         record.extend(_coerce(raw.get(name), live[name]) for name in extra)
-        if export_uid_col:
+        if export_uid_needs_fill:
             uid = _generate_export_uid()
             while uid in seen_uids:            # astronomically rare; guards
                 uid = _generate_export_uid()   # only against this one batch
             seen_uids.add(uid)
             record.append(uid)
-        if export_status_col:
+        if export_status_needs_fill:
             record.append(_EXPORT_STATUS_DEFAULT)
         records.append(tuple(record))
 
