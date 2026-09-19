@@ -1021,13 +1021,19 @@ _TEMP_JOINS = """
 _FARVISION_BALANCE_ROW_RE = r"^(b/f|b/fwd|c/f|c/fwd|opening balance|closing balance)"
 
 
-def _farvision_where(where: str) -> str:
-    """Narrow a _temp_filters WHERE for the three Farvision-only call sites
-    below (the Verify listing and the export, both counting and fetching).
+_FARVISION_HEAD_EXPR = "upper(trim(coalesce(h.name, rh.name, ih.name, t.field_text_5, '')))"
 
-    Two rules, neither folded into _temp_filters itself -- the general
-    Imported Rows page and every other consumer of it still see these rows
-    exactly as before; only Farvision Verify and its export do not:
+
+def _farvision_where(
+    where: str, *, debit_credit: str | None = None, document_type: str | None = None,
+) -> str:
+    """Narrow a _temp_filters WHERE for the Farvision-only call sites below
+    (the Verify listing and the export, both counting and fetching).
+
+    Two rules always apply, neither folded into _temp_filters itself -- the
+    general Imported Rows page and every other consumer of it still see
+    these rows exactly as before; only Farvision Verify and its export do
+    not:
 
     - Zero and NULL are the same "no real amount" -- a row with both Debit
       and Credit blank (0 or NULL) has no real transaction value.
@@ -1039,14 +1045,36 @@ def _farvision_where(where: str) -> str:
       so a real transaction whose text merely contains one of these words
       elsewhere is not touched.
 
+    debit_credit ("Debit"/"Credit") and document_type ("Payment/Reciept"/
+    "Deposit/withdrawal"), when given, are the Farvision Verify page's own
+    filters -- confirmed with the user as needing to be cheap (no Account
+    Head matching) so they can narrow the WHERE before fetch_rows/COUNT ever
+    run, the same way _temp_filters' own filters do. The SQL here mirrors
+    _debit_or_credit and _is_internal/_skip_document_type exactly, just
+    inlined so it can run before any row is matched.
+
     Both confirmed with the user.
     """
-    return (
-        f"({where}) "
-        "AND (coalesce(t.field_num_1, 0) <> 0 OR coalesce(t.field_num_2, 0) <> 0) "
-        f"AND coalesce(t.field_text_1, '')  !~* '{_FARVISION_BALANCE_ROW_RE}' "
-        f"AND coalesce(t.field_text_11, '') !~* '{_FARVISION_BALANCE_ROW_RE}'"
-    )
+    parts = [
+        f"({where})",
+        "(coalesce(t.field_num_1, 0) <> 0 OR coalesce(t.field_num_2, 0) <> 0)",
+        f"coalesce(t.field_text_1, '')  !~* '{_FARVISION_BALANCE_ROW_RE}'",
+        f"coalesce(t.field_text_11, '') !~* '{_FARVISION_BALANCE_ROW_RE}'",
+    ]
+    if debit_credit == "Debit":
+        parts.append("coalesce(t.field_num_1, 0) <> 0")
+    elif debit_credit == "Credit":
+        parts.append("coalesce(t.field_num_1, 0) = 0 AND coalesce(t.field_num_2, 0) <> 0")
+
+    if document_type == "Payment/Reciept":
+        parts.append(
+            f"{_FARVISION_HEAD_EXPR} NOT LIKE 'INTERNAL%' "
+            f"AND {_FARVISION_HEAD_EXPR} NOT IN ('CANCELLATION', 'COLLECTION')"
+        )
+    elif document_type == "Deposit/withdrawal":
+        parts.append(f"{_FARVISION_HEAD_EXPR} LIKE 'INTERNAL%'")
+
+    return " AND ".join(parts)
 
 
 async def _temp_filters(
@@ -1310,7 +1338,8 @@ _EXPORT_KINDS = {
 
 async def _build_farvision_export(
     *, schema: str, user: dict, kind: str, batch_id, classified, date_from,
-    date_to, account, company, search, rule_conflicts, job_id: str | None = None,
+    date_to, account, company, search, rule_conflicts, debit_credit=None,
+    job_id: str | None = None,
 ) -> tuple[bytes, str]:
     """The actual work behind export-farvision: fetch, match, and render.
 
@@ -1332,7 +1361,7 @@ async def _build_farvision_export(
             date_from=date_from, date_to=date_to, account=account,
             company=company, search=search, rule_conflicts=rule_conflicts,
         )
-        where = _farvision_where(where)
+        where = _farvision_where(where, debit_credit=debit_credit)
         on_row = None
         if job_id is not None:
             total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
@@ -1359,6 +1388,7 @@ async def export_farvision(
     company: str = Query(None),
     search: str = Query(""),
     rule_conflicts: str = Query(None),
+    debit_credit: str = Query(None, description='"Debit" or "Credit"'),
     background: bool = Query(
         False,
         description="true returns a job id immediately; poll GET /imports/jobs/{id} "
@@ -1397,7 +1427,7 @@ async def export_farvision(
             schema=user["schema"], user=user, kind=kind, batch_id=batch_id,
             classified=classified, date_from=date_from, date_to=date_to,
             account=account, company=company, search=search,
-            rule_conflicts=rule_conflicts,
+            rule_conflicts=rule_conflicts, debit_credit=debit_credit,
         )
         return StreamingResponse(
             iter([content]),
@@ -1416,7 +1446,7 @@ async def export_farvision(
                 schema=user["schema"], user=user, kind=kind, batch_id=batch_id,
                 classified=classified, date_from=date_from, date_to=date_to,
                 account=account, company=company, search=search,
-                rule_conflicts=rule_conflicts, job_id=job_id,
+                rule_conflicts=rule_conflicts, debit_credit=debit_credit, job_id=job_id,
             )
             jobs.finish(job_id, {
                 "filename": filename,
@@ -1443,6 +1473,8 @@ async def farvision_verify_rows(
     company: str = Query(None),
     search: str = Query(""),
     rule_conflicts: str = Query(None),
+    debit_credit: str = Query(None, description='"Debit" or "Credit"'),
+    document_type: str = Query(None, description='"Payment/Reciept" or "Deposit/withdrawal"'),
     page: int = Query(1, ge=1),
     page_size: int = Query(_FARVISION_VERIFY_PAGE_SIZE, ge=1, le=500),
     background: bool = Query(
@@ -1488,7 +1520,7 @@ async def farvision_verify_rows(
                 date_from=date_from, date_to=date_to, account=account,
                 company=company, search=search, rule_conflicts=rule_conflicts,
             )
-            where = _farvision_where(where)
+            where = _farvision_where(where, debit_credit=debit_credit, document_type=document_type)
             total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
             link_ref_map = await farvision.link_ref_codes(conn, where, params)
             rows = await farvision.fetch_rows(
@@ -1511,7 +1543,7 @@ async def farvision_verify_rows(
                     date_from=date_from, date_to=date_to, account=account,
                     company=company, search=search, rule_conflicts=rule_conflicts,
                 )
-                where = _farvision_where(where)
+                where = _farvision_where(where, debit_credit=debit_credit, document_type=document_type)
                 total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
                 link_ref_map = await farvision.link_ref_codes(conn, where, params)
                 # jobs.create defaults step_units to 1 -- start_step is what
