@@ -1518,6 +1518,7 @@ def _shape_farvision_verify_rows(rows: list, *, total: int, page: int, page_size
                 "options": r["_account_head_options"],
                 "internal": r["_internal"],
                 "company": r["_company"],
+                "desc": r["_desc_text"],
                 **{col: r.get(col) for col in farvision.COLUMNS},
             }
             for r in rows

@@ -1310,6 +1310,11 @@ async def fetch_rows(
             # row's own company's Account Head pool otherwise.
             "_internal": internal,
             "_company": company,
+            # The raw bank statement Description behind this row's match --
+            # not an export column, just what the Farvision Verify page shows
+            # on demand next to Narration so the user can sanity-check a
+            # match without it ever reaching the exported sheet.
+            "_desc_text": r["desc_text"],
             "Link Ref Code": i,
             "Business Unit": _format_business_unit(r["business_unit"]),
             "Financial Year": _format_financial_year(r["financial_year"]),
