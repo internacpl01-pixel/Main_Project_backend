@@ -438,7 +438,14 @@ async def insert_temp_rows(conn, batch_id: int, normalized: list) -> int:
     if export_uid_needs_fill:
         columns = columns + [export_uid_col]
     export_status_col = await _column_by_display_name(conn, live, _EXPORT_STATUS_FIELD_NAME)
-    export_status_needs_fill = bool(export_status_col) and export_status_col not in columns
+    # A row whose own "Export Status" cell already reads "Yes" (the
+    # re-imported-export case above) must keep that value -- but a BLANK
+    # cell in that same column, on that same file, still gets the ordinary
+    # "No" default rather than staying empty. So this column needs the
+    # per-row blank-to-"No" fallback below whether or not it was already in
+    # `extra` -- the two only differ in whether a NEW column has to be added.
+    export_status_in_extra = bool(export_status_col) and export_status_col in columns
+    export_status_needs_fill = bool(export_status_col) and not export_status_in_extra
     if export_status_needs_fill:
         columns = columns + [export_status_col]
 
@@ -469,8 +476,17 @@ async def insert_temp_rows(conn, batch_id: int, normalized: list) -> int:
         record = [source[c] for c in derived]
         # The parser keys its output by fieldname and a field's fieldname IS its
         # column name, so the lookup is direct. Coerced to the column's declared
-        # type, exactly as DPL did from live_cols.
-        record.extend(_coerce(raw.get(name), live[name]) for name in extra)
+        # type, exactly as DPL did from live_cols. Export Status gets one
+        # extra step here: a blank cell in a re-imported export's own status
+        # column falls back to "No", same as a fresh statement that never had
+        # the column at all -- only a real "Yes" (or any other non-blank
+        # value already there) is left untouched.
+        def _extra_value(name):
+            value = _coerce(raw.get(name), live[name])
+            if name == export_status_col and export_status_in_extra:
+                return value or _EXPORT_STATUS_DEFAULT
+            return value
+        record.extend(_extra_value(name) for name in extra)
         if export_uid_needs_fill:
             uid = _generate_export_uid()
             while uid in seen_uids:            # astronomically rare; guards

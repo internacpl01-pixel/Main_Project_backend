@@ -1024,6 +1024,21 @@ _FARVISION_BALANCE_ROW_RE = r"^(b/f|b/fwd|c/f|c/fwd|opening balance|closing bala
 _FARVISION_HEAD_EXPR = "upper(trim(coalesce(h.name, rh.name, ih.name, t.field_text_5, '')))"
 
 
+async def _exclude_exported(conn, where: str, params: list) -> tuple[str, list]:
+    """Drops a row whose Export Status is already "Yes" out of the Farvision
+    Verify listing (and, via the same WHERE, its export) -- confirmed with
+    the user: once a row is marked exported it disappears from the review
+    page entirely, not just from a re-export. The Reset Export Status
+    endpoint deliberately does NOT call this -- it is the one place that
+    still has to find an already-exported row, to turn its status back off.
+    """
+    col = await staging.export_status_column(conn)
+    if not col:
+        return where, params
+    return (f"({where}) AND coalesce(t.{col}, '') <> ${len(params) + 1}",
+           params + [farvision.EXPORT_STATUS_ON])
+
+
 def _farvision_where(
     where: str, *, debit_credit: str | None = None, document_type: str | None = None,
 ) -> str:
@@ -1362,15 +1377,7 @@ async def _build_farvision_export(
             company=company, search=search, rule_conflicts=rule_conflicts,
         )
         where = _farvision_where(where, debit_credit=debit_credit)
-        # A row already exported (Export Status = "Yes") is excluded here so
-        # clicking Export Farvision again for the same filters does not hand
-        # out the same rows a second time -- confirmed with the user: the
-        # Reset Export Status button on the Verify page is the only way to
-        # make an already-exported row exportable again.
-        export_status_col = await staging.export_status_column(conn)
-        if export_status_col:
-            where = f"({where}) AND coalesce(t.{export_status_col}, '') <> ${len(params) + 1}"
-            params = params + [farvision.EXPORT_STATUS_ON]
+        where, params = await _exclude_exported(conn, where, params)
         on_row = None
         if job_id is not None:
             total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
@@ -1535,6 +1542,7 @@ async def farvision_verify_rows(
                 company=company, search=search, rule_conflicts=rule_conflicts,
             )
             where = _farvision_where(where, debit_credit=debit_credit, document_type=document_type)
+            where, params = await _exclude_exported(conn, where, params)
             total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
             link_ref_map = await farvision.link_ref_codes(conn, where, params)
             rows = await farvision.fetch_rows(
@@ -1558,6 +1566,7 @@ async def farvision_verify_rows(
                     company=company, search=search, rule_conflicts=rule_conflicts,
                 )
                 where = _farvision_where(where, debit_credit=debit_credit, document_type=document_type)
+                where, params = await _exclude_exported(conn, where, params)
                 total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
                 link_ref_map = await farvision.link_ref_codes(conn, where, params)
                 # jobs.create defaults step_units to 1 -- start_step is what
