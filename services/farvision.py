@@ -1351,8 +1351,12 @@ async def fetch_rows(
             "Debit/Credit": _debit_or_credit(r["debit_amount"], r["credit_amount"]),
             "Account Head": account_head,
             "Parent Account Head": parent_account_head,
-            "Debit Amount": r["debit_amount"],
-            "Credit Amount": r["credit_amount"],
+            # 0 is treated the same as NULL here, same as _debit_or_credit --
+            # a placeholder zero alongside the row's real amount on the other
+            # side should export blank, not a literal 0, confirmed with the
+            # user.
+            "Debit Amount": r["debit_amount"] or None,
+            "Credit Amount": r["credit_amount"] or None,
             "Payment Mode": "Direct",
             "Cheque No": None,
             "Cheque Date": None,

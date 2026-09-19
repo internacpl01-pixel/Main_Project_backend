@@ -1018,6 +1018,20 @@ _TEMP_JOINS = """
 """
 
 
+def _farvision_where(where: str) -> str:
+    """Narrow a _temp_filters WHERE for the three Farvision-only call sites
+    below (the Verify listing and the export, both counting and fetching).
+
+    Zero and NULL are the same "no real amount" here -- a temp_trans row
+    with both Debit and Credit blank (0 or NULL) has no real transaction
+    value and should not appear in Farvision Verify or its export at all,
+    confirmed with the user. Deliberately not folded into _temp_filters
+    itself: the general Imported Rows page and every other consumer of it
+    still see these rows.
+    """
+    return f"({where}) AND (coalesce(t.field_num_1, 0) <> 0 OR coalesce(t.field_num_2, 0) <> 0)"
+
+
 async def _temp_filters(
     conn, user: dict, *, batch_id=None, classified=None, date_from=None,
     date_to=None, account=None, company=None, search: str = "",
@@ -1301,6 +1315,7 @@ async def _build_farvision_export(
             date_from=date_from, date_to=date_to, account=account,
             company=company, search=search, rule_conflicts=rule_conflicts,
         )
+        where = _farvision_where(where)
         on_row = None
         if job_id is not None:
             total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
@@ -1456,6 +1471,7 @@ async def farvision_verify_rows(
                 date_from=date_from, date_to=date_to, account=account,
                 company=company, search=search, rule_conflicts=rule_conflicts,
             )
+            where = _farvision_where(where)
             total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
             rows = await farvision.fetch_rows(
                 conn, where, params, schema=user["schema"],
@@ -1476,6 +1492,7 @@ async def farvision_verify_rows(
                     date_from=date_from, date_to=date_to, account=account,
                     company=company, search=search, rule_conflicts=rule_conflicts,
                 )
+                where = _farvision_where(where)
                 total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
                 # jobs.create defaults step_units to 1 -- start_step is what
                 # actually sets it to this page's own row count, which is
