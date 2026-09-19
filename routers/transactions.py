@@ -1024,17 +1024,44 @@ _FARVISION_BALANCE_ROW_RE = r"^(b/f|b/fwd|c/f|c/fwd|opening balance|closing bala
 _FARVISION_HEAD_EXPR = "upper(trim(coalesce(h.name, rh.name, ih.name, t.field_text_5, '')))"
 
 
-async def _exclude_exported(conn, where: str, params: list) -> tuple[str, list]:
+def _parse_ids(value: str | None) -> list[int] | None:
+    """"3,7,19" -> [3, 7, 19], or None for blank/absent -- same shape as the
+    comma-separated `account` filter elsewhere in this file.
+    """
+    if not value:
+        return None
+    ids = [int(v) for v in value.split(",") if v.strip().isdigit()]
+    return ids or None
+
+
+async def _exclude_exported(
+    conn, where: str, params: list, include_ids: list[int] | None = None,
+) -> tuple[str, list]:
     """Drops a row whose Export Status is already "Yes" out of the Farvision
     Verify listing (and, via the same WHERE, its export) -- confirmed with
     the user: once a row is marked exported it disappears from the review
     page entirely, not just from a re-export. The Reset Export Status
     endpoint deliberately does NOT call this -- it is the one place that
     still has to find an already-exported row, to turn its status back off.
+
+    include_ids is the one deliberate hole in that rule: clicking Export
+    Farvision on the Imported Rows page marks its whole filtered set of "No"
+    rows as "Yes" immediately (see prepare_farvision_export below), before
+    they have actually been reviewed or downloaded -- so those specific ids
+    still have to show up on THIS visit to the Verify page and still have to
+    be in THIS download, even though they now read "Yes" like any other
+    already-exported row. A later, ordinary visit to the Verify page (no
+    include_ids) hides them again, exactly like any other exported row.
     """
     col = await staging.export_status_column(conn)
     if not col:
         return where, params
+    if include_ids:
+        return (
+            f"({where}) AND (coalesce(t.{col}, '') <> ${len(params) + 1} "
+            f"OR t.id = ANY(${len(params) + 2}::bigint[]))",
+            params + [farvision.EXPORT_STATUS_ON, include_ids],
+        )
     return (f"({where}) AND coalesce(t.{col}, '') <> ${len(params) + 1}",
            params + [farvision.EXPORT_STATUS_ON])
 
@@ -1354,7 +1381,7 @@ _EXPORT_KINDS = {
 async def _build_farvision_export(
     *, schema: str, user: dict, kind: str, batch_id, classified, date_from,
     date_to, account, company, search, rule_conflicts, debit_credit=None,
-    job_id: str | None = None,
+    include_ids: list[int] | None = None, job_id: str | None = None,
 ) -> tuple[bytes, str]:
     """The actual work behind export-farvision: fetch, match, and render.
 
@@ -1377,7 +1404,7 @@ async def _build_farvision_export(
             company=company, search=search, rule_conflicts=rule_conflicts,
         )
         where = _farvision_where(where, debit_credit=debit_credit)
-        where, params = await _exclude_exported(conn, where, params)
+        where, params = await _exclude_exported(conn, where, params, include_ids=include_ids)
         on_row = None
         if job_id is not None:
             total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
@@ -1410,6 +1437,12 @@ async def export_farvision(
     search: str = Query(""),
     rule_conflicts: str = Query(None),
     debit_credit: str = Query(None, description='"Debit" or "Credit"'),
+    include_ids: str = Query(
+        None,
+        description="Comma-separated temp_trans ids to include even though "
+                    "their Export Status already reads 'Yes' -- carried over "
+                    "from prepare-farvision-export, see _exclude_exported.",
+    ),
     background: bool = Query(
         False,
         description="true returns a job id immediately; poll GET /imports/jobs/{id} "
@@ -1443,12 +1476,15 @@ async def export_farvision(
     if kind not in _EXPORT_KINDS:
         raise HTTPException(400, f"kind must be one of {sorted(_EXPORT_KINDS)}.")
 
+    ids = _parse_ids(include_ids)
+
     if not background:
         content, filename = await _build_farvision_export(
             schema=user["schema"], user=user, kind=kind, batch_id=batch_id,
             classified=classified, date_from=date_from, date_to=date_to,
             account=account, company=company, search=search,
             rule_conflicts=rule_conflicts, debit_credit=debit_credit,
+            include_ids=ids,
         )
         return StreamingResponse(
             iter([content]),
@@ -1467,7 +1503,8 @@ async def export_farvision(
                 schema=user["schema"], user=user, kind=kind, batch_id=batch_id,
                 classified=classified, date_from=date_from, date_to=date_to,
                 account=account, company=company, search=search,
-                rule_conflicts=rule_conflicts, debit_credit=debit_credit, job_id=job_id,
+                rule_conflicts=rule_conflicts, debit_credit=debit_credit,
+                include_ids=ids, job_id=job_id,
             )
             jobs.finish(job_id, {
                 "filename": filename,
@@ -1496,6 +1533,12 @@ async def farvision_verify_rows(
     rule_conflicts: str = Query(None),
     debit_credit: str = Query(None, description='"Debit" or "Credit"'),
     document_type: str = Query(None, description='"Payment/Reciept" or "Deposit/withdrawal"'),
+    include_ids: str = Query(
+        None,
+        description="Comma-separated temp_trans ids to show even though "
+                    "their Export Status already reads 'Yes' -- carried over "
+                    "from prepare-farvision-export, see _exclude_exported.",
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(_FARVISION_VERIFY_PAGE_SIZE, ge=1, le=500),
     background: bool = Query(
@@ -1534,6 +1577,8 @@ async def farvision_verify_rows(
     invented to fill the wait -- this app's standing rule for a progress
     number (see ImportProgressOverlay.jsx).
     """
+    ids = _parse_ids(include_ids)
+
     if not background:
         async with company_connection(user["schema"]) as conn:
             where, params, _columns, _term, _idx = await _temp_filters(
@@ -1542,7 +1587,7 @@ async def farvision_verify_rows(
                 company=company, search=search, rule_conflicts=rule_conflicts,
             )
             where = _farvision_where(where, debit_credit=debit_credit, document_type=document_type)
-            where, params = await _exclude_exported(conn, where, params)
+            where, params = await _exclude_exported(conn, where, params, include_ids=ids)
             total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
             link_ref_map = await farvision.link_ref_codes(conn, where, params)
             rows = await farvision.fetch_rows(
@@ -1566,7 +1611,7 @@ async def farvision_verify_rows(
                     company=company, search=search, rule_conflicts=rule_conflicts,
                 )
                 where = _farvision_where(where, debit_credit=debit_credit, document_type=document_type)
-                where, params = await _exclude_exported(conn, where, params)
+                where, params = await _exclude_exported(conn, where, params, include_ids=ids)
                 total = await conn.fetchval(f"SELECT count(*) {_TEMP_JOINS} WHERE {where}", *params)
                 link_ref_map = await farvision.link_ref_codes(conn, where, params)
                 # jobs.create defaults step_units to 1 -- start_step is what
@@ -1767,8 +1812,8 @@ async def farvision_verify_resolve_tds_rate(
     }
 
 
-@router.post("/temp-trans/farvision-verify/reset-export-status")
-async def farvision_verify_reset_export_status(
+@router.post("/temp-trans/prepare-farvision-export")
+async def prepare_farvision_export(
     batch_id: int = None,
     classified: bool = None,
     date_from: str = Query(None),
@@ -1777,16 +1822,24 @@ async def farvision_verify_reset_export_status(
     company: str = Query(None),
     search: str = Query(""),
     rule_conflicts: str = Query(None),
-    debit_credit: str = Query(None),
-    document_type: str = Query(None),
     user: dict = Depends(get_company_user),
 ):
-    """Turn Export Status back off for every row the Verify page's current
-    filters cover, so a batch already exported can be exported again on
-    purpose -- confirmed with the user. Takes the exact same filters the
-    listing itself takes, same reason as everywhere else in this file: reset
-    is a decision about what's on screen right now, not a blanket wipe of
-    every row this company has ever exported.
+    """Marks every currently-"No" row the Imported Rows table's filters
+    cover as "Yes" right away -- confirmed with the user: clicking Export
+    Farvision on that page IS the export decision, not a preview of one.
+
+    Takes the Imported Rows table's own plain filter set (no debit/credit or
+    document-type -- that page doesn't have them) and the same
+    zero-amount/balance-carry-forward exclusion export-farvision itself
+    applies (_farvision_where), so only rows that could actually end up in a
+    download get marked.
+
+    Returns their ids so the caller can hand them straight to the Farvision
+    Verify page as include_ids: that page (and the real export it leads to)
+    otherwise hides any row already reading "Yes" -- these rows need to
+    still be reviewable and downloadable on THIS visit despite having just
+    been marked. A later, ordinary visit to Verify without include_ids hides
+    them like any other already-exported row.
     """
     async with company_connection(user["schema"]) as conn:
         where, params, _columns, _term, _idx = await _temp_filters(
@@ -1794,7 +1847,40 @@ async def farvision_verify_reset_export_status(
             date_from=date_from, date_to=date_to, account=account,
             company=company, search=search, rule_conflicts=rule_conflicts,
         )
-        where = _farvision_where(where, debit_credit=debit_credit, document_type=document_type)
+        where = _farvision_where(where)
+        where, params = await _exclude_exported(conn, where, params)
+        rows = await conn.fetch(f"SELECT t.id {_TEMP_JOINS} WHERE {where}", *params)
+        ids = [r["id"] for r in rows]
+        await farvision.mark_exported(conn, ids)
+    return {"ids": ids}
+
+
+@router.post("/temp-trans/reset-export-status")
+async def reset_export_status(
+    batch_id: int = None,
+    classified: bool = None,
+    date_from: str = Query(None),
+    date_to: str = Query(None),
+    account: str = Query(None),
+    company: str = Query(None),
+    search: str = Query(""),
+    rule_conflicts: str = Query(None),
+    user: dict = Depends(get_company_user),
+):
+    """Turn Export Status back off ("Yes" -> "No") for every row the Imported
+    Rows table's current filters cover -- confirmed with the user: this lives
+    on Imported Rows, not the Farvision Verify page, and takes that page's
+    own plain filter set (no debit/credit or document-type narrowing, and no
+    Farvision-only exclusion of zero-amount/balance-carry-forward rows --
+    "reset every Yes row in view" means exactly that, not "every Yes row
+    that would also qualify for export").
+    """
+    async with company_connection(user["schema"]) as conn:
+        where, params, _columns, _term, _idx = await _temp_filters(
+            conn, user, batch_id=batch_id, classified=classified,
+            date_from=date_from, date_to=date_to, account=account,
+            company=company, search=search, rule_conflicts=rule_conflicts,
+        )
         changed = await farvision.reset_export_status(conn, where, params)
     return {"reset": changed}
 
