@@ -19,6 +19,7 @@ same tables but parsed synchronously in the event loop, dropped failed rows
 silently, and recorded a blank uploaded_by.
 """
 import asyncio
+import base64
 import datetime
 import json
 import logging
@@ -305,6 +306,87 @@ def _extract_folder_id(value: str) -> str | None:
     if "/" not in value and _BARE_FOLDER_ID_RE.match(value):
         return value
     return None
+
+
+# A Drive FILE link, in the shapes the browser actually produces:
+#   .../file/d/<ID>/view?usp=sharing
+#   .../open?id=<ID>
+#   a Google Sheet's own URL: .../spreadsheets/d/<ID>/edit
+# A bare id pasted on its own is accepted too, same as the folder box.
+_DRIVE_FILE_URL_RE = re.compile(r"/(?:file|spreadsheets)/d/([A-Za-z0-9_-]+)")
+
+
+def _extract_file_id(value: str) -> str | None:
+    value = (value or "").strip()
+    if not value:
+        return None
+    for pattern in (_DRIVE_FILE_URL_RE, _DRIVE_ID_PARAM_RE):
+        m = pattern.search(value)
+        if m:
+            return m.group(1)
+    if "/" not in value and _BARE_FOLDER_ID_RE.match(value):
+        return value
+    return None
+
+
+def _file_id_or_400(url: str) -> str:
+    file_id = _extract_file_id(url)
+    if not file_id:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "That doesn't look like a Drive file link. Open the file in "
+            "Drive and copy the address bar, e.g. "
+            "https://drive.google.com/file/d/1AbC.../view")
+    return file_id
+
+
+_GOOGLE_SHEET_MIME = "application/vnd.google-apps.spreadsheet"
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+@router.post("/drive-link/fetch")
+async def fetch_drive_link_file(
+    url: str = Form(..., description="A Drive file (or Google Sheet) URL, or a bare file id"),
+    user: dict = Depends(get_company_user),
+):
+    """Pulls a single pasted Drive file down to the browser as base64 bytes,
+    so it can be handed to the exact same import flow a computer-picked
+    file already goes through -- no separate import code path.
+
+    A native Google Sheet has no underlying .xlsx bytes to download, so it
+    is exported to one instead; an ordinary uploaded .xlsx/.xls/.csv/.pdf
+    downloads as-is.
+    """
+    file_id = _file_id_or_400(url)
+    try:
+        meta = await asyncio.to_thread(drive.get_file_meta, file_id)
+    except Exception:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Couldn't open that file. Check the link, and make sure it's "
+            "shared with the Google account this app signs in as.")
+
+    if meta.get("mimeType") == "application/vnd.google-apps.folder":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "That link points at a folder, not a file. Paste a link to the "
+            "statement itself.")
+
+    if meta.get("mimeType") == _GOOGLE_SHEET_MIME:
+        file_bytes = await asyncio.to_thread(drive.export_file, file_id, _XLSX_MIME)
+        filename = f"{meta.get('name') or file_id}.xlsx"
+    else:
+        file_bytes = await asyncio.to_thread(drive.download_file, file_id)
+        filename = meta.get("name") or file_id
+
+    if len(file_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                            "File too large (max 25 MB)")
+
+    return {
+        "filename": filename,
+        "content_b64": base64.b64encode(file_bytes).decode("ascii"),
+    }
 
 
 def _folder_id_or_400(url: str) -> str:

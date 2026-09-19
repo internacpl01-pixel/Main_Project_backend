@@ -178,9 +178,38 @@ def get_folder_name(folder_id: str) -> str:
     return meta.get("name") or folder_id
 
 
+def get_file_meta(file_id: str) -> dict:
+    """{id, name, mimeType} for any file this account can open -- unlike
+    get_folder_name, does not reject anything by type. Used to name and
+    route a single pasted file link (an ordinary .xlsx/.csv/.pdf downloads
+    as-is; a native Google Sheet has no bytes of its own and must be
+    exported instead, see export_file).
+    """
+    service = _get_service()
+    return service.files().get(
+        fileId=file_id, fields="id, name, mimeType",
+        supportsAllDrives=True,
+    ).execute()
+
+
 def download_file(file_id: str) -> bytes:
     service = _get_service()
     request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buf.getvalue()
+
+
+def export_file(file_id: str, mime_type: str) -> bytes:
+    """Renders a native Google file (a Sheet, not an uploaded .xlsx) to
+    `mime_type` -- get_media only works on files with real bytes already on
+    disk in Drive, which a Google Sheet never has.
+    """
+    service = _get_service()
+    request = service.files().export_media(fileId=file_id, mimeType=mime_type)
     buf = io.BytesIO()
     downloader = MediaIoBaseDownload(buf, request)
     done = False
