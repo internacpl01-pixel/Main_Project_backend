@@ -1351,10 +1351,15 @@ async def list_temp_trans(
 
         total = await conn.fetchval(f"SELECT count(*) {joins} WHERE {where}", *params)
 
-        # The order the file was read in, when nothing else is asked for — and
-        # the tiebreak under everything else, so paging is stable.
+        # Newest batch first when nothing else is asked for, so a statement
+        # imported just now shows up on page 1 instead of requiring a page
+        # into the past to find it -- the same "newest first" default the
+        # ledger listing already uses below. row_number still climbs within
+        # one batch, so a single statement still reads top-to-bottom in the
+        # order the file was parsed; only which batch comes first changed.
+        # The tiebreak under everything else, so paging is stable.
         order_by, sort_applied, dir_applied = _sort_clause(
-            sort, dir, columns, _TEMP_EXTRA_SORTS, "t.batch_id, t.row_number"
+            sort, dir, columns, _TEMP_EXTRA_SORTS, "t.batch_id DESC, t.row_number"
         )
 
         rows = await conn.fetch(
