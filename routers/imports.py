@@ -362,6 +362,55 @@ _GOOGLE_SHEET_MIME = "application/vnd.google-apps.spreadsheet"
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
+async def _open_drive_file(file_id: str) -> dict:
+    """Resolve a Drive file id to its metadata, or raise the 400 saying why
+    not. Shared by the verify and fetch endpoints below, so "can this app
+    open it at all" is answered identically by both -- verify passing and
+    fetch then failing (or the reverse) would mean the two had drifted.
+    """
+    try:
+        meta = await asyncio.to_thread(drive.get_file_meta, file_id)
+    except Exception:                                  # noqa: BLE001
+        # Logged, not swallowed -- same standing as _verify_folder below.
+        # Without this the real cause (an expired/invalid DRIVE_TOKEN_JSON,
+        # a malformed one, a revoked OAuth client) never reached the logs at
+        # all, and every failure here looked identical from the outside: a
+        # 400 access-log line with nothing behind it to diagnose.
+        logger.exception("Could not open Drive file %s", file_id)
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Couldn't open that file. Check the link, and make sure it's "
+            "shared with the Google account this app signs in as.")
+
+    if meta.get("mimeType") == "application/vnd.google-apps.folder":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "That link points at a folder, not a file. Paste a link to the "
+            "statement itself.")
+
+    return meta
+
+
+@router.post("/drive-link/verify")
+async def verify_drive_link_file(
+    url: str = Form(..., description="A Drive file (or Google Sheet) URL, or a bare file id"),
+    user: dict = Depends(get_company_user),
+):
+    """Check a pasted Drive file link WITHOUT downloading or importing it.
+
+    The same "well-formed link, wrong file" problem verify_drive_folder
+    solves for the Settings-page folder link, here for the one-off file link
+    on the Import page: resolves the id and opens it, so a person can see the
+    file's own name and confirm it is the statement they meant before
+    committing to the download-and-import the Fetch button actually runs.
+    Nothing is written and no bytes are downloaded, so this is safe to call
+    as often as the box is edited.
+    """
+    file_id = _file_id_or_400(url)
+    meta = await _open_drive_file(file_id)
+    return {"name": meta.get("name") or file_id, "mime_type": meta.get("mimeType")}
+
+
 @router.post("/drive-link/fetch")
 async def fetch_drive_link_file(
     url: str = Form(..., description="A Drive file (or Google Sheet) URL, or a bare file id"),
@@ -376,19 +425,7 @@ async def fetch_drive_link_file(
     downloads as-is.
     """
     file_id = _file_id_or_400(url)
-    try:
-        meta = await asyncio.to_thread(drive.get_file_meta, file_id)
-    except Exception:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "Couldn't open that file. Check the link, and make sure it's "
-            "shared with the Google account this app signs in as.")
-
-    if meta.get("mimeType") == "application/vnd.google-apps.folder":
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "That link points at a folder, not a file. Paste a link to the "
-            "statement itself.")
+    meta = await _open_drive_file(file_id)
 
     if meta.get("mimeType") == _GOOGLE_SHEET_MIME:
         file_bytes = await asyncio.to_thread(drive.export_file, file_id, _XLSX_MIME)
