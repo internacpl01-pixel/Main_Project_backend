@@ -3048,70 +3048,6 @@ async def finalize_row(
     return {"status": "finalized", "transaction_id": txn["id"]}
 
 
-# The three head columns a row carries, in the order Check Rules lets someone
-# judge them one at a time. Send to Ledger's own bar is stricter than that
-# dialog: every one of the three must come back "ok", not just free of an
-# active conflict — see _ledger_head_alignment.
-_LEDGER_TARGETS = ("head", "rera_head", "idw_head")
-
-
-async def _ledger_head_alignment(conn, user: dict, row_ids: list[int]) -> dict[int, bool]:
-    """True per row id when Head, RERA Head and TCP Head are ALL 'ok' under
-    Check Rules for that row's own account -- Send to Ledger's bar for
-    "properly aligned with rules". A conflict fails it, and so does a column
-    no rule covers yet at all (`no_direction`, or an account type/column pair
-    _rule_context can't resolve): both mean nothing has actually verified
-    this row, and this is the one place that verification gates a permanent,
-    hard-to-reverse write, so "not yet judged" is treated the same as "judged
-    wrong" rather than waved through.
-
-    Reuses _judged_rows/_rule_context exactly as the Check Rules dialog does,
-    once per distinct (account_type, account_number, target) combination
-    actually present among row_ids -- not once per row -- so this stays cheap
-    even over a large staging table.
-    """
-    if not row_ids:
-        return {}
-
-    account_col = await staging.account_column(conn)
-    if not account_col:
-        return {rid: False for rid in row_ids}
-
-    accounts = await conn.fetch(
-        f"""
-        SELECT DISTINCT b.account_type, b.account_number
-          FROM temp_trans t
-          JOIN bank_master b
-            ON b.is_active = true
-           AND {staging.account_digits(f't.{account_col}')} <> ''
-           AND {staging.account_digits(f't.{account_col}')}
-             = {staging.account_digits('b.account_number')}
-         WHERE t.id = ANY($1::bigint[])
-        """,
-        row_ids,
-    )
-
-    wanted = set(row_ids)
-    aligned_targets: dict[int, set[str]] = {rid: set() for rid in row_ids}
-    for acct in accounts:
-        for target in _LEDGER_TARGETS:
-            try:
-                ctx = await _rule_context(
-                    conn, acct["account_type"], acct["account_number"], target)
-            except HTTPException:
-                # No usable rule for this account/column at all -- every row
-                # under it stays unresolved for this target, which fails the
-                # strict "every head is ok" bar the same way an actual
-                # conflict would.
-                continue
-            for row in await _judged_rows(conn, user, ctx):
-                if row["status"] == "ok" and row["id"] in wanted:
-                    aligned_targets[row["id"]].add(target)
-
-    all_targets = set(_LEDGER_TARGETS)
-    return {rid: targets == all_targets for rid, targets in aligned_targets.items()}
-
-
 @router.post("/temp-trans/send-to-ledger")
 async def send_to_ledger(
     skip_unlocked: bool = Query(
@@ -3126,8 +3062,7 @@ async def send_to_ledger(
     the "No Pending / Classified tabs" note on StagingPage.jsx) and which
     left is_classified permanently false for every row imported since. This
     endpoint does not read or write is_classified as a gate at all; the
-    modern "classified" is "locked, and every head properly aligned with the
-    rules" -- both checked below.
+    modern "classified" is simply "locked" -- checked below.
 
     Deliberately NOT scoped by the staging page's own date/account/search
     filters the way Export Farvision or Lock All are -- confirmed with the
@@ -3135,22 +3070,17 @@ async def send_to_ledger(
     happens to be filtered to when the button is clicked. Still scoped by
     the user's own project visibility, the same as every other listing.
 
-    Two preconditions, checked across the WHOLE set before anything is
-    written:
-      - every candidate row must be locked. The default (skip_unlocked=false)
-        blocks the entire send on even one unlocked row, so the response can
-        say "lock everything first" rather than silently posting a subset
-        while something is still editable. With skip_unlocked=true (the
-        popup's second button, added after the user asked for an escape
-        hatch here specifically), an unlocked row is instead dropped from
-        the candidate set and left in staging untouched -- it is simply
-        never considered, not force-locked or force-sent.
-      - every remaining candidate row's Head, RERA Head and TCP Head must
-        each read 'ok' from Check Rules. Even one row with a conflict or an
-        unresolved column blocks the entire send -- there is no skip option
-        for this one, since a misaligned head is wrong data, not an
-        in-progress row someone just hasn't gotten to yet.
-    Both come back as 409 with a `reason` the frontend turns into a specific
+    The only precondition: every candidate row must be locked. Locking is
+    the user's own signal that a row's heads are finished and correct --
+    Check Rules is what they use to get there, run separately, before
+    locking -- so this endpoint trusts the lock and does not re-run that
+    check itself. The default (skip_unlocked=false) blocks the entire send
+    on even one unlocked row, so the response can say "lock everything
+    first" rather than silently posting a subset while something is still
+    editable. With skip_unlocked=true (the popup's second button), an
+    unlocked row is instead dropped from the candidate set and left in
+    staging untouched -- it is simply never considered, not force-locked or
+    force-sent. Comes back as 409 with reason 'unlocked' for the frontend's
     popup, rather than a generic error.
     """
     async with company_connection(user["schema"]) as conn:
@@ -3194,21 +3124,6 @@ async def send_to_ledger(
         if not row_ids:
             return {"finalized": 0, "skipped_unlocked": len(unlocked),
                     "message": "Nothing to send — every row is unlocked."}
-
-        alignment = await _ledger_head_alignment(conn, user, row_ids)
-        not_aligned = [rid for rid in row_ids if not alignment.get(rid)]
-        if not_aligned:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                detail={
-                    "reason": "not_aligned",
-                    "count": len(not_aligned),
-                    "message": f"{len(not_aligned)} row(s) don't have every "
-                               f"head aligned with the rules yet. Run Check "
-                               f"Rules and fix them before sending to the "
-                               f"ledger.",
-                },
-            )
 
         carried = [
             c["name"] for c in await custom_fields.data_columns(conn, hide_redundant=False)
