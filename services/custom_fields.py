@@ -314,6 +314,26 @@ _STAGING_INTERNALS = frozenset({
     "raw_data",      # the parser's untouched output
     "created_at",
     "updated_at",
+    # The Farvision Verify page's own override columns (migrations 044, 045,
+    # 050, 051) -- read and written exclusively through that page's own
+    # dedicated endpoints (routers/transactions.py's Farvision override
+    # routes) and services/farvision.py's row-building, never through the
+    # generic fieldmap/custom-field machinery. They exist on temp_trans only
+    # -- by design, since none of this ever reaches the ledger -- so leaving
+    # them out of _STAGING_INTERNALS meant data_columns() offered them as
+    # ordinary "statement data" like any real custom field. Two things that
+    # SELECT * off this list to build one query across both tables then broke
+    # the moment either function actually ran: send_to_ledger's bulk INSERT
+    # (asyncpg.exceptions.UndefinedColumnError: column
+    # "farvision_account_head_override" of relation "transactions" does not
+    # exist) and finalize_row before it, dormant only because nothing had
+    # ever called it (is_classified had been permanently false for years —
+    # see send_to_ledger's own docstring).
+    "farvision_account_head_override",
+    "farvision_parent_account_head_override",
+    "farvision_description_override",
+    "farvision_tds_rate_override",
+    "farvision_debit_amount_override",
 })
 
 
