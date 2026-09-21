@@ -194,6 +194,24 @@ async def get_import_job(job_id: str, user: dict = Depends(get_company_user)):
     return job
 
 
+@router.post("/jobs/{job_id}/cancel")
+async def cancel_import_job(job_id: str, user: dict = Depends(get_company_user)):
+    """Stop a running background import (the Stop button on the progress screen).
+
+    Best-effort and immediate from the user's side: the job stops reporting
+    progress and the overlay comes down right away. A batch's own page-by-page
+    read that is already under way on its executor thread runs to completion
+    in the background regardless -- Python cannot interrupt a thread mid-call
+    -- but its result is discarded (see services/jobs.py::cancel), and nothing
+    it finds gets written: both runners only stage rows on the same task this
+    cancels, before that write is reached on a cancelled run.
+    """
+    job = jobs.get(job_id)
+    if job is None or job.get("_schema") != user["schema"]:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Import job not found.")
+    return {"cancelled": jobs.cancel(job_id)}
+
+
 def _split_ext(filename: str) -> tuple[str, str]:
     if "." not in filename:
         return filename, ""
@@ -992,6 +1010,15 @@ async def import_from_drive(
                 "files": results, "imported": imported, "failed": failed,
                 "needs_password": needs_password,
             })
+        except asyncio.CancelledError:
+            # Stopped from the import screen (see services/jobs.py::cancel).
+            # Whatever file was mid-import when this fired keeps whatever rows
+            # it already staged (stage_batch commits before this runner's own
+            # await resumes) -- the same partial-file outcome a real crash at
+            # that instant would have left, and every file already recorded
+            # in `results` is the same as if the run had been asked for only
+            # that many files.
+            jobs.mark_cancelled(job_id)
         except Exception as exc:                      # noqa: BLE001
             logger.exception("Drive import job %s failed", job_id)
             jobs.fail(job_id, str(exc))

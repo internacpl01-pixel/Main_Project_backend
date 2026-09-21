@@ -693,6 +693,9 @@ async def start_tabular_job(**kwargs) -> dict:
         try:
             payload = await process_tabular_import(job_id=job_id, **kwargs)
             jobs.finish(job_id, payload)
+        except asyncio.CancelledError:
+            # Stopped from the import screen (see services/jobs.py::cancel).
+            jobs.mark_cancelled(job_id)
         except Exception as exc:                              # noqa: BLE001
             logger.warning("[%s] job %s failed: %s", kwargs.get("kind"), job_id, exc)
             jobs.fail(job_id, str(exc))

@@ -569,6 +569,12 @@ async def start_pdf_job(**kwargs) -> dict:
         try:
             payload = await process_pdf_import(job_id=job_id, **kwargs)
             jobs.finish(job_id, payload)
+        except asyncio.CancelledError:
+            # Stopped from the import screen (see services/jobs.py::cancel).
+            # Nothing is staged: process_pdf_import only writes at the very
+            # end, on the same task this cancels, so a cancel anywhere in the
+            # parse leaves temp_trans exactly as it was before the import.
+            jobs.mark_cancelled(job_id)
         except Exception as exc:                      # noqa: BLE001
             # Every failure mode of the synchronous path lands here instead of
             # in a response: a duplicate file, an unreadable range, a timeout.

@@ -34,6 +34,7 @@ PARSING = "parsing"
 SAVING = "saving"
 DONE = "done"
 FAILED = "failed"
+CANCELLED = "cancelled"
 
 # How long a finished job stays readable. The browser polls every second or so,
 # so this only has to outlive the gap between the last tick and the poll that
@@ -195,6 +196,37 @@ def fail(job_id: str, error: str) -> None:
         if job is None:
             return
         job.update(state=FAILED, error=error, message="Failed",
+                   finished_at=time.time(), task=None)
+
+
+def cancel(job_id: str) -> bool:
+    """Ask a running job to stop. Returns False if there is nothing to stop.
+
+    Cancels the asyncio task wrapping the parse. If a batch's page-by-page
+    read is already running on its executor thread when this fires, that
+    thread runs to completion in the background -- Python cannot interrupt a
+    thread mid-call -- but its result is discarded: the task's own await
+    raises CancelledError the moment the thread finally does return, so
+    nothing from it ever reaches jobs.tick/finish again. What the user sees
+    stops immediately either way, because the poller stops being told a job
+    is running the instant this call marks it so.
+    """
+    with _lock:
+        job = _jobs.get(job_id)
+        if job is None or job["state"] in (DONE, FAILED, CANCELLED):
+            return False
+        task = job["task"]
+    if task is not None:
+        task.cancel()
+    return True
+
+
+def mark_cancelled(job_id: str) -> None:
+    with _lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            return
+        job.update(state=CANCELLED, message="Stopped",
                    finished_at=time.time(), task=None)
 
 
