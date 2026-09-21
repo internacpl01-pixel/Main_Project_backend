@@ -2507,9 +2507,16 @@ async def clear_temp_trans(schema: str = Depends(get_current_schema)):
     """
     async with company_connection(schema) as conn:
         # Same standing as always: a Clear All that silently took locked rows
-        # with it would make the lock a decoration.
+        # with it would make the lock a decoration. Scoped to UNPOSTED rows
+        # only -- a posted row is always locked (Send to Ledger requires it)
+        # and is never touched by this endpoint either way, so counting it
+        # here would refuse every clear forever the moment anything has ever
+        # been posted, which defeats the whole point of skipping posted rows
+        # instead of refusing on them.
         locked = await conn.fetchval(
-            "SELECT count(*) FROM temp_trans WHERE is_locked"
+            "SELECT count(*) FROM temp_trans t "
+            "LEFT JOIN transactions tr ON tr.temp_trans_id = t.id "
+            "WHERE tr.id IS NULL AND t.is_locked"
         )
         if locked:
             raise HTTPException(
