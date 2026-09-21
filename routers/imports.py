@@ -792,6 +792,55 @@ async def skip_drive_file(
     return {"status": "skipped", "name": new_name}
 
 
+@router.post("/drive-files/skip-batch")
+async def skip_drive_files(
+    file_ids: str = Form(..., description="Comma-separated Drive file ids"),
+    user: dict = Depends(get_company_user),
+):
+    """Same as POST /drive-files/{file_id}/skip, for many files in one call.
+
+    The single-file endpoint above lists the whole Drive folder on every
+    call, purely to confirm the id it was given actually belongs to it. Fine
+    for one file -- wrong for the "Skip N" button on the unmatched-files
+    list (ImportPage.jsx's handleSkipUnmatched), which used to call that
+    endpoint once per file with Promise.all: N files meant N *concurrent*
+    full folder listings plus N renames, all competing for the same small
+    executor thread pool and Drive API quota at once. On a small Render
+    instance that was enough concurrent memory and connection pressure to
+    crash the process outright -- seen in production as "Cannot reach the
+    server" right after clicking Skip on ~70 files. This endpoint lists the
+    folder exactly once and renames every requested file against that one
+    snapshot, sequentially, instead.
+    """
+    folder_id = await _import_folder_or_400(user["schema"])
+    ids = {i.strip() for i in file_ids.split(",") if i.strip()}
+    drive_files = await asyncio.to_thread(drive.list_folder_files, folder_id)
+    by_id = {f["id"]: f for f in drive_files}
+
+    results = []
+    for file_id in ids:
+        match = by_id.get(file_id)
+        if match is None:
+            results.append({"id": file_id, "status": "not_found"})
+            continue
+        stem, ext = _split_ext(match["name"])
+        if stem.lower().endswith("_bank_absent"):
+            results.append({"id": file_id, "status": "skipped", "name": match["name"]})
+            continue
+        # Strip a stale "_failed" first, same as the single-file endpoint --
+        # a file that failed once and is now being set aside must not end up
+        # as "..._failed_bank_absent.ext".
+        stem, _ = _retryable_stem(stem)
+        new_name = f"{stem}_bank_absent{ext}"
+        await asyncio.to_thread(drive.rename_file, file_id, new_name)
+        await log_drive_result(
+            user["schema"], file_name=match["name"], status="skipped",
+            imported_by=user["username"],
+            error="Set aside — no matching account in Master Data.")
+        results.append({"id": file_id, "status": "skipped", "name": new_name})
+    return {"files": results}
+
+
 @router.post("/from-drive")
 async def import_from_drive(
     pages: str = Form("", description='PDF pages to read: "30", "31-65", or blank for all'),
