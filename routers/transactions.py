@@ -1384,12 +1384,26 @@ async def list_temp_trans(
         # remove and grey itself out when there is nothing to remove. Taken
         # here rather than counted in the browser, which only ever holds the
         # rows matching the current tab.
+        #
+        # unposted is the number this page actually treats as "here": every
+        # listing query on this page already excludes a posted row (see the
+        # NOT EXISTS added to this endpoint's own WHERE), and Clear All only
+        # ever removes unposted rows too -- so staged_total (the whole table,
+        # posted rows included) is the wrong number for anything the frontend
+        # shows a person as "what's on this page" or "what Clear All will
+        # remove". Kept alongside it rather than replaced, since staged_total
+        # is still the honest whole-table count if anything else ever needs it.
         summary = dict(await conn.fetchrow(
             """
             SELECT (SELECT count(*) FROM temp_trans)      AS staged_total,
                    (SELECT count(*) FROM import_batches)  AS batches,
                    (SELECT count(*) FROM transactions
-                     WHERE temp_trans_id IS NOT NULL)     AS posted
+                     WHERE temp_trans_id IS NOT NULL)     AS posted,
+                   (SELECT count(*) FROM temp_trans t
+                     WHERE NOT EXISTS (
+                       SELECT 1 FROM transactions tr
+                        WHERE tr.temp_trans_id = t.id
+                     ))                                    AS unposted
             """
         ))
 
