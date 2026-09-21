@@ -1294,6 +1294,16 @@ async def list_temp_trans(
             date_from=date_from, date_to=date_to, account=account,
             company=company, search=search, rule_conflicts=rule_conflicts,
         )
+        # A posted row moves to the Ledger page, not literally out of
+        # temp_trans: transactions.temp_trans_id is ON DELETE RESTRICT
+        # precisely so the link back to the original import can never be
+        # dropped -- Clear All and the per-row delete both depend on that
+        # link surviving to detect "already posted" and refuse (see
+        # clear_temp_trans and delete_temp_row). Hiding it here rather than
+        # deleting it is what makes Send to Ledger read as a move from the
+        # user's side without breaking that guarantee.
+        where = (f"({where}) AND NOT EXISTS ("
+                f"SELECT 1 FROM transactions tr WHERE tr.temp_trans_id = t.id)")
         # The data columns are read from the live table, not written out here.
         # A custom field is a real column on temp_trans, and a fixed SELECT is
         # why one could be created, matched during parsing and stored, and still
@@ -3036,4 +3046,203 @@ async def finalize_row(
     # choice, so there is no fixed set of them to report here. The caller
     # reloads the ledger, which describes its own columns.
     return {"status": "finalized", "transaction_id": txn["id"]}
+
+
+# The three head columns a row carries, in the order Check Rules lets someone
+# judge them one at a time. Send to Ledger's own bar is stricter than that
+# dialog: every one of the three must come back "ok", not just free of an
+# active conflict — see _ledger_head_alignment.
+_LEDGER_TARGETS = ("head", "rera_head", "idw_head")
+
+
+async def _ledger_head_alignment(conn, user: dict, row_ids: list[int]) -> dict[int, bool]:
+    """True per row id when Head, RERA Head and TCP Head are ALL 'ok' under
+    Check Rules for that row's own account -- Send to Ledger's bar for
+    "properly aligned with rules". A conflict fails it, and so does a column
+    no rule covers yet at all (`no_direction`, or an account type/column pair
+    _rule_context can't resolve): both mean nothing has actually verified
+    this row, and this is the one place that verification gates a permanent,
+    hard-to-reverse write, so "not yet judged" is treated the same as "judged
+    wrong" rather than waved through.
+
+    Reuses _judged_rows/_rule_context exactly as the Check Rules dialog does,
+    once per distinct (account_type, account_number, target) combination
+    actually present among row_ids -- not once per row -- so this stays cheap
+    even over a large staging table.
+    """
+    if not row_ids:
+        return {}
+
+    account_col = await staging.account_column(conn)
+    if not account_col:
+        return {rid: False for rid in row_ids}
+
+    accounts = await conn.fetch(
+        f"""
+        SELECT DISTINCT b.account_type, b.account_number
+          FROM temp_trans t
+          JOIN bank_master b
+            ON b.is_active = true
+           AND {staging.account_digits(f't.{account_col}')} <> ''
+           AND {staging.account_digits(f't.{account_col}')}
+             = {staging.account_digits('b.account_number')}
+         WHERE t.id = ANY($1::bigint[])
+        """,
+        row_ids,
+    )
+
+    wanted = set(row_ids)
+    aligned_targets: dict[int, set[str]] = {rid: set() for rid in row_ids}
+    for acct in accounts:
+        for target in _LEDGER_TARGETS:
+            try:
+                ctx = await _rule_context(
+                    conn, acct["account_type"], acct["account_number"], target)
+            except HTTPException:
+                # No usable rule for this account/column at all -- every row
+                # under it stays unresolved for this target, which fails the
+                # strict "every head is ok" bar the same way an actual
+                # conflict would.
+                continue
+            for row in await _judged_rows(conn, user, ctx):
+                if row["status"] == "ok" and row["id"] in wanted:
+                    aligned_targets[row["id"]].add(target)
+
+    all_targets = set(_LEDGER_TARGETS)
+    return {rid: targets == all_targets for rid, targets in aligned_targets.items()}
+
+
+@router.post("/temp-trans/send-to-ledger")
+async def send_to_ledger(
+    skip_unlocked: bool = Query(
+        False, description="If true, an unlocked row is left in staging "
+                           "instead of blocking the whole send -- the "
+                           "popup's own 'skip them, send the rest' choice."),
+    user: dict = Depends(get_company_user),
+):
+    """Finalize every not-yet-posted staged row this user can see into the
+    transactions ledger -- the button on Imported Rows that replaces the old
+    per-row Classify-then-Finalize flow, which the UI stopped exposing (see
+    the "No Pending / Classified tabs" note on StagingPage.jsx) and which
+    left is_classified permanently false for every row imported since. This
+    endpoint does not read or write is_classified as a gate at all; the
+    modern "classified" is "locked, and every head properly aligned with the
+    rules" -- both checked below.
+
+    Deliberately NOT scoped by the staging page's own date/account/search
+    filters the way Export Farvision or Lock All are -- confirmed with the
+    user this is a whole-company action, independent of whatever the table
+    happens to be filtered to when the button is clicked. Still scoped by
+    the user's own project visibility, the same as every other listing.
+
+    Two preconditions, checked across the WHOLE set before anything is
+    written:
+      - every candidate row must be locked. The default (skip_unlocked=false)
+        blocks the entire send on even one unlocked row, so the response can
+        say "lock everything first" rather than silently posting a subset
+        while something is still editable. With skip_unlocked=true (the
+        popup's second button, added after the user asked for an escape
+        hatch here specifically), an unlocked row is instead dropped from
+        the candidate set and left in staging untouched -- it is simply
+        never considered, not force-locked or force-sent.
+      - every remaining candidate row's Head, RERA Head and TCP Head must
+        each read 'ok' from Check Rules. Even one row with a conflict or an
+        unresolved column blocks the entire send -- there is no skip option
+        for this one, since a misaligned head is wrong data, not an
+        in-progress row someone just hasn't gotten to yet.
+    Both come back as 409 with a `reason` the frontend turns into a specific
+    popup, rather than a generic error.
+    """
+    async with company_connection(user["schema"]) as conn:
+        scope = await scoping.visible_project_ids(conn, user)
+        clause, params, _ = scoping.project_filter(scope, "t.project_id", 1)
+        if clause:
+            where = clause
+        elif scoping.scope_is_empty(scope):
+            where, params = "t.project_id IS NULL", []
+        else:
+            where, params = "1=1", []
+
+        # Not yet posted: no row already in transactions for this staged row.
+        pending = await conn.fetch(
+            f"""
+            SELECT t.id, t.is_locked
+              FROM temp_trans t
+              LEFT JOIN transactions tr ON tr.temp_trans_id = t.id
+             WHERE {where} AND tr.id IS NULL
+            """,
+            *params,
+        )
+        if not pending:
+            return {"finalized": 0,
+                    "message": "Nothing to send — every row is already in the ledger."}
+
+        unlocked = [r["id"] for r in pending if not r["is_locked"]]
+        if unlocked and not skip_unlocked:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "unlocked",
+                    "count": len(unlocked),
+                    "message": f"{len(unlocked)} row(s) are not locked yet. "
+                               f"Lock every row before sending to the ledger.",
+                },
+            )
+
+        row_ids = ([r["id"] for r in pending if r["is_locked"]]
+                  if skip_unlocked else [r["id"] for r in pending])
+        if not row_ids:
+            return {"finalized": 0, "skipped_unlocked": len(unlocked),
+                    "message": "Nothing to send — every row is unlocked."}
+
+        alignment = await _ledger_head_alignment(conn, user, row_ids)
+        not_aligned = [rid for rid in row_ids if not alignment.get(rid)]
+        if not_aligned:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "not_aligned",
+                    "count": len(not_aligned),
+                    "message": f"{len(not_aligned)} row(s) don't have every "
+                               f"head aligned with the rules yet. Run Check "
+                               f"Rules and fix them before sending to the "
+                               f"ledger.",
+                },
+            )
+
+        carried = [
+            c["name"] for c in await custom_fields.data_columns(conn, hide_redundant=False)
+        ]
+        cols = ", ".join(carried)
+        src = ", ".join(f"t.{c}" for c in carried)
+
+        # One transaction: marking these rows classified and posting them to
+        # the ledger either both happen or neither does.
+        async with conn.transaction():
+            finalized = await conn.fetch(
+                f"""
+                INSERT INTO transactions (
+                    {cols},
+                    project_id, bank_id, beneficiary_id, head_id, rera_head_id,
+                    idw_head_id, temp_trans_id
+                )
+                SELECT
+                    {src},
+                    t.project_id,
+                    (SELECT bank_id FROM import_batches WHERE id = t.batch_id),
+                    t.beneficiary_id, t.head_id, t.rera_head_id, t.idw_head_id,
+                    t.id
+                FROM temp_trans t
+                WHERE t.id = ANY($1::bigint[])
+                RETURNING id
+                """,
+                row_ids,
+            )
+            await conn.execute(
+                "UPDATE temp_trans SET is_classified = true "
+                "WHERE id = ANY($1::bigint[]) AND NOT is_classified",
+                row_ids,
+            )
+
+    return {"finalized": len(finalized), "skipped_unlocked": len(unlocked) if skip_unlocked else 0}
 
