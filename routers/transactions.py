@@ -1001,6 +1001,43 @@ async def delete_all_transactions(user: dict = Depends(get_company_user)):
     return {"deleted": total, "rows_postable_again": restored}
 
 
+@router.post("/{id}/reverse", dependencies=[Depends(require_manager)])
+async def reverse_transaction(id: int, user: dict = Depends(get_company_user)):
+    """Un-post one transaction -- the arrow button on the Ledger page.
+
+    Deleting the transactions row IS the reversal: the FK only restricts
+    deleting FROM temp_trans while something still points at it, never
+    deleting the transaction itself. Posting never consumed the temp_trans
+    row (see delete_all_transactions's own note, and send_to_ledger, which
+    only ever INSERTs), so there is nothing to restore on that side -- the
+    row was there all along, just hidden from Imported Rows while
+    tr.temp_trans_id pointed to it. Removing this row makes it visible there
+    again and postable again, the same as Delete All does for the whole
+    ledger, just for one row.
+
+    Manager level, not company-admin-only like Delete All: reversing one row
+    a person can already see and act on is a much smaller mistake to make
+    (and to notice and redo) than emptying the entire ledger at once.
+    """
+    async with company_connection(user["schema"]) as conn:
+        scope = await scoping.visible_project_ids(conn, user)
+        row = await conn.fetchrow(
+            "SELECT id, project_id, temp_trans_id FROM transactions WHERE id = $1",
+            id,
+        )
+        # Same visibility the ledger listing itself uses (include_unassigned=
+        # False, see /transactions/filters above) -- a row this user could
+        # not see on the Ledger page in the first place is reported missing
+        # rather than reversed, even for a valid id reached by guessing.
+        if (row is None or scope is not scoping.UNRESTRICTED
+                and (row["project_id"] is None or row["project_id"] not in scope)):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Transaction not found.")
+
+        await conn.execute("DELETE FROM transactions WHERE id = $1", id)
+
+    return {"reversed": True, "temp_trans_id": row["temp_trans_id"]}
+
+
 # ---------- Temp Import (raw rows before finalization) -----------------------
 
 # The joins resolve each id to the name the user picked in the master tables, so
@@ -2440,7 +2477,7 @@ async def transaction_filter_options(user: dict = Depends(get_company_user)):
 @router.delete("/temp-trans", dependencies=[Depends(require_manager)])
 async def clear_temp_trans(schema: str = Depends(get_current_schema)):
     """
-    Clear the staging table — every staged row, from every batch.
+    Clear the staging table of every UNPOSTED row, from every batch.
 
     DPL's "Truncate All Data" button, adapted to the one thing that differs
     here: `master` stood alone, but temp_trans has the ledger hanging off it.
@@ -2448,34 +2485,29 @@ async def clear_temp_trans(schema: str = Depends(get_current_schema)):
     would silently take `transactions` with it, and losing the ledger to a
     "clear the import staging area" button is not a recoverable mistake.
 
-    Refused outright if any staged row has been posted. transactions.
-    temp_trans_id is ON DELETE RESTRICT, so Postgres would block it anyway —
-    checking first turns a foreign-key error into a sentence that says which
-    rows are in the way.
+    A posted row is skipped, not refused: send_to_ledger and the ledger's own
+    reverse button already treat a posted row as invisible to Imported Rows
+    but still reversible, and a Clear All that suddenly destroyed the source
+    data behind a real ledger entry (or that a full `transactions.temp_trans_
+    id` FK violation would have blocked anyway) would break both of those
+    promises at once. So this only ever removes a row with nothing posted
+    against it, and only removes a batch once every row that came from it is
+    gone that way -- a batch still holding a posted row keeps its file_hash
+    blocked from re-import, and keeps a batch_id for that row to belong to.
+    The response says how many rows were left behind and why.
 
-    The batches go too. They cascade to their rows, and leaving them behind
-    would keep every file_hash on record, so re-importing the same statement
-    you just cleared would come back 409 "already uploaded".
+    The locked-row guard is unrelated and unchanged: locking is an explicit
+    "don't touch this" a person set on purpose, not a byproduct of posting,
+    so it still refuses the whole clear rather than silently skipping.
 
-    Not scoped by project: this is an all-or-nothing reset, and clearing "the
-    rows I can see" would leave a half-empty staging table that looks cleared
-    to the person who pressed the button and not to anyone else.
+    Not scoped by project: this is an all-or-nothing reset of what's left
+    after posted rows are set aside, and clearing "the rows I can see" would
+    leave a half-empty staging table that looks cleared to the person who
+    pressed the button and not to anyone else.
     """
     async with company_connection(schema) as conn:
-        posted = await conn.fetchval(
-            "SELECT count(*) FROM transactions WHERE temp_trans_id IS NOT NULL"
-        )
-        if posted:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                f"Cannot clear staging: {posted} staged "
-                f"{'row is' if posted == 1 else 'rows are'} already posted to "
-                f"the ledger. Reverse those transactions first, or discard the "
-                f"unposted batches individually.",
-            )
-
-        # Same standing as the posted check: a Clear All that silently took
-        # locked rows with it would make the lock a decoration.
+        # Same standing as always: a Clear All that silently took locked rows
+        # with it would make the lock a decoration.
         locked = await conn.fetchval(
             "SELECT count(*) FROM temp_trans WHERE is_locked"
         )
@@ -2487,15 +2519,35 @@ async def clear_temp_trans(schema: str = Depends(get_current_schema)):
                 f"{'it' if locked == 1 else 'them'} first.",
             )
 
-        rows = await conn.fetchval("SELECT count(*) FROM temp_trans")
-        batches = await conn.fetchval("SELECT count(*) FROM import_batches")
-        # One statement: temp_trans cascades from import_batches, so deleting
-        # the parents clears both sides atomically.
-        await conn.execute("DELETE FROM import_batches")
-        # Anything left had no batch behind it — belt and braces.
-        await conn.execute("DELETE FROM temp_trans")
+        async with conn.transaction():
+            posted = await conn.fetchval(
+                "SELECT count(*) FROM transactions WHERE temp_trans_id IS NOT NULL"
+            )
+            deleted_rows = await conn.fetch(
+                """
+                DELETE FROM temp_trans t
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM transactions tr WHERE tr.temp_trans_id = t.id
+                 )
+                RETURNING id
+                """
+            )
+            deleted_batches = await conn.fetch(
+                """
+                DELETE FROM import_batches b
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM temp_trans t WHERE t.batch_id = b.id
+                 )
+                RETURNING id
+                """
+            )
 
-    return {"status": "cleared", "rows_removed": rows, "batches_removed": batches}
+    return {
+        "status": "cleared",
+        "rows_removed": len(deleted_rows),
+        "batches_removed": len(deleted_batches),
+        "skipped_posted": posted,
+    }
 
 
 @router.delete("/temp-trans/{row_id}", dependencies=[Depends(require_manager)])
