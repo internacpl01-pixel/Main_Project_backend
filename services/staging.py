@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import re
+import uuid
 
 from database import company_connection
 from import_helpers import find_duplicate_rows, insert_temp_rows
@@ -472,6 +473,7 @@ async def stage_batch(
     normalized: list,
     parse_stats: dict,
     hash_scope: str = "",
+    allow_reimport: bool = False,
 ) -> dict:
     """Create the batch row and stage its lines into temp_trans.
 
@@ -482,6 +484,17 @@ async def stage_batch(
     The file_hash check is the hard stop against re-uploading the same
     statement. It is checked explicitly rather than left to the UNIQUE
     constraint so the caller can report *which* batch it collided with.
+
+    allow_reimport=True (the single-file import screen's "import anyway"
+    confirm, after a first attempt came back DuplicateFileError) does not
+    lift that UNIQUE constraint -- it can't, another row already holds this
+    exact file_hash -- so this attempt is given its own distinct one instead
+    (a random suffix folded in the same way hash_scope already is), letting
+    the insert below succeed. Nothing about *row*-level duplicate detection
+    changes: find_duplicate_rows still compares by row_hash, which is what
+    actually identifies which specific transactions repeat, so a re-imported
+    file's rows come back correctly flagged for the caller's review UI even
+    though this batch's file_hash is deliberately unique.
     """
     file_hash = hashlib.sha256(file_bytes).hexdigest()
     if hash_scope:
@@ -497,7 +510,11 @@ async def stage_batch(
             file_hash,
         )
         if existing is not None:
-            raise DuplicateFileError(dict(existing))
+            if not allow_reimport:
+                raise DuplicateFileError(dict(existing))
+            file_hash = hashlib.sha256(
+                f"{file_hash}:reimport:{uuid.uuid4().hex}".encode()
+            ).hexdigest()
 
         await _bank_check(conn, bank_id)
 

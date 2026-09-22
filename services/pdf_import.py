@@ -276,6 +276,7 @@ async def process_pdf_import(
     pages_spec: str = "",
     batch_pages: int = PDF_BATCH_PAGES,
     job_id: str | None = None,
+    allow_reimport: bool = False,
 ) -> dict:
     """Parse a statement and, when save=True, stage it into temp_trans.
 
@@ -520,7 +521,7 @@ async def process_pdf_import(
 
     staged = await stage_batch(
         schema, file_bytes, label, username, bank_id, normalized, parse_stats,
-        hash_scope=scope,
+        hash_scope=scope, allow_reimport=allow_reimport,
     )
 
     payload.update(

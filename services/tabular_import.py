@@ -469,6 +469,7 @@ async def process_tabular_import(
     save: bool = False,
     sheets: str = "",
     job_id: str | None = None,
+    allow_reimport: bool = False,
 ) -> dict:
     """Parse a workbook or CSV and, when save=True, stage each sheet as a batch.
 
@@ -595,6 +596,7 @@ async def process_tabular_import(
                         # it the second sheet of a workbook collides with the
                         # first on file_hash and is refused as a duplicate.
                         hash_scope=f"sheet={sheet['name']}" if sheet["name"] else "",
+                        allow_reimport=allow_reimport,
                     )
                 except Exception as exc:                      # noqa: BLE001
                     entry["error"] = str(exc)

@@ -331,8 +331,8 @@ def normalize_parsed_rows(rows: list, fieldmap_rows: list, bank_id=None) -> tupl
             "amount": amount,
             "credit_debit": credit_debit,
             "balance": _to_amount(raw.get(f_bal)),
-            "txn_ft": row_content_hash(txn_date, description, amount, credit_debit,
-                                       bank_id=bank_id, reference_no=reference_no),
+            "row_hash": row_content_hash(txn_date, description, amount, credit_debit,
+                                         bank_id=bank_id, reference_no=reference_no),
             "raw_data": raw,
         })
 
@@ -436,7 +436,7 @@ async def insert_temp_rows(conn, batch_id: int, normalized: list) -> int:
     # there any more, and DPL took the same precaution in append_rows_to_master.
     # It is the difference between "that field stopped being recorded" and
     # "every import 500s".
-    derived = [c for c in ("batch_id", "row_number", "txn_ft", "txn_date",
+    derived = [c for c in ("batch_id", "row_number", "row_hash", "txn_date",
                            "description", "amount", "credit_debit", "balance",
                            "raw_data")
                if c in live]
@@ -496,7 +496,7 @@ async def insert_temp_rows(conn, batch_id: int, normalized: list) -> int:
     for i, r in enumerate(normalized, start=1):
         raw = r["raw_data"] or {}
         source = {
-            "batch_id": batch_id, "row_number": i, "txn_ft": r["txn_ft"],
+            "batch_id": batch_id, "row_number": i, "row_hash": r["row_hash"],
             "txn_date": r["txn_date"], "description": r["description"],
             "amount": r["amount"], "credit_debit": r["credit_debit"],
             "balance": r["balance"], "raw_data": json.dumps(raw, default=str),
@@ -564,7 +564,7 @@ async def find_duplicate_rows(conn, batch_id: int) -> list[dict]:
         WHERE t.batch_id = $1
           AND EXISTS (
               SELECT 1 FROM temp_trans o
-              WHERE o.txn_ft = t.txn_ft AND o.batch_id <> t.batch_id
+              WHERE o.row_hash = t.row_hash AND o.batch_id <> t.batch_id
           )
         ORDER BY t.row_number
         """,

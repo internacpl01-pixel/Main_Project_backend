@@ -122,6 +122,13 @@ async def import_pdf(
         False,
         description="true returns a job id immediately; poll GET /imports/jobs/{id}",
     ),
+    allow_reimport: bool = Form(
+        False,
+        description="true re-stages this exact file even though it was "
+                    "already uploaded -- the single-file import screen's "
+                    "'import anyway' confirm, after a first attempt without "
+                    "this came back 409 DuplicateFileError.",
+    ),
     user: dict = Depends(get_company_user),
 ):
     """
@@ -160,6 +167,7 @@ async def import_pdf(
         pages_spec=pages,
         # None means "the server decides"; 0 is a real choice meaning one pass.
         batch_pages=PDF_BATCH_PAGES if batch_pages is None else batch_pages,
+        allow_reimport=allow_reimport,
     )
 
     try:
@@ -1184,7 +1192,8 @@ async def retry_drive_file_with_password(
 
 
 async def _import_tabular(kind: str, file: UploadFile, save: bool, bank_id,
-                          user: dict, sheets: str = "", background: bool = False):
+                          user: dict, sheets: str = "", background: bool = False,
+                          allow_reimport: bool = False):
     """Shared body for the Excel and CSV routes — only the reader differs."""
     _, allowed = READERS[kind]
     file_bytes = await _read_upload(file, allowed)
@@ -1200,6 +1209,7 @@ async def _import_tabular(kind: str, file: UploadFile, save: bool, bank_id,
         bank_id=_clean_bank_id(bank_id),
         save=save,
         sheets=sheets or "",
+        allow_reimport=allow_reimport,
     )
 
     try:
@@ -1259,6 +1269,11 @@ async def import_excel(
         False,
         description="true returns a job id immediately; poll GET /imports/jobs/{id}",
     ),
+    allow_reimport: bool = Form(
+        False,
+        description="true re-stages this exact file even though it was "
+                    "already uploaded -- see /imports/pdf's own field.",
+    ),
     user: dict = Depends(get_company_user),
 ):
     """Parse an Excel bank statement. Same flow and same options as /imports/pdf.
@@ -1273,7 +1288,8 @@ async def import_excel(
     same way a long PDF does.
     """
     return await _import_tabular("excel", file, save, bank_id, user,
-                                 sheets=sheets, background=background)
+                                 sheets=sheets, background=background,
+                                 allow_reimport=allow_reimport)
 
 
 @router.post("/csv")
@@ -1285,6 +1301,11 @@ async def import_csv(
         False,
         description="true returns a job id immediately; poll GET /imports/jobs/{id}",
     ),
+    allow_reimport: bool = Form(
+        False,
+        description="true re-stages this exact file even though it was "
+                    "already uploaded -- see /imports/pdf's own field.",
+    ),
     user: dict = Depends(get_company_user),
 ):
     """
@@ -1295,7 +1316,7 @@ async def import_csv(
     a single sheet, so there is nothing to select.
     """
     return await _import_tabular("csv", file, save, bank_id, user,
-                                 background=background)
+                                 background=background, allow_reimport=allow_reimport)
 
 
 @router.get("/batches")
@@ -1361,7 +1382,7 @@ async def get_batch(batch_id: int, schema: str = Depends(get_current_schema)):
             """
             SELECT id, row_number, amount, credit_debit, is_classified,
                    project_id, beneficiary_id, head_id, rera_head_id,
-                   idw_head_id, txn_ft, raw_data
+                   idw_head_id, row_hash, raw_data
             FROM temp_trans
             WHERE batch_id = $1
             ORDER BY row_number
