@@ -14,7 +14,7 @@ import logging
 import re
 
 from database import company_connection
-from import_helpers import count_duplicate_rows, insert_temp_rows
+from import_helpers import find_duplicate_rows, insert_temp_rows
 
 logger = logging.getLogger(__name__)
 
@@ -517,7 +517,7 @@ async def stage_batch(
         )
 
         inserted = await insert_temp_rows(conn, batch_id, normalized)
-        duplicates = await count_duplicate_rows(conn, batch_id)
+        duplicate_rows = await find_duplicate_rows(conn, batch_id)
 
         # A row whose statement never printed its own account number gets it
         # from the bank picked on the import screen -- before the company fill
@@ -561,12 +561,16 @@ async def stage_batch(
 
     logger.info("[stage] batch %s: %d rows, %d duplicate rows, %d account set, "
                 "%d company set, %d FY set",
-                batch_id, inserted, duplicates, acct_filled.get("updated", 0),
+                batch_id, inserted, len(duplicate_rows), acct_filled.get("updated", 0),
                 filled.get("updated", 0), fy.get("updated", 0))
     return {
         "batch_id": batch_id,
         "inserted": inserted,
-        "duplicate_rows": duplicates,
+        "duplicate_rows": len(duplicate_rows),
+        # The detail behind that count -- see import_helpers.find_duplicate_
+        # rows. Only the single-file import flow actually shows these to a
+        # person to review; batch and Drive imports keep reading the count.
+        "duplicates": duplicate_rows,
         "account_number_filled": acct_filled.get("updated", 0),
         "company_filled": filled.get("updated", 0),
         "financial_year_filled": fy.get("updated", 0),

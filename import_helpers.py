@@ -23,7 +23,7 @@ from decimal import Decimal, InvalidOperation
 
 from parsers import (_build_alias_map, _category_map_from_aliases,
                      _category_of, _normalize_for_matching)
-from services.custom_fields import table_structure
+from services.custom_fields import date_column, description_column, table_structure
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +169,8 @@ def _to_amount(val) -> Decimal | None:
         return None
 
 
-def row_content_hash(txn_date, description, amount, credit_debit) -> str:
+def row_content_hash(txn_date, description, amount, credit_debit,
+                     bank_id=None, reference_no=None) -> str:
     """Content fingerprint of one statement line, independent of which file it
     came from.
 
@@ -178,17 +179,38 @@ def row_content_hash(txn_date, description, amount, credit_debit) -> str:
     block the import, which is why 002 dropped the UNIQUE constraint that used
     to sit on this value. The hard block against re-uploading an identical file
     is import_batches.file_hash.
+
+    bank_id scopes the fingerprint to one account (confirmed with the user):
+    without it, a same-date/same-amount/same-description transaction on two
+    DIFFERENT bank accounts read as duplicates of each other, which they are
+    not. reference_no (a bank's own UTR/cheque/reference number, when the
+    fieldmap has one mapped) replaces the description entirely rather than
+    supplementing it, also confirmed with the user -- it is the one field a
+    bank guarantees is unique per transaction, where the printed description
+    is free text that can legitimately repeat (two rent payments, same
+    tenant, same amount, different months, worded identically).
     """
-    parts = [
-        txn_date.isoformat() if txn_date else "",
-        (description or "").strip().lower(),
-        str(amount) if amount is not None else "",
-        credit_debit or "",
-    ]
+    reference = (reference_no or "").strip()
+    if reference:
+        parts = [
+            str(bank_id) if bank_id is not None else "",
+            txn_date.isoformat() if txn_date else "",
+            reference.upper(),
+            str(amount) if amount is not None else "",
+            credit_debit or "",
+        ]
+    else:
+        parts = [
+            str(bank_id) if bank_id is not None else "",
+            txn_date.isoformat() if txn_date else "",
+            (description or "").strip().lower(),
+            str(amount) if amount is not None else "",
+            credit_debit or "",
+        ]
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
-def normalize_parsed_rows(rows: list, fieldmap_rows: list) -> tuple[list, dict]:
+def normalize_parsed_rows(rows: list, fieldmap_rows: list, bank_id=None) -> tuple[list, dict]:
     """Turn parser output into rows shaped like temp_trans.
 
     Returns (normalized, stats). Each normalized row is a dict with exactly the
@@ -218,6 +240,10 @@ def normalize_parsed_rows(rows: list, fieldmap_rows: list) -> tuple[list, dict]:
     # printed column and a flag says which one each row is.
     f_amt = by_cat.get("amount")
     f_dir = by_cat.get("drcr")
+    # A bank's own UTR/cheque/reference number, when the fieldmap has one
+    # mapped -- see row_content_hash for why this replaces description in
+    # the fingerprint rather than joining it.
+    f_ref = by_cat.get("reference_no")
 
     normalized = []
     skipped_no_amount = 0
@@ -295,6 +321,7 @@ def normalize_parsed_rows(rows: list, fieldmap_rows: list) -> tuple[list, dict]:
         credit_debit = None if amount is None else ("DR" if withdrawal is not None else "CR")
 
         description = (raw.get(f_desc) or "").strip() or None
+        reference_no = (raw.get(f_ref) or "").strip() if f_ref else ""
 
         # Keys here are temp_trans column names, which are fixed -- unlike the
         # keys read out of `raw` above, which are whatever the fieldmap says.
@@ -304,7 +331,8 @@ def normalize_parsed_rows(rows: list, fieldmap_rows: list) -> tuple[list, dict]:
             "amount": amount,
             "credit_debit": credit_debit,
             "balance": _to_amount(raw.get(f_bal)),
-            "row_hash": row_content_hash(txn_date, description, amount, credit_debit),
+            "txn_ft": row_content_hash(txn_date, description, amount, credit_debit,
+                                       bank_id=bank_id, reference_no=reference_no),
             "raw_data": raw,
         })
 
@@ -408,7 +436,7 @@ async def insert_temp_rows(conn, batch_id: int, normalized: list) -> int:
     # there any more, and DPL took the same precaution in append_rows_to_master.
     # It is the difference between "that field stopped being recorded" and
     # "every import 500s".
-    derived = [c for c in ("batch_id", "row_number", "row_hash", "txn_date",
+    derived = [c for c in ("batch_id", "row_number", "txn_ft", "txn_date",
                            "description", "amount", "credit_debit", "balance",
                            "raw_data")
                if c in live]
@@ -468,7 +496,7 @@ async def insert_temp_rows(conn, batch_id: int, normalized: list) -> int:
     for i, r in enumerate(normalized, start=1):
         raw = r["raw_data"] or {}
         source = {
-            "batch_id": batch_id, "row_number": i, "row_hash": r["row_hash"],
+            "batch_id": batch_id, "row_number": i, "txn_ft": r["txn_ft"],
             "txn_date": r["txn_date"], "description": r["description"],
             "amount": r["amount"], "credit_debit": r["credit_debit"],
             "balance": r["balance"], "raw_data": json.dumps(raw, default=str),
@@ -504,25 +532,45 @@ async def insert_temp_rows(conn, batch_id: int, normalized: list) -> int:
     return len(records)
 
 
-async def count_duplicate_rows(conn, batch_id: int) -> int:
-    """How many rows in this batch already appear in an earlier batch.
+async def find_duplicate_rows(conn, batch_id: int) -> list[dict]:
+    """Which of this batch's own rows already appear in an earlier batch, with
+    enough detail (id, date, description, amount, direction) for a person to
+    look at each one and decide whether to keep or discard it.
 
-    Soft signal only. The caller surfaces it so a user re-importing an
-    overlapping statement period can see the overlap before finalizing, without
-    the import itself being refused.
+    date/description are NOT fixed column names on temp_trans -- unlike
+    amount/credit_debit, they live wherever this company's own fieldmap
+    mapped them (a field_date_N / field_text_N column, or none at all), the
+    same reason routers/transactions.py's _judged_rows resolves them through
+    custom_fields.date_column/description_column rather than naming a
+    column directly. Doing the same here is what keeps this from crashing on
+    any company whose date/description fields aren't literally called that.
+
+    Soft signal only -- nothing here blocks or skips an insert. The caller
+    surfaces this so a user re-importing an overlapping statement period can
+    see the overlap and act on it (see routers/imports.py's single-file
+    import flow, which lets that person delete the ones they don't want via
+    the ordinary per-row delete endpoint) without the import itself ever
+    being refused.
     """
-    return await conn.fetchval(
-        """
-        SELECT count(*)
+    date_col = await date_column(conn)
+    desc_col = await description_column(conn)
+    date_sel = f"t.{date_col} AS txn_date" if date_col else "NULL AS txn_date"
+    desc_sel = f"t.{desc_col} AS description" if desc_col else "NULL AS description"
+
+    rows = await conn.fetch(
+        f"""
+        SELECT t.id, {date_sel}, {desc_sel}, t.amount, t.credit_debit
         FROM temp_trans t
         WHERE t.batch_id = $1
           AND EXISTS (
               SELECT 1 FROM temp_trans o
-              WHERE o.row_hash = t.row_hash AND o.batch_id <> t.batch_id
+              WHERE o.txn_ft = t.txn_ft AND o.batch_id <> t.batch_id
           )
+        ORDER BY t.row_number
         """,
         batch_id,
     )
+    return [dict(r) for r in rows]
 
 
 def compute_fill_rates(rows: list) -> dict:

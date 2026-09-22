@@ -1361,7 +1361,7 @@ async def get_batch(batch_id: int, schema: str = Depends(get_current_schema)):
             """
             SELECT id, row_number, amount, credit_debit, is_classified,
                    project_id, beneficiary_id, head_id, rera_head_id,
-                   idw_head_id, row_hash, raw_data
+                   idw_head_id, txn_ft, raw_data
             FROM temp_trans
             WHERE batch_id = $1
             ORDER BY row_number

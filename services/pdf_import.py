@@ -451,7 +451,7 @@ async def process_pdf_import(
 
     pages = len(pages_used)
     t_parse = (time.perf_counter() - t0) * 1000
-    normalized, norm_stats = normalize_parsed_rows(parsed_rows, fieldmap_rows)
+    normalized, norm_stats = normalize_parsed_rows(parsed_rows, fieldmap_rows, bank_id=bank_id)
     logger.info(
         "[PDF] parse %.0fms, parsed=%d usable=%d", t_parse, len(parsed_rows), len(normalized)
     )
@@ -476,6 +476,7 @@ async def process_pdf_import(
         "fill_rates": compute_fill_rates(parsed_rows),
         "stats": parse_stats,
         "duplicate_rows": 0,
+        "duplicates": [],
         # What was actually read, so the screen can say so rather than implying
         # the whole file was taken. header_page_added is the one surprise worth
         # naming: page 1's transactions are in this import because its header
@@ -527,6 +528,7 @@ async def process_pdf_import(
         batch_id=staged["batch_id"],
         row_count=staged["inserted"],
         duplicate_rows=staged["duplicate_rows"],
+        duplicates=staged["duplicates"],
         total_ms=round((time.perf_counter() - t_start) * 1000),
     )
     return payload

@@ -529,6 +529,7 @@ async def process_tabular_import(
     all_normalized: list = []
     total_staged = 0
     total_duplicates = 0
+    all_duplicates = []
 
     for i, sheet in enumerate(chosen, start=1):
         label = sheet["name"] or filename
@@ -545,7 +546,7 @@ async def process_tabular_import(
             for fieldname, value in (sheet["document_fields"] or {}).items():
                 record.setdefault(fieldname, value)
 
-        normalized, norm_stats = normalize_parsed_rows(records, fieldmap_rows)
+        normalized, norm_stats = normalize_parsed_rows(records, fieldmap_rows, bank_id=bank_id)
         all_records.extend(records)
         all_normalized.extend(normalized)
 
@@ -565,6 +566,7 @@ async def process_tabular_import(
             "batch_id": None,
             "staged": 0,
             "duplicate_rows": 0,
+            "duplicates": [],
             "error": None,
         }
 
@@ -601,9 +603,11 @@ async def process_tabular_import(
                 else:
                     entry.update(batch_id=staged["batch_id"],
                                  staged=staged["inserted"],
-                                 duplicate_rows=staged["duplicate_rows"])
+                                 duplicate_rows=staged["duplicate_rows"],
+                                 duplicates=staged["duplicates"])
                     total_staged += staged["inserted"]
                     total_duplicates += staged["duplicate_rows"]
+                    all_duplicates.extend(staged["duplicates"])
 
         if job_id:
             jobs.complete_step(job_id, rows=entry["staged"] or entry["usable"])
@@ -656,6 +660,7 @@ async def process_tabular_import(
             "sheets_read": [r["sheet"] for r in results],
         },
         "duplicate_rows": total_duplicates,
+        "duplicates": all_duplicates,
         # The per-sheet breakdown: one line each, with its own batch id, its own
         # counts and its own failure if it had one.
         "sheets": [{k: v for k, v in r.items() if k != "rows"} for r in results],

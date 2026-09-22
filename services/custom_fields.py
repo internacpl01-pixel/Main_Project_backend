@@ -307,7 +307,7 @@ async def delete_custom_field(conn, fieldname: str) -> dict:
 # limited to the staging contract itself. Everything a user can add, rename or
 # delete comes from the fieldmap.
 _STAGING_INTERNALS = frozenset({
-    "row_hash",      # dedup fingerprint
+    "txn_ft",        # dedup fingerprint (renamed from row_hash, migration 052)
     "row_number",    # position in the source file
     "is_classified", # workflow state, rendered as the Status column
     "is_locked",     # workflow state, rendered as the padlock button
