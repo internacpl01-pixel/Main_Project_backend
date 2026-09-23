@@ -19,7 +19,7 @@ import base64
 import logging
 import re
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, Form, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 
 import permissions
@@ -2638,6 +2638,66 @@ async def delete_temp_row(row_id: int, user: dict = Depends(get_company_user)):
         await conn.execute("DELETE FROM temp_trans WHERE id = $1", row_id)
 
     return {"status": "deleted", "row_id": row_id, "batch_id": row["batch_id"]}
+
+
+@router.post("/temp-trans/delete-batch", dependencies=[Depends(require_manager)])
+async def delete_temp_rows_batch(
+    ids: str = Form(..., description="Comma-separated temp_trans ids to delete"),
+    user: dict = Depends(get_company_user),
+):
+    """Same as DELETE /temp-trans/{row_id}, for many rows in one call.
+
+    Built for the "Remove checked" button on the duplicate-rows review after
+    a single-file import (ImportPage.jsx): that button used to call the
+    single-row endpoint once per id with Promise.all, and a statement with
+    hundreds of overlapping rows meant hundreds of concurrent DELETEs at
+    once -- the same failure mode as the Drive "Skip 71" crash (see
+    skip_drive_files above), enough to take down a small Render instance.
+    This does the whole thing as one query.
+
+    Same two refusals as the single-row endpoint, applied per row rather
+    than to the whole call: a locked or already-posted id is left alone and
+    reported separately instead of failing every other id in the list.
+    """
+    id_list = [int(i) for i in ids.split(",") if i.strip().lstrip("-").isdigit()]
+    if not id_list:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "No row ids given.")
+
+    async with company_connection(user["schema"]) as conn:
+        scope = await scoping.visible_project_ids(conn, user)
+        rows = await conn.fetch(
+            """
+            SELECT t.id, t.project_id, t.is_locked, tr.id AS posted_txn_id
+              FROM temp_trans t
+              LEFT JOIN transactions tr ON tr.temp_trans_id = t.id
+             WHERE t.id = ANY($1::bigint[])
+            """,
+            id_list,
+        )
+        found = {r["id"] for r in rows}
+        # Outside your scope reads as not-found, same as the single-row
+        # endpoint -- this cannot be used to probe which ids belong to
+        # another project.
+        visible = [r for r in rows if scoping.can_use_project(scope, r["project_id"])]
+        locked_ids = [r["id"] for r in visible if r["is_locked"]]
+        posted_ids = [r["id"] for r in visible if r["posted_txn_id"] is not None]
+        deletable = [r["id"] for r in visible
+                    if not r["is_locked"] and r["posted_txn_id"] is None]
+
+        deleted_ids = []
+        if deletable:
+            deleted = await conn.fetch(
+                "DELETE FROM temp_trans WHERE id = ANY($1::bigint[]) RETURNING id",
+                deletable,
+            )
+            deleted_ids = [r["id"] for r in deleted]
+
+    return {
+        "deleted": deleted_ids,
+        "skipped_locked": locked_ids,
+        "skipped_posted": posted_ids,
+        "not_found": sorted(set(id_list) - found),
+    }
 
 
 # Which id column each editable dropdown writes, and which fieldmap.mirrors
