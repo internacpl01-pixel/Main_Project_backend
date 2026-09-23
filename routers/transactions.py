@@ -1245,7 +1245,7 @@ async def _temp_filters(
         rule_ctx = await _rule_context(conn, wanted_type, wanted_account,
                                        wanted_target or rules.DEFAULT_TARGET)
         flagged = [r["id"] for r in await _judged_rows(conn, user, rule_ctx)
-                   if r["status"] == "conflict"]
+                   if r["status"] == "conflict" or r["ambiguous"]]
         filters.append(f"t.id = ANY(${idx}::bigint[])")
         params.append(flagged)
         idx += 1
@@ -2236,6 +2236,16 @@ async def _judged_rows(conn, user: dict, ctx: dict) -> list[dict]:
         row["values"] = values
         row["heads"] = heads
         row["extra_rule_ids"] = [c["id"] for c in extra]
+        # True whenever more than one condition matched this row AND there was
+        # more than one head to choose between -- independent of status,
+        # because it means the same thing on a conflict (the dialog's amber
+        # badge already covers that) and on an "ok" row (which it does not: a
+        # row current_id happens to satisfy is not the same fact as this rule
+        # actually having settled on it, since a different matching condition
+        # could have named a different head). check_temp_rules's summary and
+        # the flagged-rows filter below both treat an ambiguous "ok" as still
+        # needing a person's eyes, the same as a conflict.
+        row["ambiguous"] = len(extra) > 0 and len(heads) > 1
         out.append(row)
     return out
 
@@ -2281,7 +2291,11 @@ async def check_temp_rules(
         conditions, columns = ctx["conditions"], ctx["columns"]
 
         checked = await _judged_rows(conn, user, ctx)
-        ok = sum(1 for r in checked if r["status"] == "ok")
+        # An "ok" row that is also ambiguous is not a clean pass -- see
+        # _judged_rows' own note -- so it comes out of `ok` and into its own
+        # count rather than being reported as a row nobody needs to look at.
+        ambiguous = sum(1 for r in checked if r["status"] == "ok" and r["ambiguous"])
+        ok = sum(1 for r in checked if r["status"] == "ok") - ambiguous
         conflicts = sum(1 for r in checked if r["status"] == "conflict")
         locked_conflicts = sum(1 for r in checked
                                if r["status"] == "conflict" and r["is_locked"])
@@ -2359,6 +2373,7 @@ async def check_temp_rules(
         "summary": {
             "total": len(checked),
             "ok": ok,
+            "ambiguous": ambiguous,
             "conflicts": conflicts,
             "locked_conflicts": locked_conflicts,
             "no_direction": no_direction,
