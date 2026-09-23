@@ -2113,10 +2113,12 @@ async def _judged_rows(conn, user: dict, ctx: dict) -> list[dict]:
     place and clean in the other. Scoped like the list itself.
 
     Each row carries `status` (ok / conflict / no_direction) and `rule_id`: the
-    condition that decided it, or None when the grid did. A conflicting row
-    also carries `values`, the statement columns under their own names, for the
-    dialog to draw. Only conflicts, because those are the only rows it draws,
-    and every narration on the account is a payload nobody reads.
+    condition that decided it, or None when the grid did. Every row also
+    carries `values`, the statement columns under their own names, and `heads`,
+    the ids its direction/condition allow -- the dialog draws both an ok row
+    and a conflicting one now (green vs red), and an ok row still offers a
+    Replace dropdown, so both need the same evidence and the same choices a
+    conflict gets.
     """
     rule, digits, account_col = ctx["target"], ctx["digits"], ctx["account_col"]
     expected, allowed_ids = ctx["expected"], ctx["allowed_ids"]
@@ -2150,6 +2152,21 @@ async def _judged_rows(conn, user: dict, ctx: dict) -> list[dict]:
     display = [c["name"] for c in columns]
 
     field = rule["field"]
+    # A freshly imported row carries the statement's own word for this head in
+    # its mirror column (e.g. field_text_6, "Master to Free") long before
+    # anything has matched it to a master row and set rera_head_id -- that
+    # match IS what this check is for. Reading current_name from m.name alone
+    # showed every unrun row as "not set", even one the sheet was perfectly
+    # clear about, because the id it joins on had never been assigned yet.
+    # Falling back to the raw mirror text (never invented -- read from the
+    # fieldmap, like _editable_columns' own dropdown label) lets the dialog
+    # show what the statement said even when nothing has matched it to a
+    # master row yet; current_id, and therefore the conflict verdict below,
+    # is unaffected by this and still means exactly what it always has.
+    ecols = await _editable_columns(conn)
+    mirror_col = (ecols.get(rule["mirrors"]) or {}).get("column")
+    current_name_sql = (f"coalesce(m.name, t.{mirror_col})" if mirror_col
+                        else "m.name")
     rows = await conn.fetch(
         f"""
         SELECT t.id, t.batch_id, t.row_number, t.is_locked,
@@ -2157,7 +2174,7 @@ async def _judged_rows(conn, user: dict, ctx: dict) -> list[dict]:
                t.amount,
                {date_sel}
                t.{field} AS current_id,
-               m.name AS current_name
+               {current_name_sql} AS current_name
                {rules.subject_sql(fields)}
                {rules.subject_sql(display, prefix="d")}
           FROM temp_trans t
@@ -2193,10 +2210,11 @@ async def _judged_rows(conn, user: dict, ctx: dict) -> list[dict]:
         # sent straight from resolve() rather than looked up again through
         # `conditions[rule_id]`, which only ever knew about the first one.
         # `extra_rule_ids` is how the dialog explains the "ambiguous" badge.
-        if row["status"] == "conflict":
-            row["values"] = values
-            row["heads"] = heads
-            row["extra_rule_ids"] = [c["id"] for c in extra]
+        # Attached to every row, not just conflicts: the dialog now draws an ok
+        # row too, and it still needs the Replace dropdown's choices.
+        row["values"] = values
+        row["heads"] = heads
+        row["extra_rule_ids"] = [c["id"] for c in extra]
         out.append(row)
     return out
 
