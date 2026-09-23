@@ -2154,31 +2154,52 @@ async def _judged_rows(conn, user: dict, ctx: dict) -> list[dict]:
     field = rule["field"]
     # A freshly imported row carries the statement's own word for this head in
     # its mirror column (e.g. field_text_6, "Master to Free") long before
-    # anything has matched it to a master row and set rera_head_id -- that
-    # match IS what this check is for. Reading current_name from m.name alone
-    # showed every unrun row as "not set", even one the sheet was perfectly
-    # clear about, because the id it joins on had never been assigned yet.
-    # Falling back to the raw mirror text (never invented -- read from the
-    # fieldmap, like _editable_columns' own dropdown label) lets the dialog
-    # show what the statement said even when nothing has matched it to a
-    # master row yet; current_id, and therefore the conflict verdict below,
-    # is unaffected by this and still means exactly what it always has.
+    # anything has matched it to a master row and set rera_head_id. Treating
+    # that row as a conflict -- "not set" -- until someone opens the dropdown
+    # and reselects the exact same word by hand is not what a person means by
+    # a conflict: the statement already said the right thing, id or no id.
+    #
+    # So when the id column is empty, this also tries the mirror text against
+    # the master by name (case/space-insensitive, active rows only -- same
+    # rule a dropdown follows everywhere else) and judges against THAT id when
+    # it finds one. lower(btrim(...)) rather than an exact column match is
+    # deliberate: "Master to Free" typed once in the fieldmap's raw import and
+    # once by hand in Master Data should not fail to agree over a stray space.
+    # The lookup is a LATERAL with its own ORDER BY id LIMIT 1, not a plain
+    # LEFT JOIN, because 035 made head names non-unique -- a plain join on a
+    # name two rows share would fan this row out into two.
     ecols = await _editable_columns(conn)
     mirror_col = (ecols.get(rule["mirrors"]) or {}).get("column")
-    current_name_sql = (f"coalesce(m.name, t.{mirror_col})" if mirror_col
-                        else "m.name")
+    if mirror_col:
+        name_match_join = f"""
+          LEFT JOIN LATERAL (
+                 SELECT m2.id, m2.name
+                   FROM {rule['master_table']} m2
+                  WHERE m2.is_active
+                    AND lower(btrim(m2.name)) = lower(btrim(t.{mirror_col}))
+                  ORDER BY m2.id
+                  LIMIT 1
+               ) m2 ON t.{field} IS NULL
+        """
+        current_id_sql = f"coalesce(t.{field}, m2.id)"
+        current_name_sql = f"coalesce(m.name, m2.name, t.{mirror_col})"
+    else:
+        name_match_join = ""
+        current_id_sql = f"t.{field}"
+        current_name_sql = "m.name"
     rows = await conn.fetch(
         f"""
         SELECT t.id, t.batch_id, t.row_number, t.is_locked,
                upper(btrim(coalesce(t.credit_debit, ''))) AS direction,
                t.amount,
                {date_sel}
-               t.{field} AS current_id,
+               {current_id_sql} AS current_id,
                {current_name_sql} AS current_name
                {rules.subject_sql(fields)}
                {rules.subject_sql(display, prefix="d")}
           FROM temp_trans t
           LEFT JOIN {rule['master_table']} m ON m.id = t.{field}
+          {name_match_join}
          WHERE {' AND '.join(filters)}
          ORDER BY t.batch_id, t.row_number
         """,
