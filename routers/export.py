@@ -23,11 +23,18 @@ from fpdf import FPDF
 
 from database import company_connection
 from routers.auth import get_company_user
-from services import custom_fields, scoping
+from services import custom_fields, scoping, staging
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/export", tags=["export"])
+
+# Sent by the ledger's own Account Number filter (TableFilters.jsx's
+# NO_VALUE) for "rows with nothing in this column" -- an empty string cannot
+# ask for that, since an empty param already means "no filter". Same value
+# routers.transactions.BLANK uses, kept as its own constant here rather than
+# imported cross-router for one shared literal.
+BLANK = "__none__"
 
 _NUMERIC_TYPES = {"numeric", "real", "double precision", "integer", "bigint"}
 _INTEGER_TYPES = {"integer", "bigint", "smallint"}
@@ -80,7 +87,8 @@ def _as_date(val):
     return None
 
 
-async def _fetch_ledger(user: dict, project_id, head_id, date_from, date_to):
+async def _fetch_ledger(user: dict, project_id, head_id, date_from, date_to,
+                        account=None, company=None):
     """The rows to export, with the same filters /transactions accepts.
 
     Debit and credit are split back into two columns here. The ledger stores one
@@ -89,6 +97,13 @@ async def _fetch_ledger(user: dict, project_id, head_id, date_from, date_to):
 
     Project scoping is applied here rather than at the endpoint so that an
     export can never contain a row the same user could not see on screen.
+
+    account/company match routers.transactions._facet_filters' own rules
+    exactly -- account on digits only, ignoring leading zeros, and comma
+    separated for several at once; company case-insensitive -- so the Export
+    page's filters (built from the same GET /transactions/filters options the
+    Ledger page's own FilterBar reads) can never disagree with what the
+    Ledger page showed for the same choice.
     """
     filters, params, idx = ["1=1"], [], 1
     for value, clause in (
@@ -106,6 +121,42 @@ async def _fetch_ledger(user: dict, project_id, head_id, date_from, date_to):
         # the date. Nothing below names a statement field.
         columns = await custom_fields.data_columns(conn)
         date_col = await custom_fields.date_column(conn)
+
+        if account:
+            col = await staging.account_column(conn)
+            if not col:
+                raise HTTPException(
+                    400, "Cannot filter by account number: this company has "
+                         "no account number field mapped.")
+            wanted = [v.strip() for v in account.split(",") if v.strip()]
+            include_blank = BLANK in wanted
+            numbers = sorted({staging.normalise_account(v)
+                              for v in wanted if v != BLANK})
+            numbers = [n for n in numbers if n]
+            clauses = []
+            if numbers:
+                clauses.append(
+                    f"{staging.account_digits(f't.{col}')} = ANY(${idx}::text[])")
+                params.append(numbers)
+                idx += 1
+            if include_blank:
+                clauses.append(f"(t.{col} IS NULL OR btrim(t.{col}) = '')")
+            filters.append("(" + " OR ".join(clauses) + ")" if clauses else "1 = 0")
+
+        if company:
+            col = await staging.company_column(conn)
+            if not col:
+                raise HTTPException(
+                    400, "Cannot filter by company: this company has no "
+                         "Company field mapped. Add one on the Custom "
+                         "Fields page.")
+            if company == BLANK:
+                filters.append(f"(t.{col} IS NULL OR btrim(t.{col}) = '')")
+            else:
+                filters.append(
+                    f"lower(btrim(t.{col})) = lower(btrim(${idx}::text))")
+                params.append(company)
+                idx += 1
 
         for value, op in ((date_from, ">="), (date_to, "<=")):
             if value is not None and date_col:
@@ -413,6 +464,17 @@ async def export_transactions(
     head_id: int = Query(None),
     date_from: date = Query(None, description="YYYY-MM-DD"),
     date_to: date = Query(None, description="YYYY-MM-DD"),
+    account: str = Query(
+        None,
+        description='Account numbers to include, comma separated for several. '
+                    'Matched on digits only, ignoring leading zeros. Include '
+                    '"__none__" for rows with no account.',
+    ),
+    company: str = Query(
+        None,
+        description='Company the row belongs to, case-insensitive. '
+                    '"__none__" for rows with no company set.',
+    ),
     user: dict = Depends(get_company_user),
 ):
     """
@@ -421,7 +483,8 @@ async def export_transactions(
     Accepts the same filters as GET /transactions, so what you export is what
     you were looking at.
     """
-    columns, rows = await _fetch_ledger(user, project_id, head_id, date_from, date_to)
+    columns, rows = await _fetch_ledger(
+        user, project_id, head_id, date_from, date_to, account, company)
 
     col_names = [c["name"] for c in columns]
     col_display = [c["displayname"] for c in columns]
