@@ -970,18 +970,21 @@ async def fill_derived(user: dict = Depends(get_company_user)):
 
 @router.delete("/all", dependencies=[Depends(require_level(permissions.COMPANY_ADMIN))])
 async def delete_all_transactions(user: dict = Depends(get_company_user)):
-    """Empty the ledger.
+    """Empty the ledger -- permanently. Company admin only, not manager.
 
-    Company admin only, not manager. Clearing staging throws away work nobody
-    has posted yet; this throws away the posted record itself, and the two are
-    not the same decision.
+    Used to leave the underlying temp_trans row behind, un-posted and postable
+    again from Imported Rows (see reverse_transaction, which still does this
+    for a single row -- that is what "reverse" means, undo the post, not
+    destroy the data). Clear All confirmed with the user to mean something
+    stronger: no copy of these rows should survive anywhere, in the ledger or
+    in Imported Rows, once they click through the "cannot be undone" warning.
+    So this deletes both tables' rows in one transaction rather than the
+    transactions row alone.
 
-    It is recoverable, which is the reason it can exist at all. Posting a row
-    does not consume it: the temp_trans row stays, still classified, and the
-    only thing stopping it being posted twice is UNIQUE (temp_trans_id) on this
-    table. Remove the transaction and that row becomes postable again -- so
-    "delete the ledger" means "un-post everything", not "lose it". Anything
-    imported is still in Imported Rows with its classification intact.
+    transactions.temp_trans_id is ON DELETE RESTRICT, which is why the
+    transactions rows have to go first -- deleting temp_trans while a
+    transaction still pointed at it would fail the same way a single delete
+    from Imported Rows already refuses to touch a posted row.
 
     No scoping filter. A partial wipe of somebody's visible projects would leave
     a ledger that balances for nobody, and the level required here already
@@ -990,15 +993,16 @@ async def delete_all_transactions(user: dict = Depends(get_company_user)):
     async with company_connection(user["schema"]) as conn:
         async with conn.transaction():
             total = await conn.fetchval("SELECT count(*) FROM transactions")
-            # Counted before the delete: afterwards there is nothing left to
-            # join against and the number would always be zero.
-            restored = await conn.fetchval(
-                "SELECT count(*) FROM transactions WHERE temp_trans_id IS NOT NULL")
+            temp_ids = [r["temp_trans_id"] for r in await conn.fetch(
+                "SELECT temp_trans_id FROM transactions WHERE temp_trans_id IS NOT NULL")]
             await conn.execute("DELETE FROM transactions")
+            if temp_ids:
+                await conn.execute(
+                    "DELETE FROM temp_trans WHERE id = ANY($1::bigint[])", temp_ids)
 
-    logger.info("[ledger] cleared: %d transactions, %d rows back to postable",
-                total, restored)
-    return {"deleted": total, "rows_postable_again": restored}
+    logger.info("[ledger] cleared permanently: %d transactions, %d staged rows with them",
+                total, len(temp_ids))
+    return {"deleted": total, "staged_rows_deleted": len(temp_ids)}
 
 
 @router.post("/{id}/reverse", dependencies=[Depends(require_manager)])

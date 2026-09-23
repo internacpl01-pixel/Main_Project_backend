@@ -186,7 +186,8 @@ def _is_repeat_header(cells: list, header_cells: list) -> bool:
 
 def _resolve_collisions(header_cells: list, col_mapping: dict,
                         display_by_field: dict,
-                        date_cols: set) -> tuple[dict, list]:
+                        date_cols: set,
+                        aliases_by_field: dict | None = None) -> tuple[dict, list]:
     """Decide which column owns a field when several claim it.
 
     Two source columns can map to one field. This workbook does it twice: HEAD
@@ -195,11 +196,18 @@ def _resolve_collisions(header_cells: list, col_mapping: dict,
     BOM sheets — where TYPE holds 'IMPS' and 'Charges' and TYPE FOR RERA IDW
     holds the actual RERA category — the wrong one took the column.
 
-    The column whose title IS the field's display name wins. That is not a
-    tie-break, it is the sheet saying which column it means: 'TYPE FOR RERA IDW'
-    is that field, and 'TYPE' merely shares a word with one of its aliases.
-    Failing an exact match, the leftmost wins, which is the older behaviour and
-    the right answer for a transaction-date / value-date pair.
+    The column whose title IS one of the field's own configured names wins.
+    That is not a tie-break, it is the sheet saying which column it means:
+    'TYPE FOR RERA IDW' is that field, and 'TYPE' merely shares a word with one
+    of its aliases. "The field's own configured names" is mapfields (the exact
+    header text an admin typed in to identify the column) as well as
+    displayname — checked in that order, mapfields first, because a company
+    that renamed its displayname to something friendlier ("RERA HEAD") while
+    mapfields still holds the sheet's own header ("TYPE FOR RERA IDW") would
+    never satisfy a displayname-only check and always fall through to the
+    leftmost column regardless of which one was actually right. Failing every
+    exact match, the leftmost wins, which is the older behaviour and the right
+    answer for a transaction-date / value-date pair.
 
     The losing columns are dropped for that field rather than used as a fallback
     on rows where the winner is blank. Filling 'TYPE FOR RERA IDW' with 'IMPS'
@@ -226,8 +234,11 @@ def _resolve_collisions(header_cells: list, col_mapping: dict,
             owner[fieldname] = cols[0]
             continue
 
-        wanted = _norm_header(display_by_field.get(fieldname, ""))
-        exact = [c for c in cols if wanted and _norm_header(title(c)) == wanted]
+        wanted_aliases = (aliases_by_field or {}).get(fieldname, set())
+        exact = [c for c in cols if _norm_header(title(c)) in wanted_aliases]
+        if not exact:
+            wanted = _norm_header(display_by_field.get(fieldname, ""))
+            exact = [c for c in cols if wanted and _norm_header(title(c)) == wanted]
         win = exact[0] if exact else cols[0]
         owner[fieldname] = win
 
@@ -245,7 +256,8 @@ def _resolve_collisions(header_cells: list, col_mapping: dict,
 
 def _assemble_tabular_rows(grid: list, header_idx: int, col_mapping: dict,
                            date_cols: set,
-                           display_by_field: dict | None = None) -> tuple[list, list, dict]:
+                           display_by_field: dict | None = None,
+                           aliases_by_field: dict | None = None) -> tuple[list, list, dict]:
     """One grid row in, one record out. Returns (records, collisions, owner).
 
     No continuation merging, ever. That is the difference between this and the
@@ -256,7 +268,7 @@ def _assemble_tabular_rows(grid: list, header_idx: int, col_mapping: dict,
     """
     header_cells = grid[header_idx] if 0 <= header_idx < len(grid) else []
     owner, collisions = _resolve_collisions(
-        header_cells, col_mapping, display_by_field or {}, date_cols
+        header_cells, col_mapping, display_by_field or {}, date_cols, aliases_by_field
     )
     # Only the winning column of each field is read at all.
     effective = {col_idx: fn for fn, col_idx in owner.items()}
@@ -303,6 +315,36 @@ def _display_names(fieldmap_rows: list) -> dict:
         for r in (fieldmap_rows or [])
         if r.get("fieldname")
     }
+
+
+def _field_aliases(fieldmap_rows: list) -> dict:
+    """{fieldname: {normalized header strings that name it}} for collision
+    tie-breaking -- every comma-separated mapfields alias plus the display
+    name, normalized the same way column titles are.
+
+    mapfields is what actually identifies a column: a company that renamed a
+    field's displayname to something friendlier ("RERA HEAD") while mapfields
+    still holds the sheet's own header text ("TYPE FOR RERA IDW") would never
+    exact-match on displayname alone, so _resolve_collisions fell through to
+    "leftmost wins" and silently picked a same-category column that only
+    shares a word with the real one (see its docstring's TYPE / TYPE FOR RERA
+    IDW example) -- correct on some sheets and wrong on others depending on
+    which one happened to sit further left.
+    """
+    out: dict[str, set] = {}
+    for r in fieldmap_rows or []:
+        fieldname = r.get("fieldname")
+        if not fieldname:
+            continue
+        names = out.setdefault(fieldname, set())
+        for alias in (r.get("mapfields", "") or "").split(","):
+            norm = _norm_header(alias)
+            if norm:
+                names.add(norm)
+        norm = _norm_header(r.get("displayname", "") or "")
+        if norm:
+            names.add(norm)
+    return out
 
 
 def analyse_sheet(name: str, grid: list, alias_map: dict, col_types: dict,
@@ -358,7 +400,8 @@ def analyse_sheet(name: str, grid: list, alias_map: dict, col_types: dict,
     has_money = bool(cats & {"withdrawal", "deposits", "balance", "amount"})
 
     records, collisions, owner = _assemble_tabular_rows(
-        grid, header_idx, col_mapping, date_cols, _display_names(fieldmap_rows)
+        grid, header_idx, col_mapping, date_cols,
+        _display_names(fieldmap_rows), _field_aliases(fieldmap_rows)
     )
     # Reported from the column that WON, not from whichever the mapping happened
     # to list last. Saying "field_date_1 <- VALUE DATE" when the transaction date
