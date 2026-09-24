@@ -127,22 +127,28 @@ APPS_SCRIPT_SHARED_SECRET = os.getenv("APPS_SCRIPT_SHARED_SECRET", "")
 # should keep working exactly as it does today.
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 
-# --- OTP login (routers/auth.py's POST /auth/otp/*) --------------------------
-# Plain SMTP -- works with a Gmail app password, or any transactional-email
-# provider's SMTP relay (SendGrid, Resend, etc.), so nothing here locks this
-# app to one vendor. Blank SMTP_HOST disables the feature the same way a blank
+# --- Magic-link login (routers/auth.py's POST /auth/otp/*, services/supabase_auth.py) --
+# Supabase Auth (GoTrue) generates the link, emails it through its own
+# default mailer (no SMTP setup needed anywhere in this app) and verifies a
+# click on it over its REST API -- this app sends nothing of its own.
+#
+# SUPABASE_URL is "https://<project-ref>.supabase.co" -- the project-ref is
+# the part of DATABASE_URL's username before the dot
+# (postgresql://postgres.<project-ref>:...), NOT the pooler hostname, so it
+# has to be its own setting rather than derived from DATABASE_URL here.
+# SUPABASE_ANON_KEY is the public "anon" key from Project Settings -> API --
+# safe to expose (it is what a browser's own supabase-js client uses too),
+# but still required explicitly rather than guessed.
+#
+# Blank SUPABASE_URL disables the feature the same way a blank
 # GOOGLE_CLIENT_ID does: a clear 400 from the endpoint, not a startup crash.
-SMTP_HOST = os.getenv("SMTP_HOST", "")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-# Some providers require the From address to be a verified sender distinct
-# from the SMTP login -- kept separate rather than reusing SMTP_USER.
-SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 
-# How long a sent code stays valid, and how soon another one may be sent to
-# the same address -- both short on purpose. A code that works for hours is a
-# password with extra steps; a resend with no cooldown is a free tool for
-# spamming a stranger's inbox by typing their email into the login form.
-OTP_EXPIRE_MINUTES = int(os.getenv("OTP_EXPIRE_MINUTES", "10"))
-OTP_RESEND_COOLDOWN_SECONDS = int(os.getenv("OTP_RESEND_COOLDOWN_SECONDS", "60"))
+# Where the frontend actually lives, e.g. "https://app.yourdomain.com" -- the
+# clicked link has to land back on THIS app's own callback route
+# (FRONTEND_URL + /auth/callback), not on Supabase's own placeholder page.
+# Also has to be added to that project's Authentication -> URL Configuration
+# "Redirect URLs" allow-list in the Supabase dashboard, or Supabase silently
+# ignores it and falls back to whatever its Site URL is set to.
+FRONTEND_URL = os.getenv("FRONTEND_URL", "")

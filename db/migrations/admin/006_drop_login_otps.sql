@@ -1,0 +1,14 @@
+-- =============================================================================
+-- 006_drop_login_otps.sql
+-- Reverses admin.login_otps from 005_email_and_otp.sql.
+--
+-- OTP delivery moved to Supabase Auth's own /auth/v1/otp + /auth/v1/verify
+-- (services/supabase_auth.py) -- Supabase generates, emails and verifies the
+-- code itself, so this app no longer generates, hashes or stores one of its
+-- own. The table admin.users.email stays: it is still how a request is
+-- matched to one of THIS app's accounts, for both Google sign-in and OTP.
+--
+-- Per the migration-runner rule, 005 itself is never edited -- this is the
+-- new file that undoes the one part of it superseded.
+-- =============================================================================
+DROP TABLE IF EXISTS admin.login_otps;

@@ -3,8 +3,8 @@ Authentication routes.
 
 POST /auth/login           —  form-based login → JWT token
 POST /auth/google          —  Google sign-in (an existing account's linked email) → JWT token
-POST /auth/otp/request     —  email a one-time sign-in code
-POST /auth/otp/verify      —  redeem that code → JWT token
+POST /auth/otp/request     —  email a magic sign-in link
+POST /auth/otp/exchange    —  redeem the Supabase session the clicked link left behind → JWT token
 POST /auth/change-password —  the signed-in account changes its own password
 GET  /auth/me              —  validates the current JWT
 
@@ -25,8 +25,7 @@ from jose import JWTError, jwt
 import config
 import permissions
 from database import company_connection
-from services import accounts, otp
-from services.email import EmailNotConfigured
+from services import accounts, supabase_auth
 
 logger = logging.getLogger(__name__)
 
@@ -358,58 +357,68 @@ async def google_login(credential: str = Body(..., embed=True,
 
 @router.post("/otp/request")
 async def request_otp(email: str = Body(..., embed=True)):
-    """Email a 6-digit sign-in code to an account's linked address.
+    """Ask Supabase Auth to email a sign-in link to an account's linked
+    address (see services/supabase_auth.py) -- this app sends nothing itself.
 
     Always answers the same way whether or not the email matches an account
     -- the same reason /auth/login's error never says which of username or
-    password was wrong. A code is only actually sent when it does match one;
-    otherwise this returns instantly and does nothing, so the response time
-    is not itself a tell.
+    password was wrong. A link is only actually requested from Supabase when
+    the email does match one of THIS app's accounts; otherwise this returns
+    instantly and does nothing, so the response time is not itself a tell.
     """
     email = (email or "").strip()
     if not email:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Email is required.")
 
-    generic = {"message": "If an account uses that email, a code has been sent to it."}
+    generic = {"message": "If an account uses that email, a sign-in link has been sent to it."}
 
     async with company_connection("admin") as conn:
         row = await _account_by_email(conn, email)
-        if row is None:
-            return generic
+    if row is None:
+        return generic
 
-        try:
-            await otp.request_code(conn, email)
-        except otp.Cooldown as e:
-            # The one case worth telling the truth about: someone who really
-            # does own this account clicking "resend" too fast should be told
-            # to wait, not left wondering if the first code is even coming.
-            raise HTTPException(
-                status.HTTP_429_TOO_MANY_REQUESTS,
-                f"A code was already sent. Wait {e.seconds_left}s before requesting another.",
-            )
-        except EmailNotConfigured as e:
-            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(e))
+    try:
+        await supabase_auth.send_link(email)
+    except supabase_auth.SupabaseAuthNotConfigured as e:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(e))
+    except supabase_auth.SupabaseAuthError as e:
+        # Supabase's own rate-limit message ("you can only request this once
+        # every 60 seconds") is already a fine thing to show as-is -- the one
+        # case worth telling the truth about, the same reasoning a self-hosted
+        # cooldown would have had.
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(e))
 
     return generic
 
 
-@router.post("/otp/verify")
-async def verify_otp(email: str = Body(..., embed=True), code: str = Body(..., embed=True)):
-    """Redeem a code /auth/otp/request sent, for a JWT -- the OTP equivalent
-    of /auth/login's password check.
+@router.post("/otp/exchange")
+async def exchange_magic_link(access_token: str = Body(..., embed=True)):
+    """Redeem the Supabase session a clicked magic link left in the browser's
+    URL (see MagicCallbackPage.jsx), for a JWT of this app's own -- the link
+    equivalent of /auth/login's password check.
+
+    access_token is a Supabase session token, not this app's own -- it proves
+    only that Supabase's mailer delivered a link to this address and someone
+    clicked it, resolved here to the email Supabase says it belongs to and
+    then matched against THIS app's own accounts, same two-step
+    verify-then-match shape google_login uses for a Google ID token.
     """
-    email = (email or "").strip()
+    try:
+        email = await supabase_auth.email_for_access_token(access_token)
+    except supabase_auth.SupabaseAuthNotConfigured as e:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(e))
+    except supabase_auth.SupabaseAuthError as e:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(e))
 
     async with company_connection("admin") as conn:
         row = await _account_by_email(conn, email)
-        # Checked even when there is no matching account, so the timing and
-        # shape of a wrong-code response cannot be told apart from a
-        # no-such-account one -- otherwise "invalid code" vs "wrong or
-        # expired code" would itself leak which emails are registered.
-        ok = await otp.verify_code(conn, email, code)
 
-    if row is None or not ok:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Wrong or expired code.")
+    if row is None:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            f"No account here is linked to {email}. Ask your admin to add "
+            f"this email to your account on the Users page first.",
+        )
 
     return _issue_token(row)
 
