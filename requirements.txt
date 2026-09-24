@@ -27,6 +27,12 @@ google-api-python-client==2.200.0
 google-auth-httplib2==0.4.2
 google-auth-oauthlib==1.4.1
 
+# --- Google sign-in (routers/auth.py's POST /auth/google) --------------------
+# Verifies the ID token Google Identity Services hands the frontend. Already
+# installed transitively by the two Drive packages above, but named directly
+# now that routers/auth.py imports it itself.
+google-auth==2.58.0
+
 # --- Drive settings sync (routers/imports.py PUT /imports/drive-settings) ----
 # Posts a folder-ID change to the Apps Script's own web app so both sides
 # stay in sync.

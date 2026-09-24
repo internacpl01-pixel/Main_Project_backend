@@ -10,11 +10,19 @@ parameter on every function for that reason, never a default.
 Callers do the hierarchy checks (permissions.can_create / can_edit) before
 calling in; this layer only enforces what the database itself guarantees.
 """
+import re
+
 import bcrypt
 
 # Project policy: minimum 4 characters for both username and password.
 MIN_USERNAME_LENGTH = 3
 MIN_PASSWORD_LENGTH = 4
+
+# Deliberately loose -- this only catches a typo like "ravi@" or "ravi.com"
+# before it reaches the database. Whether the address actually exists is
+# never checked here; Google's own verified-email claim or a delivered OTP
+# code is what actually proves that, later, at sign-in time.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 class AccountError(Exception):
@@ -101,11 +109,25 @@ def validate_password(password: str) -> str:
     return password
 
 
+def validate_email(email: str | None) -> str | None:
+    """None/blank means "leave unset" -- unlike username/password, an email is
+    optional (Google sign-in and OTP login are opt-in, per account), so this
+    is the one field callers may legitimately want cleared rather than always
+    required.
+    """
+    email = (email or "").strip()
+    if not email:
+        return None
+    if not _EMAIL_RE.match(email):
+        raise AccountError(f"'{email}' does not look like a valid email address.")
+    return email
+
+
 async def list_accounts(conn, company_id: int) -> list[dict]:
     """Every account belonging to one company, most privileged first."""
     rows = await conn.fetch(
         """
-        SELECT id, username, role, is_active, created_at, updated_at
+        SELECT id, username, email, role, is_active, created_at, updated_at
         FROM admin.users
         WHERE company_id = $1
         ORDER BY
@@ -131,7 +153,7 @@ async def get_account(conn, user_id: int, company_id: int) -> dict | None:
     """
     row = await conn.fetchrow(
         """
-        SELECT id, username, role, is_active, company_id, created_at, updated_at
+        SELECT id, username, email, role, is_active, company_id, created_at, updated_at
         FROM admin.users
         WHERE id = $1 AND company_id = $2
         """,
@@ -141,40 +163,70 @@ async def get_account(conn, user_id: int, company_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-async def create_account(conn, *, username: str, password: str, role: str, company_id: int) -> dict:
+async def _assert_email_free(conn, email: str, exclude_id: int | None = None) -> None:
+    clause = "lower(email) = lower($1)"
+    params = [email]
+    if exclude_id is not None:
+        clause += " AND id <> $2"
+        params.append(exclude_id)
+    taken = await conn.fetchval(f"SELECT 1 FROM admin.users WHERE {clause}", *params)
+    if taken:
+        raise AccountError(
+            f"'{email}' is already linked to another account. Each email can "
+            f"sign in as only one account."
+        )
+
+
+async def create_account(
+    conn, *, username: str, password: str, role: str, company_id: int,
+    email: str | None = None,
+) -> dict:
     """
     Create one company account. Raises AccountError on bad input or a taken name.
 
     Usernames are unique across the whole install, not per company — login
     resolves a user from the username alone, before any company is known.
+
+    email is optional (Google sign-in and OTP login are opt-in per account) --
+    a blank value leaves the account reachable by username+password only,
+    exactly as every account was before this feature existed.
     """
     username = validate_username(username)
     username = await enforce_code_prefix(conn, username, company_id)
     password = validate_password(password)
+    email = validate_email(email)
 
     taken = await conn.fetchval("SELECT 1 FROM admin.users WHERE lower(username) = lower($1)", username)
     if taken:
         raise AccountError(f"Username '{username}' is already taken.")
+    if email is not None:
+        await _assert_email_free(conn, email)
 
     row = await conn.fetchrow(
         """
-        INSERT INTO admin.users (username, password_hash, role, company_id)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id, username, role, is_active, created_at, updated_at
+        INSERT INTO admin.users (username, password_hash, role, company_id, email)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, username, email, role, is_active, created_at, updated_at
         """,
         username,
         hash_password(password),
         role,
         company_id,
+        email,
     )
     return dict(row)
 
 
 async def update_account(
-    conn, user_id: int, company_id: int, *, username: str | None = None, password: str | None = None
+    conn, user_id: int, company_id: int, *, username: str | None = None,
+    password: str | None = None, email: str | None = None,
 ) -> dict | None:
     """
-    Change a username, a password, or both. Fields left None are untouched.
+    Change a username, a password, and/or the linked email. Fields left None
+    (omitted from the request) are untouched. An email explicitly sent as an
+    empty string clears it -- distinct from omitting it -- which is how the
+    Users page's "remove this email" turns Google sign-in and OTP back off
+    for one account without touching its username or password.
     Returns None if no such account in this company.
     """
     sets = []
@@ -200,8 +252,15 @@ async def update_account(
         sets.append(f"password_hash = ${len(params) + 1}")
         params.append(hash_password(password))
 
+    if email is not None:
+        validated = validate_email(email)
+        if validated is not None:
+            await _assert_email_free(conn, validated, exclude_id=user_id)
+        sets.append(f"email = ${len(params) + 1}")
+        params.append(validated)
+
     if not sets:
-        raise AccountError("Provide a username or a password to update.")
+        raise AccountError("Provide a username, a password or an email to update.")
 
     params.extend([user_id, company_id])
     row = await conn.fetchrow(
@@ -209,7 +268,7 @@ async def update_account(
         UPDATE admin.users
         SET {", ".join(sets)}
         WHERE id = ${len(params) - 1} AND company_id = ${len(params)}
-        RETURNING id, username, role, is_active, created_at, updated_at
+        RETURNING id, username, email, role, is_active, created_at, updated_at
         """,
         *params,
     )

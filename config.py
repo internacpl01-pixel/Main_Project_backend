@@ -112,3 +112,37 @@ DRIVE_TOKEN_PATH = os.getenv("DRIVE_TOKEN_PATH", "credentials/drive_token.json")
 # server-to-server call at all.
 APPS_SCRIPT_WEB_APP_URL = os.getenv("APPS_SCRIPT_WEB_APP_URL", "")
 APPS_SCRIPT_SHARED_SECRET = os.getenv("APPS_SCRIPT_SHARED_SECRET", "")
+
+# --- Google sign-in (routers/auth.py's POST /auth/google) -------------------
+# The OAuth Client ID from Google Cloud Console (Credentials -> OAuth client
+# ID -> Web application), same project the Drive import already uses or a new
+# one -- this is a DIFFERENT client from DRIVE_CREDENTIALS_PATH's, since that
+# one is a Desktop-app client used server-side for the one-time Drive consent,
+# while this is a Web client whose id is public (it goes into the frontend
+# bundle so Google Identity Services' button can initialize) and only ever
+# used to check WHO the frontend's sign-in button says signed in, never to
+# access anything on the user's behalf. Blank disables the feature outright --
+# routers.auth.google_login 400s with a plain "not configured" rather than
+# crashing the whole app at startup, since a company that never sets this up
+# should keep working exactly as it does today.
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+
+# --- OTP login (routers/auth.py's POST /auth/otp/*) --------------------------
+# Plain SMTP -- works with a Gmail app password, or any transactional-email
+# provider's SMTP relay (SendGrid, Resend, etc.), so nothing here locks this
+# app to one vendor. Blank SMTP_HOST disables the feature the same way a blank
+# GOOGLE_CLIENT_ID does: a clear 400 from the endpoint, not a startup crash.
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+# Some providers require the From address to be a verified sender distinct
+# from the SMTP login -- kept separate rather than reusing SMTP_USER.
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
+
+# How long a sent code stays valid, and how soon another one may be sent to
+# the same address -- both short on purpose. A code that works for hours is a
+# password with extra steps; a resend with no cooldown is a free tool for
+# spamming a stranger's inbox by typing their email into the login form.
+OTP_EXPIRE_MINUTES = int(os.getenv("OTP_EXPIRE_MINUTES", "10"))
+OTP_RESEND_COOLDOWN_SECONDS = int(os.getenv("OTP_RESEND_COOLDOWN_SECONDS", "60"))

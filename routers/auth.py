@@ -2,6 +2,9 @@
 Authentication routes.
 
 POST /auth/login           —  form-based login → JWT token
+POST /auth/google          —  Google sign-in (an existing account's linked email) → JWT token
+POST /auth/otp/request     —  email a one-time sign-in code
+POST /auth/otp/verify      —  redeem that code → JWT token
 POST /auth/change-password —  the signed-in account changes its own password
 GET  /auth/me              —  validates the current JWT
 
@@ -10,16 +13,22 @@ get_current_user, get_current_schema, get_current_company_id and require_level.
 They live here because they all decode the same token; the role hierarchy they
 compare against is defined once in permissions.py.
 """
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Body, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token as google_id_token
 from jose import JWTError, jwt
 
 import config
 import permissions
 from database import company_connection
-from services import accounts
+from services import accounts, otp
+from services.email import EmailNotConfigured
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -179,6 +188,42 @@ def require_level(required_level: int):
     return checker
 
 
+def _issue_token(row) -> dict:
+    """The one place a users row becomes a JWT -- password login, Google
+    sign-in and OTP login all end here, so the token any of the three hands
+    back means exactly the same thing regardless of which door was used.
+
+    schema_name = 'admin' for super_admin (company_id NULL), or the
+    company's own schema otherwise.
+    """
+    schema = row["schema_name"] if row["company_id"] is not None else "admin"
+
+    payload = {
+        "sub": row["username"],
+        "uid": row["id"],
+        "role": row["role"],
+        "company_id": row["company_id"],
+        "schema": schema,
+        "exp": datetime.now(timezone.utc)
+        .timestamp() + config.JWT_EXPIRE_MINUTES * 60,
+    }
+
+    token = jwt.encode(payload, config.JWT_SECRET, algorithm=config.JWT_ALGORITHM)
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "role": row["role"],
+        "level": permissions.level_of(row["role"]),
+        "schema": schema,
+    }
+
+
+_ACCOUNT_COLUMNS = """
+    u.id, u.username, u.password_hash, u.role, u.company_id, c.schema_name
+"""
+
+
 @router.post("/login")
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     """
@@ -208,9 +253,8 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     # this matches at most one row and keeps the lookup off a sequential scan.
     async with company_connection("admin") as conn:
         row = await conn.fetchrow(
-            """
-            SELECT u.id, u.username, u.password_hash, u.role,
-                   u.company_id, c.schema_name
+            f"""
+            SELECT {_ACCOUNT_COLUMNS}
             FROM admin.users u
             LEFT JOIN admin.companies c ON c.id = u.company_id
             WHERE lower(u.username) = lower($1) AND u.is_active = true
@@ -231,29 +275,143 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
             detail="Wrong username or password.",
         )
 
-    # Build the JWT. schema_name = 'admin' for super_admin, or the
-    # company's schema for company users.
-    schema = row["schema_name"] if row["company_id"] is not None else "admin"
+    return _issue_token(row)
 
-    payload = {
-        "sub": row["username"],
-        "uid": row["id"],
-        "role": row["role"],
-        "company_id": row["company_id"],
-        "schema": schema,
-        "exp": datetime.now(timezone.utc)
-        .timestamp() + config.JWT_EXPIRE_MINUTES * 60,
-    }
 
-    token = jwt.encode(payload, config.JWT_SECRET, algorithm=config.JWT_ALGORITHM)
+async def _account_by_email(conn, email: str):
+    """The one active account this email is linked to, or None.
 
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "role": row["role"],
-        "level": permissions.level_of(row["role"]),
-        "schema": schema,
-    }
+    lower(email), matching the unique index admin/005 adds -- 'Ravi@x.com' and
+    'ravi@x.com' are the same inbox, so a Google account or a typed-in address
+    that differs only by case must still find the row an admin set up.
+    """
+    return await conn.fetchrow(
+        f"""
+        SELECT {_ACCOUNT_COLUMNS}
+        FROM admin.users u
+        LEFT JOIN admin.companies c ON c.id = u.company_id
+        WHERE lower(u.email) = lower($1) AND u.is_active = true
+        """,
+        email,
+    )
+
+
+@router.post("/google")
+async def google_login(credential: str = Body(..., embed=True,
+                                              description="The ID token Google Identity Services returned to the browser.")):
+    """Sign in with an already-linked Google account.
+
+    There is no self-signup here (see routers/users.py) -- an admin creates
+    every account and is the one who fills in its email from the Users page.
+    So this never creates an account; it only accepts Google's word for an
+    email address and looks up whichever account already carries it. No
+    account with that email, or the account is deactivated, gets the same
+    plain refusal a stranger typing a random email would get -- confirmed
+    with the user: "ask your admin", not a new account made on the spot.
+
+    The credential is verified against GOOGLE_CLIENT_ID server-side
+    (google-auth's own id_token.verify_oauth2_token, which checks the
+    signature, expiry and audience) -- never trusted just because the browser
+    sent it, the same reason a password is checked here and not on the
+    frontend.
+    """
+    if not config.GOOGLE_CLIENT_ID:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Google sign-in is not set up on this server yet.",
+        )
+
+    try:
+        claims = google_id_token.verify_oauth2_token(
+            credential, google_requests.Request(), config.GOOGLE_CLIENT_ID,
+        )
+    except ValueError as e:
+        # Expired, malformed, wrong audience, bad signature -- every one of
+        # google-auth's own failure modes for a token that is not what it
+        # claims to be. Logged, not shown: the sentence differs by exactly
+        # which check failed, and none of those reasons are this user's to see.
+        logger.info("[auth] Google sign-in token rejected: %s", e)
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "Could not verify that Google sign-in.")
+
+    if not claims.get("email_verified", False):
+        # Google itself is unsure this address belongs to whoever is signing
+        # in -- treated the same as no email at all rather than trusted anyway.
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "That Google account's email is not verified.",
+        )
+
+    email = claims["email"]
+    async with company_connection("admin") as conn:
+        row = await _account_by_email(conn, email)
+
+    if row is None:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            f"No account here is linked to {email}. Ask your admin to add "
+            f"this email to your account on the Users page first.",
+        )
+
+    return _issue_token(row)
+
+
+@router.post("/otp/request")
+async def request_otp(email: str = Body(..., embed=True)):
+    """Email a 6-digit sign-in code to an account's linked address.
+
+    Always answers the same way whether or not the email matches an account
+    -- the same reason /auth/login's error never says which of username or
+    password was wrong. A code is only actually sent when it does match one;
+    otherwise this returns instantly and does nothing, so the response time
+    is not itself a tell.
+    """
+    email = (email or "").strip()
+    if not email:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Email is required.")
+
+    generic = {"message": "If an account uses that email, a code has been sent to it."}
+
+    async with company_connection("admin") as conn:
+        row = await _account_by_email(conn, email)
+        if row is None:
+            return generic
+
+        try:
+            await otp.request_code(conn, email)
+        except otp.Cooldown as e:
+            # The one case worth telling the truth about: someone who really
+            # does own this account clicking "resend" too fast should be told
+            # to wait, not left wondering if the first code is even coming.
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                f"A code was already sent. Wait {e.seconds_left}s before requesting another.",
+            )
+        except EmailNotConfigured as e:
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(e))
+
+    return generic
+
+
+@router.post("/otp/verify")
+async def verify_otp(email: str = Body(..., embed=True), code: str = Body(..., embed=True)):
+    """Redeem a code /auth/otp/request sent, for a JWT -- the OTP equivalent
+    of /auth/login's password check.
+    """
+    email = (email or "").strip()
+
+    async with company_connection("admin") as conn:
+        row = await _account_by_email(conn, email)
+        # Checked even when there is no matching account, so the timing and
+        # shape of a wrong-code response cannot be told apart from a
+        # no-such-account one -- otherwise "invalid code" vs "wrong or
+        # expired code" would itself leak which emails are registered.
+        ok = await otp.verify_code(conn, email, code)
+
+    if row is None or not ok:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Wrong or expired code.")
+
+    return _issue_token(row)
 
 
 @router.get("/me")

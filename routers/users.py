@@ -97,6 +97,7 @@ async def create_user(
     username: str = Body(...),
     password: str = Body(...),
     role: str = Body(..., description="staff | manager | company_admin"),
+    email: str = Body(None, description="Optional — lets this account use Google sign-in or an OTP code instead of a password."),
     actor: dict = Depends(require_level(permissions.MANAGER)),
     company_id: int = Depends(get_current_company_id),
 ):
@@ -126,7 +127,8 @@ async def create_user(
     async with company_connection("admin") as conn:
         try:
             row = await accounts.create_account(
-                conn, username=username, password=password, role=role, company_id=company_id
+                conn, username=username, password=password, role=role,
+                company_id=company_id, email=email,
             )
         except accounts.AccountError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -139,16 +141,18 @@ async def update_user(
     user_id: int,
     username: str = Body(None, description="New username"),
     password: str = Body(None, description="New password"),
+    email: str = Body(None, description="New linked email, or \"\" to remove it. Omit to leave unchanged."),
     actor: dict = Depends(require_level(permissions.MANAGER)),
     company_id: int = Depends(get_current_company_id),
 ):
     """
-    Change an account's username, password, or both. Omitted fields are left alone.
+    Change an account's username, password, and/or linked email. Omitted
+    fields are left alone.
     """
-    if username is None and password is None:
+    if username is None and password is None and email is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Provide a username or a password to update.",
+            detail="Provide a username, a password or an email to update.",
         )
 
     async with company_connection("admin") as conn:
@@ -157,7 +161,8 @@ async def update_user(
 
         try:
             row = await accounts.update_account(
-                conn, user_id, company_id, username=username, password=password
+                conn, user_id, company_id, username=username, password=password,
+                email=email,
             )
         except accounts.AccountError as e:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
