@@ -38,7 +38,8 @@ from services.pdf_import import (PDF_BATCH_PAGES, process_pdf_import,
                                  start_pdf_job)
 from services.drive_log import list_drive_log, log_drive_result
 from services.settings import (get_drive_folder_history, get_drive_folder_id,
-                               get_import_folder_id, get_raw_import_folder_id,
+                               get_import_folder_id, get_raw_drive_folder_id,
+                               get_raw_import_folder_id,
                                record_drive_folder_history, set_drive_folder_id,
                                set_import_folder_id)
 from services.staging import (DuplicateFileError, bulk_bank_lookup,
@@ -485,6 +486,19 @@ async def _verify_folder(folder_id: str) -> str:
             "folder is shared with the Google account this app signs in as.")
 
 
+async def _folder_name_or_none(folder_id: str) -> str | None:
+    """Best-effort name for a folder that is about to become history, not the
+    one being saved. Unlike _verify_folder this never raises -- a folder that
+    used to be current and is now deleted or unshared is still worth
+    remembering by id, and a lookup failure here must not block saving the
+    new one.
+    """
+    try:
+        return await asyncio.to_thread(drive.get_folder_name, folder_id)
+    except Exception:                                  # noqa: BLE001
+        return None
+
+
 @router.post("/drive-folder/verify")
 async def verify_drive_folder(
     url: str = Form(..., description="A Drive folder URL, or a bare folder id"),
@@ -580,15 +594,26 @@ async def update_import_folder(
     Manager+, the same tier as changing the export folder: both decide where
     statements are read from.
     """
+    # The folder about to stop being current -- recorded as history, not the
+    # one being saved, so it shows up as "previously used" the moment it
+    # actually becomes previous rather than one save later.
+    previous_id = await get_raw_import_folder_id(user["schema"])
+
     if not url.strip():
         await set_import_folder_id(user["schema"], None)
+        if previous_id:
+            await record_drive_folder_history(
+                user["schema"], "import", previous_id,
+                await _folder_name_or_none(previous_id), user["username"])
         return {"import_folder_id": None, "folder_name": None}
 
     folder_id = _folder_id_or_400(url)
     name = await _verify_folder(folder_id)
     await set_import_folder_id(user["schema"], folder_id)
-    await record_drive_folder_history(
-        user["schema"], "import", folder_id, name, user["username"])
+    if previous_id and previous_id != folder_id:
+        await record_drive_folder_history(
+            user["schema"], "import", previous_id,
+            await _folder_name_or_none(previous_id), user["username"])
     return {"import_folder_id": folder_id, "folder_name": name}
 
 
@@ -626,6 +651,9 @@ async def update_drive_settings(
     """
     folder_id = _folder_id_or_400(url.strip() or folder_id.strip())
     name = await _verify_folder(folder_id)
+    # The folder about to stop being current -- see update_import_folder's
+    # own note on why this is recorded rather than the one being saved.
+    previous_id = await get_raw_drive_folder_id(user["schema"])
 
     if config.APPS_SCRIPT_WEB_APP_URL:
         try:
@@ -648,8 +676,10 @@ async def update_drive_settings(
                 body.get("error") or "The Apps Script rejected the update.")
 
     await set_drive_folder_id(user["schema"], folder_id)
-    await record_drive_folder_history(
-        user["schema"], "export", folder_id, name, user["username"])
+    if previous_id and previous_id != folder_id:
+        await record_drive_folder_history(
+            user["schema"], "export", previous_id,
+            await _folder_name_or_none(previous_id), user["username"])
     return {"folder_id": folder_id, "export_folder_id": folder_id}
 
 

@@ -26,12 +26,23 @@ import config
 from database import company_connection
 
 
+async def get_raw_drive_folder_id(schema: str) -> str | None:
+    """The export folder AS STORED -- None when nobody has saved one yet and
+    it is still following config.DRIVE_FOLDER_ID.
+
+    Separate from get_drive_folder_id for the same reason
+    get_raw_import_folder_id is separate from get_import_folder_id: a caller
+    that needs to know "is this actually a previous DB value worth
+    remembering" must not have the env-var fallback silently mixed in.
+    """
+    async with company_connection(schema) as conn:
+        return await conn.fetchval(
+            "SELECT folder_id FROM drive_settings WHERE id = 1")
+
+
 async def get_drive_folder_id(schema: str) -> str:
     """The export folder: DB value if saved, else the env var it replaces."""
-    async with company_connection(schema) as conn:
-        value = await conn.fetchval(
-            "SELECT folder_id FROM drive_settings WHERE id = 1")
-    return value or config.DRIVE_FOLDER_ID
+    return await get_raw_drive_folder_id(schema) or config.DRIVE_FOLDER_ID
 
 
 async def set_drive_folder_id(schema: str, folder_id: str) -> None:
