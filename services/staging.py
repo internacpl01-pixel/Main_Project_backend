@@ -51,6 +51,11 @@ _NARRATION_ALIASES = {"narration", "narrations", "remark", "remarks", "note", "n
 # Export Status" button, confirmed with the user. A custom field like the two
 # above, found the same way.
 _EXPORT_STATUS_ALIASES = {"export status", "export_status", "exportstatus"}
+# The unit/flat number and the accountant's own remarks -- two more inputs the
+# "Generate Narration" button reads. "acc remarks" only: "crm remarks" is a
+# separate column this company fills in elsewhere and is never narration input.
+_APT_ALIASES = {"apt", "apt no", "apt#", "apt num", "unit no", "flat no"}
+_ACC_REMARKS_ALIASES = {"acc remarks", "accountant remarks", "account remarks"}
 
 # A fieldmap row names a physical column and that name is interpolated into the
 # UPDATE below -- Postgres has no placeholder for an identifier. The fieldmap is
@@ -125,6 +130,16 @@ async def company_column(conn) -> str | None:
 async def narration_column(conn) -> str | None:
     """The free-text column the row editor lets people type into, or None."""
     return await _resolve_field(conn, _NARRATION_ALIASES)
+
+
+async def apt_column(conn) -> str | None:
+    """The unit/flat number column, or None if this company has no such field."""
+    return await _resolve_field(conn, _APT_ALIASES)
+
+
+async def acc_remarks_column(conn) -> str | None:
+    """The accountant's own remarks column, or None. Distinct from CRM remarks."""
+    return await _resolve_field(conn, _ACC_REMARKS_ALIASES)
 
 
 async def export_status_column(conn) -> str | None:

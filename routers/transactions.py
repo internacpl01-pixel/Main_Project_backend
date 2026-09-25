@@ -8,6 +8,7 @@ DELETE /temp-trans                    — clear the whole staging table
 DELETE /temp-trans/{row_id}           — remove one staged row
 POST   /temp-trans/{row_id}/classify  — tag a raw row with a head
 POST   /temp-trans/{row_id}/finalize  — move a row into the ledger
+POST   /temp-trans/{row_id}/generate-narration — compute (not save) NARRATION text
 
 Both list endpoints are paged and searchable, and both return
 {columns, rows, total, page, limit}. They used to return every row in the table
@@ -24,9 +25,10 @@ from fastapi.responses import StreamingResponse
 
 import permissions
 from database import company_connection
+from import_helpers import fields_by_category
 from routers import master
 from routers.auth import get_company_user, get_current_schema, require_level
-from services import custom_fields, farvision, jobs, rules, scoping, staging
+from services import custom_fields, farvision, jobs, narration, rules, scoping, staging
 
 logger = logging.getLogger(__name__)
 
@@ -2921,6 +2923,82 @@ async def edit_temp_row(
     if updated is None:
         raise HTTPException(404, "Staged row not found.")
     return {"status": "updated", "row_id": row_id, "changed": sorted(payload)}
+
+
+_CUSTOM_FIELD_COLUMN_RE = re.compile(r"^field_(text|num|date)_\d+$")
+
+
+@router.post("/temp-trans/{row_id}/generate-narration")
+async def generate_narration_text(
+    row_id: int,
+    user: dict = Depends(get_company_user),
+):
+    """Compute this row's NARRATION text from its own Description, Reference,
+    Credit/Debit, Business Unit, Head, Type for RERA IDW, Apt# and ACC Remarks
+    -- the same inputs the accountant's Excel formula reads.
+
+    Returns the text; it does not write it. The Imported Rows editor drops the
+    result into the narration textarea, which still has to go through the
+    dialog's own Save so a generated line can be reviewed or hand-edited first,
+    same as anything typed there directly.
+    """
+    async with company_connection(user["schema"]) as conn:
+        scope = await scoping.visible_project_ids(conn, user)
+
+        fieldmap_rows = [dict(r) for r in await conn.fetch(
+            "SELECT fieldname, displayname, mapfields FROM fieldmap WHERE is_active = true"
+        )]
+        cats = fields_by_category(fieldmap_rows)
+        editable = await _editable_columns(conn)
+
+        wanted = {
+            "description": cats.get("description"),
+            "reference_no": cats.get("reference_no"),
+            "deposits": cats.get("deposits"),
+            "business_unit": (editable.get("project") or {}).get("column"),
+            "head": (editable.get("head") or {}).get("column"),
+            "type_rera_idw": (editable.get("rera_head") or {}).get("column"),
+            "apt": await staging.apt_column(conn),
+            "remarks": await staging.acc_remarks_column(conn),
+        }
+        # Only ever field_text_N / field_num_N / field_date_N -- the same guard
+        # _editable_columns applies to its own mirrors, applied here too since
+        # these column names are about to be interpolated into a SELECT.
+        wanted = {
+            key: col for key, col in wanted.items()
+            if col and _CUSTOM_FIELD_COLUMN_RE.match(col)
+        }
+        if not wanted:
+            raise HTTPException(
+                400, "This company has none of the columns narration needs."
+            )
+
+        select_cols = sorted(set(wanted.values()))
+        row = await conn.fetchrow(
+            f"SELECT id, project_id, {', '.join(select_cols)} "
+            f"FROM temp_trans WHERE id = $1",
+            row_id,
+        )
+        if row is None or not scoping.can_use_project(scope, row["project_id"]):
+            raise HTTPException(404, "Staged row not found.")
+
+        row = dict(row)
+        deposits_col = wanted.get("deposits")
+        deposits = row.get(deposits_col) if deposits_col else None
+        is_credit = deposits is not None and float(deposits) > 0
+
+        text = narration.build_narration(
+            description=row.get(wanted.get("description")),
+            reference_no=row.get(wanted.get("reference_no")),
+            is_credit=is_credit,
+            business_unit=row.get(wanted.get("business_unit")),
+            head=row.get(wanted.get("head")),
+            type_rera_idw=row.get(wanted.get("type_rera_idw")),
+            apt=row.get(wanted.get("apt")),
+            remarks=row.get(wanted.get("remarks")),
+        )
+
+    return {"narration": text}
 
 
 @router.post("/temp-trans/lock-all")
