@@ -73,18 +73,19 @@ def build_narration(
     apt: str | None,
     remarks: str | None,
 ) -> str:
-    """The NARRATION text for one row, or the formula's own placeholder when
-    Remarks is blank -- exactly what the spreadsheet showed in that case,
-    rather than a different message invented here."""
-    if _blank(remarks):
-        return "Remarks Compulsory For Narration"
+    """The NARRATION text for one row.
 
+    The spreadsheet formula refused to produce anything when Remarks was
+    blank ("Remarks Compulsory For Narration"). Dropped here per the user --
+    a blank Remarks just flows through as an empty string wherever the
+    formula would have used it, same as any other blank input field.
+    """
     description = description or ""
     ref = "N/A" if _blank(reference_no) else str(reference_no)
     bu = business_unit or ""
     head = head or ""
     type_ = type_rera_idw or ""
-    remarks = str(remarks)
+    remarks = "" if _blank(remarks) else str(remarks)
     apt_suffix = "" if _blank(apt) else f" | Apt: {apt}"
 
     if head.strip().lower() == "internal":
