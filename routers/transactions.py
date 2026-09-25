@@ -2134,7 +2134,11 @@ async def _judged_rows(conn, user: dict, ctx: dict) -> list[dict]:
     expected, allowed_ids = ctx["expected"], ctx["allowed_ids"]
     conditions, fields, columns = ctx["conditions"], ctx["fields"], ctx["columns"]
 
-    filters = ["1=1"]
+    # Same exclusion _temp_filters applies (see its own comment): a row
+    # already posted to the ledger is not one Imported Rows shows any more,
+    # so Check Rules must not judge it either -- a rule "broken" by a row
+    # nobody can act on any more is a false alarm, not a finding.
+    filters = ["1=1", "NOT EXISTS (SELECT 1 FROM transactions tr WHERE tr.temp_trans_id = t.id)"]
     params: list = []
     idx = 1
 
