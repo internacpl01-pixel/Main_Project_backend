@@ -1080,11 +1080,19 @@ async def _clean_narration_rule(conn, account_type, direction, tests,
     if (from_clean is None) != (to_clean is None):
         raise HTTPException(
             400, "From and To go together — fill both, or leave both blank "
-                 "if this rule only sets Purpose.")
-    if from_clean is None and purpose_clean is None:
+                 "if this rule sets Purpose instead.")
+    leg_pair_set = from_clean is not None and to_clean is not None
+    # Exactly one THEN, not "at least one": which branch a row falls into
+    # decides which one could ever be read, so a rule setting both is asking
+    # a question that never has a single answer.
+    if leg_pair_set and purpose_clean is not None:
         raise HTTPException(
-            400, "A narration rule needs at least one answer — From/To, "
-                 "Purpose, or both — for when its test passes.")
+            400, "A narration rule sets From/To or Purpose, not both — they "
+                 "answer different rows. Write a second rule for the other.")
+    if not leg_pair_set and purpose_clean is None:
+        raise HTTPException(
+            400, "A narration rule needs an answer — From/To or Purpose — "
+                 "for when its test passes.")
 
     return {"account_type": wanted_type, "direction": wanted_dir,
             "tests": clean_tests, "from_label": from_clean,
