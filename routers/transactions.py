@@ -1178,7 +1178,17 @@ async def _temp_filters(
     Returns (where, params, columns, search_term, next_placeholder). The last is
     the number the caller's own LIMIT/OFFSET continues from.
     """
-    filters = ["1=1"]
+    # A posted row moves to the Ledger page, not literally out of temp_trans:
+    # transactions.temp_trans_id is ON DELETE RESTRICT precisely so the link
+    # back to the original import can never be dropped (Clear All and the
+    # per-row delete both depend on it surviving to detect "already posted"
+    # and refuse). So a row that has been sent to the ledger is still a row
+    # in this table, and every consumer of this filter set -- the list,
+    # Lock/Unlock all, Generate Narration, Reset Export Status -- has to
+    # exclude it the same way, or "all" stops meaning what the docstring
+    # above promises: a bulk action counting rows the list itself hides is
+    # counting rows nobody asked it to touch.
+    filters = ["1=1", "NOT EXISTS (SELECT 1 FROM transactions tr WHERE tr.temp_trans_id = t.id)"]
     params: list = []
     idx = 1
 
@@ -1338,16 +1348,8 @@ async def list_temp_trans(
             date_from=date_from, date_to=date_to, account=account,
             company=company, search=search, rule_conflicts=rule_conflicts,
         )
-        # A posted row moves to the Ledger page, not literally out of
-        # temp_trans: transactions.temp_trans_id is ON DELETE RESTRICT
-        # precisely so the link back to the original import can never be
-        # dropped -- Clear All and the per-row delete both depend on that
-        # link surviving to detect "already posted" and refuse (see
-        # clear_temp_trans and delete_temp_row). Hiding it here rather than
-        # deleting it is what makes Send to Ledger read as a move from the
-        # user's side without breaking that guarantee.
-        where = (f"({where}) AND NOT EXISTS ("
-                f"SELECT 1 FROM transactions tr WHERE tr.temp_trans_id = t.id)")
+        # The already-posted exclusion now lives in _temp_filters itself, so
+        # every consumer agrees on it -- see that function's own comment.
         # The data columns are read from the live table, not written out here.
         # A custom field is a real column on temp_trans, and a fixed SELECT is
         # why one could be created, matched during parsing and stored, and still
@@ -1990,6 +1992,11 @@ async def temp_trans_filter_options(user: dict = Depends(get_company_user)):
             where = "t.project_id IS NULL"
         else:
             where = "1=1"
+        # Same exclusion _temp_filters applies: a row already posted to the
+        # ledger is not one of these dropdowns' business to count or offer --
+        # see _temp_filters' own comment for why.
+        where = (f"({where}) AND NOT EXISTS ("
+                f"SELECT 1 FROM transactions tr WHERE tr.temp_trans_id = t.id)")
         return await _filter_options(conn, "temp_trans", where, params)
 
 
