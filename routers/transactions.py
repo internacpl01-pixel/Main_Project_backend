@@ -2977,7 +2977,7 @@ def _row_narration(row: dict, wanted: dict, override: dict | None = None) -> str
         type_rera_idw=row.get(wanted.get("type_rera_idw")),
         apt=row.get(wanted.get("apt")),
         remarks=row.get(wanted.get("remarks")),
-        internal_transfer_override=override,
+        override=override,
     )
 
 
@@ -3007,16 +3007,20 @@ async def _account_type_select(conn) -> tuple[str, str]:
     return "bm.account_type AS _account_type", join
 
 
-async def _internal_transfer_overrides(conn, rows: list[dict], wanted: dict) -> dict[int, dict]:
-    """{row id: {from_label, to_label}} for rows an active Narration Rule
-    overrides -- see company/052_narration_rule.sql.
+async def _narration_overrides(conn, rows: list[dict], wanted: dict) -> dict[int, dict]:
+    """{row id: {from_label?, to_label?, purpose_label?}} for rows an active
+    Narration Rule overrides -- see company/052_narration_rule.sql and
+    company/053_narration_rule_purpose.sql.
 
-    Only ever consulted for rows the Internal Transfer branch would otherwise
-    have to guess a "(From X to Y)" for: Head == Internal, at least 3 dashes
-    in the Description, and an account type resolved for the row (from
+    Only ever consulted for rows build_narration would otherwise have to
+    guess a "(From X to Y)" leg or a "Purpose: ..." for -- Head == Internal
+    with at least 3 dashes in the Description (the From/To slot), or Head !=
+    Internal and not a Customer Collection credit (the Purpose slot) -- and
+    only when an account type resolved for the row (from
     _account_type_select). Everything else is untouched -- a company with no
-    narration rules at all, or a row outside this one branch, always falls
-    back to build_narration's own extraction, exactly as before this existed.
+    narration rules at all, or a row in neither slot (Internal with < 3
+    dashes, or a Customer Collection credit), always falls back to
+    build_narration's own guess, exactly as before this existed.
 
     Rules are loaded per (account_type, direction) pair actually present
     among candidate rows -- realistically a handful of queries even across a
@@ -3027,17 +3031,24 @@ async def _internal_transfer_overrides(conn, rows: list[dict], wanted: dict) -> 
     for every other row in the batch.
     """
     desc_col, head_col = wanted.get("description"), wanted.get("head")
+    type_col = wanted.get("type_rera_idw")
     if not desc_col or not head_col:
         return {}
 
     candidates = []
     for r in rows:
         head = (r.get(head_col) or "").strip().lower()
-        desc = r.get(desc_col) or ""
         acct_type = (r.get("_account_type") or "").strip().upper()
         direction = r.get("credit_debit")
-        if (head == "internal" and desc.count("-") >= 3
-                and acct_type and direction in rules.DIRECTIONS):
+        if not (acct_type and direction in rules.DIRECTIONS):
+            continue
+        if head == "internal":
+            desc = r.get(desc_col) or ""
+            overridable = desc.count("-") >= 3
+        else:
+            type_ = (r.get(type_col) or "").strip().lower() if type_col else ""
+            overridable = not (direction == "CR" and type_ == "customer collection")
+        if overridable:
             candidates.append((r["id"], acct_type, direction))
     if not candidates:
         return {}
@@ -3110,7 +3121,7 @@ async def generate_narration_text(
             raise HTTPException(404, "Staged row not found.")
 
         row = dict(row)
-        overrides = await _internal_transfer_overrides(conn, [row], wanted)
+        overrides = await _narration_overrides(conn, [row], wanted)
         text = _row_narration(row, wanted, overrides.get(row["id"]))
 
     return {"narration": text}
@@ -3165,7 +3176,7 @@ async def generate_narration_bulk(
             *params,
         )]
 
-        overrides = await _internal_transfer_overrides(conn, rows, wanted)
+        overrides = await _narration_overrides(conn, rows, wanted)
 
         matched = len(rows)
         skipped_locked = sum(1 for r in rows if r["is_locked"])

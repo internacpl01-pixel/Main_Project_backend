@@ -1001,10 +1001,12 @@ async def list_narration_rules(user: dict = Depends(get_company_user)):
 
 
 async def _clean_narration_rule(conn, account_type, direction, tests,
-                                from_label, to_label) -> dict:
+                                from_label, to_label, purpose_label) -> dict:
     """Check a narration rule against the live account types and columns, or
     400 saying why. Same checks `_clean` makes on a condition's WHEN half;
-    the THEN half is two non-empty strings instead of a head list.
+    the THEN half is From/To, Purpose, or both instead of a head list --
+    From and To go together (a blank either side is not printable), Purpose
+    is independent, and at least one of the two THENs must be given.
     """
     wanted_type = (account_type or "").strip().upper()
     if not wanted_type:
@@ -1071,16 +1073,23 @@ async def _clean_narration_rule(conn, account_type, direction, tests,
             "value1": v1, "value2": v2, "combinator": combinator,
         })
 
-    from_clean = (from_label or "").strip()
-    to_clean = (to_label or "").strip()
-    if not from_clean or not to_clean:
+    from_clean = (from_label or "").strip() or None
+    to_clean = (to_label or "").strip() or None
+    purpose_clean = (purpose_label or "").strip() or None
+
+    if (from_clean is None) != (to_clean is None):
         raise HTTPException(
-            400, "Both From and To need text — they are what the "
-                 "parenthetical shows when this rule matches.")
+            400, "From and To go together — fill both, or leave both blank "
+                 "if this rule only sets Purpose.")
+    if from_clean is None and purpose_clean is None:
+        raise HTTPException(
+            400, "A narration rule needs at least one answer — From/To, "
+                 "Purpose, or both — for when its test passes.")
 
     return {"account_type": wanted_type, "direction": wanted_dir,
             "tests": clean_tests, "from_label": from_clean,
-            "to_label": to_clean, "columns": columns}
+            "to_label": to_clean, "purpose_label": purpose_clean,
+            "columns": columns}
 
 
 async def _write_narration_rule_tests(conn, rule_id: int, tests: list[dict]) -> None:
@@ -1108,10 +1117,17 @@ async def create_narration_rule(
     tests: list[dict] = Body(..., description="One or more {subject_field, "
                                               "operator, value1, value2, "
                                               "combinator}."),
-    from_label: str = Body(..., description="The leg leaving the account "
+    from_label: str = Body(None, description="The leg leaving the account "
                                             "when this rule matches a DR "
-                                            "row, or arriving when CR."),
-    to_label: str = Body(..., description="The other leg."),
+                                            "row, or arriving when CR. Goes "
+                                            "with to_label -- both or "
+                                            "neither."),
+    to_label: str = Body(None, description="The other leg."),
+    purpose_label: str = Body(None, description="Overrides the Purpose "
+                                                "shown on a Receipt Credit "
+                                                "or Payment Disbursement "
+                                                "line. Independent of "
+                                                "From/To."),
     is_active: bool = Body(True),
     user: dict = Depends(get_company_user),
 ):
@@ -1121,7 +1137,8 @@ async def create_narration_rule(
     """
     async with company_connection(user["schema"]) as conn:
         clean = await _clean_narration_rule(
-            conn, account_type, direction, tests, from_label, to_label)
+            conn, account_type, direction, tests, from_label, to_label,
+            purpose_label)
         nxt = await conn.fetchval(
             "SELECT coalesce(max(sort_order), -1) + 1 FROM narration_rule "
             "WHERE account_type = $1 AND direction = $2",
@@ -1130,12 +1147,12 @@ async def create_narration_rule(
             """
             INSERT INTO narration_rule
                 (account_type, direction, from_label, to_label,
-                 sort_order, is_active)
-            VALUES ($1, $2, $3, $4, $5, $6)
+                 purpose_label, sort_order, is_active)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id
             """,
             clean["account_type"], clean["direction"], clean["from_label"],
-            clean["to_label"], nxt, bool(is_active),
+            clean["to_label"], clean["purpose_label"], nxt, bool(is_active),
         )
         await _write_narration_rule_tests(conn, new_id, clean["tests"])
         saved = await _fetch_narration_rules(conn, "id = $1", new_id)
@@ -1151,8 +1168,9 @@ async def update_narration_rule(
     account_type: str = Body(...),
     direction: str = Body(...),
     tests: list[dict] = Body(...),
-    from_label: str = Body(...),
-    to_label: str = Body(...),
+    from_label: str = Body(None),
+    to_label: str = Body(None),
+    purpose_label: str = Body(None),
     is_active: bool = Body(True),
     user: dict = Depends(get_company_user),
 ):
@@ -1166,7 +1184,8 @@ async def update_narration_rule(
             raise HTTPException(404, "That narration rule no longer exists.")
 
         clean = await _clean_narration_rule(
-            conn, account_type, direction, tests, from_label, to_label)
+            conn, account_type, direction, tests, from_label, to_label,
+            purpose_label)
         moved = (current["account_type"] != clean["account_type"]
                  or current["direction"] != clean["direction"])
         order = await conn.fetchval(
@@ -1179,12 +1198,13 @@ async def update_narration_rule(
             """
             UPDATE narration_rule
                SET account_type = $2, direction = $3, from_label = $4,
-                   to_label = $5, is_active = $6,
-                   sort_order = coalesce($7, sort_order), updated_at = now()
+                   to_label = $5, purpose_label = $6, is_active = $7,
+                   sort_order = coalesce($8, sort_order), updated_at = now()
              WHERE id = $1
             """,
             rule_id, clean["account_type"], clean["direction"],
-            clean["from_label"], clean["to_label"], bool(is_active), order,
+            clean["from_label"], clean["to_label"], clean["purpose_label"],
+            bool(is_active), order,
         )
         await _write_narration_rule_tests(conn, rule_id, clean["tests"])
         saved = await _fetch_narration_rules(conn, "id = $1", rule_id)
@@ -1254,11 +1274,11 @@ async def preview_narration_rule(
     minus the head half neither this nor that preview needs an answer for.
     """
     async with company_connection(user["schema"]) as conn:
-        # Placeholder From/To: this only asks about the IF half, and the
-        # non-empty check on them would otherwise refuse a preview of a test
+        # Placeholder Purpose: this only asks about the IF half, and the
+        # at-least-one-THEN check would otherwise refuse a preview of a test
         # someone has not filled the THEN half in for yet.
         clean = await _clean_narration_rule(
-            conn, account_type, direction, tests, "preview", "preview")
+            conn, account_type, direction, tests, None, None, "preview")
 
         account_col = await staging.account_column(conn)
         if not account_col:

@@ -718,13 +718,16 @@ def resolve(direction: str | None, subjects: dict, conditions: list[dict],
 
 
 # =============================================================================
-# Narration rules: override the Internal Transfer "(From X to Y)" text.
+# Narration rules: override the Internal Transfer "(From X to Y)" text, the
+# Purpose text, or both.
 #
 # Same shape as a condition -- account type, direction, one or more tests --
-# but the THEN is two plain strings instead of a list of heads, so there is no
+# but the THEN is plain strings instead of a list of heads, so there is no
 # child table of ids and no `target` (a narration rule never writes a head
-# column, so there is no master it could belong to). See
-# company/052_narration_rule.sql.
+# column, so there is no master it could belong to). From/To go together (a
+# row is only ever in the Internal Transfer branch or the Purpose branches,
+# never both), Purpose is independent -- see company/052_narration_rule.sql
+# and company/053_narration_rule_purpose.sql.
 # =============================================================================
 
 async def load_narration_rules(conn, account_type: str, direction: str,
@@ -738,7 +741,7 @@ async def load_narration_rules(conn, account_type: str, direction: str,
     """
     rows = await conn.fetch(
         """
-        SELECT id, from_label, to_label, sort_order
+        SELECT id, from_label, to_label, purpose_label, sort_order
           FROM narration_rule
          WHERE upper(btrim(account_type)) = $1 AND direction = $2
            AND is_active = true
@@ -788,21 +791,30 @@ async def load_narration_rules(conn, account_type: str, direction: str,
 
 
 def resolve_narration_override(subjects: dict, rules_list: list[dict]) -> dict | None:
-    """The first matching rule's {from_label, to_label}, or None.
+    """The first matching rule's {from_label, to_label, purpose_label} (only
+    the keys that rule actually set), or None.
 
     `rules_list` is already filtered to one (account_type, direction) by
     load_narration_rules; this only asks which one's tests pass first, the
-    same first-match-wins `match()` already implements for conditions.
+    same first-match-wins `match()` already implements for conditions. Which
+    of From/To vs Purpose the caller ends up using depends on which branch the
+    row itself falls into -- this hands back whatever the rule set and lets
+    build_narration read only the field its own branch needs.
     """
     for r in rules_list:
         if match(r, subjects):
-            return {"from_label": r["from_label"], "to_label": r["to_label"]}
+            return {k: r[k] for k in ("from_label", "to_label", "purpose_label")
+                    if r.get(k)}
     return None
 
 
 def describe_narration_rule(rule: dict, column_labels: dict[str, str] | None = None) -> str:
     """One narration rule as a sentence: the IF half from `phrase`, the THEN
-    stated as the From/To text rather than a list of heads."""
+    stated as whichever of From/To and Purpose the rule sets."""
     said = phrase(rule, column_labels)
-    return (f'{said[:1].upper()}{said[1:]} shows "From {rule["from_label"]} '
-           f'to {rule["to_label"]}".')
+    thens = []
+    if rule.get("from_label") and rule.get("to_label"):
+        thens.append(f'the transfer leg "From {rule["from_label"]} to {rule["to_label"]}"')
+    if rule.get("purpose_label"):
+        thens.append(f'the Purpose "{rule["purpose_label"]}"')
+    return f"{said[:1].upper()}{said[1:]} shows {' and '.join(thens)}."

@@ -72,7 +72,7 @@ def build_narration(
     type_rera_idw: str | None,
     apt: str | None,
     remarks: str | None,
-    internal_transfer_override: dict | None = None,
+    override: dict | None = None,
 ) -> str:
     """The NARRATION text for one row.
 
@@ -81,14 +81,24 @@ def build_narration(
     a blank Remarks just flows through as an empty string wherever the
     formula would have used it, same as any other blank input field.
 
-    `internal_transfer_override` is a Narration Rule's answer for the ONE
-    thing this function otherwise has to guess -- the "(From X to Y)" leg
-    name inside the Internal Transfer branch, normally built by pulling the
-    last 4 characters out of the description. {"from_label", "to_label"} when
-    a rule matched this row (resolved by the caller, which has the database
-    connection this pure function does not), None otherwise. Nothing else in
-    the line is affected by it.
+    `override` is a Narration Rule's answer for the two things this function
+    otherwise has to guess, resolved by the caller (which has the database
+    connection this pure function does not):
+
+      * "(From X to Y)" inside the Internal Transfer branch, normally built
+        from the last 4 characters after the description's third dash --
+        used when both override["from_label"] and ["to_label"] are set.
+      * "Purpose: ..." inside the Receipt Credit / Payment Disbursement
+        branches, normally Remarks (or Head/"Salary") -- used when
+        override["purpose_label"] is set.
+
+    A row is only ever in one of those branches, so a rule carrying both
+    never has to choose between them -- whichever branch this row falls into
+    reads only the key it needs and ignores the other. None, or a dict
+    missing the relevant key(s), falls back to the computed guess exactly as
+    before this existed.
     """
+    override = override or {}
     description = description or ""
     ref = "N/A" if _blank(reference_no) else str(reference_no)
     bu = business_unit or ""
@@ -99,9 +109,8 @@ def build_narration(
 
     if head.strip().lower() == "internal":
         if description.count("-") >= 3:
-            if internal_transfer_override:
-                leg = (f'(From {internal_transfer_override["from_label"]} '
-                      f'to {internal_transfer_override["to_label"]})')
+            if override.get("from_label") and override.get("to_label"):
+                leg = f'(From {override["from_label"]} to {override["to_label"]})'
             else:
                 last4 = _last4_after_third_dash(description)
                 leg = (f"(From x{last4} to YES IDW 0490)" if is_credit
@@ -121,14 +130,16 @@ def build_narration(
             )
         else:
             last4 = _last4_after_third_dash(description)
-            purpose = head if _blank(remarks) or remarks.strip().lower() == "n/a" else remarks
+            purpose = override.get("purpose_label") or (
+                head if _blank(remarks) or remarks.strip().lower() == "n/a" else remarks)
             result = (
                 f"Receipt Credit from x{last4} (Purpose: {purpose}) {apt_suffix} "
                 f"| Ref: {ref} | BU: {bu} | Head: {head}"
             )
         return result.strip()
 
-    purpose = "Salary" if "salary" in head.lower() else remarks
+    purpose = override.get("purpose_label") or (
+        "Salary" if "salary" in head.lower() else remarks)
     counterparty = _extract_counterparty(description) if description else "Vendor"
     result = (
         f"Payment Disbursement (Purpose: {purpose}) | To: {counterparty} "
