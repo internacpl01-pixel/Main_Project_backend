@@ -24,6 +24,13 @@ Conditions sit under the grid: "a RERA debit whose narration mentions REFUND is
 a Cust Cancellation". Same two axes plus the head type, one test on one column
 of the statement, and the heads that are the answer when it passes.
 
+Narration rules are a third, unrelated thing living in this same router because
+they reuse the condition engine: an account type, a direction, one or more
+tests -- but the THEN is the From/To text for the "(From X to Y)" leg inside
+generated NARRATION's Internal Transfer branch, not a head. No head type, no
+master table, no `target` -- see company/052_narration_rule.sql and
+services/narration.py.
+
 See company/028_rule_table.sql, company/030_rule_condition.sql,
 company/032_rule_single_master.sql and company/034_rule_all_heads.sql.
 """
@@ -906,6 +913,405 @@ async def preview_condition(
              # Keyed by column, not a single "value": more than one test can
              # read more than one column, and there is no longer one obvious
              # field to single out.
+             "values": {f: (None if r[f"s{i}"] is None else str(r[f"s{i}"]))
+                       for i, f in enumerate(fields)}}
+            for r in matched[:5]
+        ],
+    }
+
+
+async def _fetch_narration_rules(conn, where: str = "", *params) -> list[dict]:
+    """Every narration rule matching `where`, active or not, with its tests
+    and a `problem`/`sentence` the same shape _fetch_conditions builds.
+
+    No head type here at all: a narration rule never writes a head column, so
+    there is nothing to filter by and no master to join against.
+    """
+    clause = f"WHERE {where}" if where else ""
+    rows = await conn.fetch(
+        f"""
+        SELECT * FROM narration_rule
+        {clause}
+        ORDER BY account_type, direction, sort_order, id
+        """,
+        *params,
+    )
+    ids = [r["id"] for r in rows]
+    test_rows = await conn.fetch(
+        """
+        SELECT rule_id, sort_order, combinator, subject_field,
+               operator, value1, value2
+          FROM narration_rule_test
+         WHERE rule_id = ANY($1::bigint[])
+         ORDER BY rule_id, sort_order
+        """,
+        ids,
+    ) if ids else []
+    tests_by_rule: dict[int, list[dict]] = {}
+    for r in test_rows:
+        tests_by_rule.setdefault(r["rule_id"], []).append(dict(r))
+
+    columns = await _subject_columns(conn)
+    labels = {name: col["label"] for name, col in columns.items()}
+
+    out: list[dict] = []
+    for r in rows:
+        c = dict(r)
+        c["tests"] = tests_by_rule.get(c["id"], [])
+        bad_op = next((tt for tt in c["tests"]
+                      if tt["operator"] not in rules.OPERATORS), None)
+        bad_col = next((tt for tt in c["tests"]
+                       if tt["subject_field"] not in columns), None)
+        if not c["tests"]:
+            c["problem"] = "This rule has no test left. Set one."
+        elif bad_op is not None:
+            c["problem"] = (f"This uses a test ({bad_op['operator']}) that no "
+                            f"longer exists. Set it again.")
+        elif bad_col is not None:
+            c["problem"] = (f"The column it tests ({bad_col['subject_field']}) "
+                            f"is no longer on the imported rows.")
+        else:
+            c["problem"] = None
+        c["sentence"] = rules.describe_narration_rule(c, labels)
+        out.append(c)
+    return out
+
+
+@router.get("/narration-rules")
+async def list_narration_rules(user: dict = Depends(get_company_user)):
+    """Every narration rule, plus everything the builder's dropdowns need --
+    same one-response-not-five shape /conditions uses, and for the same
+    reason.
+    """
+    async with company_connection(user["schema"]) as conn:
+        found = await _fetch_narration_rules(conn)
+        columns = await _subject_columns(conn)
+        types = await conn.fetch(
+            "SELECT upper(btrim(name)) AS name FROM account_type_master "
+            "WHERE is_active = true AND btrim(name) <> '' "
+            "GROUP BY 1 ORDER BY 1"
+        )
+    return {
+        "rules": found,
+        "columns": list(columns.values()),
+        "operators": rules.operator_catalog(),
+        "account_types": [t["name"] for t in types],
+        "directions": list(_DIRECTIONS),
+    }
+
+
+async def _clean_narration_rule(conn, account_type, direction, tests,
+                                from_label, to_label) -> dict:
+    """Check a narration rule against the live account types and columns, or
+    400 saying why. Same checks `_clean` makes on a condition's WHEN half;
+    the THEN half is two non-empty strings instead of a head list.
+    """
+    wanted_type = (account_type or "").strip().upper()
+    if not wanted_type:
+        raise HTTPException(400, "An account type is required.")
+    known = await conn.fetchval(
+        "SELECT 1 FROM account_type_master "
+        "WHERE upper(btrim(name)) = $1 AND is_active = true", wanted_type)
+    if not known:
+        raise HTTPException(
+            400, f"'{wanted_type}' is not an active account type. Add it "
+                 f"under Master Data → Type of Account first.")
+
+    wanted_dir = (direction or "").strip().upper()
+    if wanted_dir not in _DIRECTIONS:
+        raise HTTPException(
+            400, f"Direction must be {' or '.join(_DIRECTIONS)}.")
+
+    columns = await _subject_columns(conn)
+    if not tests:
+        raise HTTPException(
+            400, "A narration rule needs at least one test — the column, "
+                 "comparison and value that decide whether it applies.")
+
+    clean_tests: list[dict] = []
+    for i, raw in enumerate(tests or []):
+        field = (raw.get("subject_field") or "").strip()
+        col = columns.get(field)
+        if col is None:
+            raise HTTPException(
+                400, f"'{field or '(nothing)'}' is not a column on the "
+                     f"imported rows. Pick one of the fields shown on "
+                     f"Imported Rows.")
+
+        operator = (raw.get("operator") or "").strip()
+        op = rules.OPERATORS.get(operator)
+        if op is None:
+            raise HTTPException(400, f"'{operator}' is not a test this can make.")
+        if col["kind"] not in op["kinds"]:
+            raise HTTPException(
+                400, f"'{op['label']}' cannot be asked of {col['label']}, "
+                     f"which holds {col['kind']} values.")
+
+        v1 = (raw.get("value1") or "").strip() or None
+        v2 = (raw.get("value2") or "").strip() or None
+        if op["values"] >= 1 and v1 is None:
+            raise HTTPException(400, f"'{op['label']}' needs a value to compare to.")
+        if op["values"] == 2 and v2 is None:
+            raise HTTPException(400, f"'{op['label']}' needs both values.")
+        if op["values"] == 0:
+            v1 = v2 = None
+        elif op["values"] == 1:
+            v2 = None
+
+        combinator = (raw.get("combinator") or "").strip().upper() or None
+        if i == 0:
+            combinator = None
+        elif combinator not in ("AND", "OR"):
+            raise HTTPException(
+                400, "Every test after the first needs AND or OR against "
+                     "the one before it.")
+
+        clean_tests.append({
+            "subject_field": field, "operator": operator,
+            "value1": v1, "value2": v2, "combinator": combinator,
+        })
+
+    from_clean = (from_label or "").strip()
+    to_clean = (to_label or "").strip()
+    if not from_clean or not to_clean:
+        raise HTTPException(
+            400, "Both From and To need text — they are what the "
+                 "parenthetical shows when this rule matches.")
+
+    return {"account_type": wanted_type, "direction": wanted_dir,
+            "tests": clean_tests, "from_label": from_clean,
+            "to_label": to_clean, "columns": columns}
+
+
+async def _write_narration_rule_tests(conn, rule_id: int, tests: list[dict]) -> None:
+    """Replace a narration rule's tests with exactly this list, in this
+    order -- same replace-the-whole-list shape `_write_tests` uses."""
+    await conn.execute(
+        "DELETE FROM narration_rule_test WHERE rule_id = $1", rule_id)
+    for i, test in enumerate(tests):
+        await conn.execute(
+            """
+            INSERT INTO narration_rule_test
+                (rule_id, sort_order, combinator, subject_field,
+                 operator, value1, value2)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """,
+            rule_id, i, test["combinator"], test["subject_field"],
+            test["operator"], test["value1"], test["value2"],
+        )
+
+
+@router.post("/narration-rules", dependencies=[Depends(require_manager)])
+async def create_narration_rule(
+    account_type: str = Body(..., description="An active account type."),
+    direction: str = Body(..., description="CR or DR."),
+    tests: list[dict] = Body(..., description="One or more {subject_field, "
+                                              "operator, value1, value2, "
+                                              "combinator}."),
+    from_label: str = Body(..., description="The leg leaving the account "
+                                            "when this rule matches a DR "
+                                            "row, or arriving when CR."),
+    to_label: str = Body(..., description="The other leg."),
+    is_active: bool = Body(True),
+    user: dict = Depends(get_company_user),
+):
+    """Write one narration rule. It lands last in its (account type,
+    direction) group, so it decides last -- same reason a new condition is
+    appended rather than inserted anywhere clever.
+    """
+    async with company_connection(user["schema"]) as conn:
+        clean = await _clean_narration_rule(
+            conn, account_type, direction, tests, from_label, to_label)
+        nxt = await conn.fetchval(
+            "SELECT coalesce(max(sort_order), -1) + 1 FROM narration_rule "
+            "WHERE account_type = $1 AND direction = $2",
+            clean["account_type"], clean["direction"])
+        new_id = await conn.fetchval(
+            """
+            INSERT INTO narration_rule
+                (account_type, direction, from_label, to_label,
+                 sort_order, is_active)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id
+            """,
+            clean["account_type"], clean["direction"], clean["from_label"],
+            clean["to_label"], nxt, bool(is_active),
+        )
+        await _write_narration_rule_tests(conn, new_id, clean["tests"])
+        saved = await _fetch_narration_rules(conn, "id = $1", new_id)
+
+    logger.info("[rules] %s: narration rule %s added by %s", user["schema"],
+               new_id, user.get("username"))
+    return saved[0]
+
+
+@router.put("/narration-rules/{rule_id}", dependencies=[Depends(require_manager)])
+async def update_narration_rule(
+    rule_id: int,
+    account_type: str = Body(...),
+    direction: str = Body(...),
+    tests: list[dict] = Body(...),
+    from_label: str = Body(...),
+    to_label: str = Body(...),
+    is_active: bool = Body(True),
+    user: dict = Depends(get_company_user),
+):
+    """Rewrite one narration rule. Its position is not touched unless it
+    moves to another account type or direction, same as a condition."""
+    async with company_connection(user["schema"]) as conn:
+        current = await conn.fetchrow(
+            "SELECT account_type, direction FROM narration_rule WHERE id = $1",
+            rule_id)
+        if current is None:
+            raise HTTPException(404, "That narration rule no longer exists.")
+
+        clean = await _clean_narration_rule(
+            conn, account_type, direction, tests, from_label, to_label)
+        moved = (current["account_type"] != clean["account_type"]
+                 or current["direction"] != clean["direction"])
+        order = await conn.fetchval(
+            "SELECT coalesce(max(sort_order), -1) + 1 FROM narration_rule "
+            "WHERE account_type = $1 AND direction = $2 AND id <> $3",
+            clean["account_type"], clean["direction"], rule_id,
+        ) if moved else None
+
+        await conn.execute(
+            """
+            UPDATE narration_rule
+               SET account_type = $2, direction = $3, from_label = $4,
+                   to_label = $5, is_active = $6,
+                   sort_order = coalesce($7, sort_order), updated_at = now()
+             WHERE id = $1
+            """,
+            rule_id, clean["account_type"], clean["direction"],
+            clean["from_label"], clean["to_label"], bool(is_active), order,
+        )
+        await _write_narration_rule_tests(conn, rule_id, clean["tests"])
+        saved = await _fetch_narration_rules(conn, "id = $1", rule_id)
+
+    logger.info("[rules] %s: narration rule %s edited by %s", user["schema"],
+               rule_id, user.get("username"))
+    return saved[0]
+
+
+@router.delete("/narration-rules/{rule_id}",
+               dependencies=[Depends(require_manager)])
+async def delete_narration_rule(rule_id: int,
+                                user: dict = Depends(get_company_user)):
+    """Remove a narration rule. Deleted rather than deactivated, same as a
+    condition -- the list already has a switch for "not now"."""
+    async with company_connection(user["schema"]) as conn:
+        gone = await conn.fetchval(
+            "DELETE FROM narration_rule WHERE id = $1 RETURNING id", rule_id)
+    if gone is None:
+        raise HTTPException(404, "That narration rule no longer exists.")
+    logger.info("[rules] %s: narration rule %s deleted by %s", user["schema"],
+               rule_id, user.get("username"))
+    return {"status": "deleted", "id": gone}
+
+
+@router.post("/narration-rules/reorder", dependencies=[Depends(require_manager)])
+async def reorder_narration_rules(
+    account_type: str = Body(...),
+    direction: str = Body(...),
+    ids: list[int] = Body(..., description="Every rule in that group, in "
+                                           "the order they should decide."),
+    user: dict = Depends(get_company_user),
+):
+    """Set the order in which one group's narration rules are tried. A group
+    is one account type and one direction -- the only combination in which
+    two of these ever compete for the same row."""
+    wanted_type = (account_type or "").strip().upper()
+    wanted_dir = (direction or "").strip().upper()
+    if wanted_dir not in _DIRECTIONS:
+        raise HTTPException(400, f"Direction must be {' or '.join(_DIRECTIONS)}.")
+
+    async with company_connection(user["schema"]) as conn:
+        live = {r["id"] for r in await conn.fetch(
+            "SELECT id FROM narration_rule "
+            "WHERE account_type = $1 AND direction = $2",
+            wanted_type, wanted_dir)}
+        ordered = [i for i in dict.fromkeys(ids or []) if i in live]
+        rest = sorted(live - set(ordered))
+        for position, rid in enumerate(ordered + rest):
+            await conn.execute(
+                "UPDATE narration_rule SET sort_order = $2, updated_at = now() "
+                "WHERE id = $1", rid, position)
+        saved = await _fetch_narration_rules(
+            conn, "account_type = $1 AND direction = $2", wanted_type, wanted_dir)
+    return {"status": "reordered", "rules": saved}
+
+
+@router.post("/narration-rules/preview")
+async def preview_narration_rule(
+    account_type: str = Body(...),
+    direction: str = Body(...),
+    tests: list[dict] = Body(...),
+    user: dict = Depends(get_company_user),
+):
+    """Run an unsaved set of tests against the rows actually staged -- same
+    "how many of my rows does this describe" check /conditions/preview runs,
+    minus the head half neither this nor that preview needs an answer for.
+    """
+    async with company_connection(user["schema"]) as conn:
+        # Placeholder From/To: this only asks about the IF half, and the
+        # non-empty check on them would otherwise refuse a preview of a test
+        # someone has not filled the THEN half in for yet.
+        clean = await _clean_narration_rule(
+            conn, account_type, direction, tests, "preview", "preview")
+
+        account_col = await staging.account_column(conn)
+        if not account_col:
+            raise HTTPException(
+                400, "This company has no account number field mapped, so "
+                     "rows cannot be matched to an account. Map one on the "
+                     "Field Mapping page first.")
+
+        filters = [
+            f"{staging.account_digits(f't.{account_col}')} IN ("
+            f"  SELECT {staging.account_digits('b.account_number')}"
+            f"    FROM bank_master b"
+            f"   WHERE upper(btrim(coalesce(b.account_type, ''))) = $1"
+            f"     AND {staging.account_digits('b.account_number')} <> '')",
+            "upper(btrim(coalesce(t.credit_debit, ''))) = $2",
+        ]
+        params: list = [clean["account_type"], clean["direction"]]
+        idx = 3
+
+        scope = await scoping.visible_project_ids(conn, user)
+        clause, scope_params, idx = scoping.project_filter(
+            scope, "t.project_id", idx)
+        if clause:
+            filters.append(clause)
+            params.extend(scope_params)
+        elif scoping.scope_is_empty(scope):
+            filters.append("t.project_id IS NULL")
+
+        fields = rules.subject_fields([{"tests": clean["tests"]}])
+        rows = await conn.fetch(
+            f"""
+            SELECT t.id, t.amount
+                   {rules.subject_sql(fields)}
+              FROM temp_trans t
+             WHERE {' AND '.join(filters)}
+             ORDER BY t.batch_id, t.row_number
+            """,
+            *params,
+        )
+
+    draft = {"tests": clean["tests"]}
+    matched = []
+    for r in rows:
+        if rules.match(draft, rules.subject_values(r, fields)):
+            matched.append(r)
+
+    labels = {name: col["label"] for name, col in clean["columns"].items()}
+    return {
+        "scanned": len(rows),
+        "matched": len(matched),
+        "phrase": rules.phrase({**draft, "direction": clean["direction"]}, labels),
+        "examples": [
+            {"id": r["id"], "amount": r["amount"],
              "values": {f: (None if r[f"s{i}"] is None else str(r[f"s{i}"]))
                        for i, f in enumerate(fields)}}
             for r in matched[:5]

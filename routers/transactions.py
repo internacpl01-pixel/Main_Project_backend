@@ -9,6 +9,7 @@ DELETE /temp-trans/{row_id}           — remove one staged row
 POST   /temp-trans/{row_id}/classify  — tag a raw row with a head
 POST   /temp-trans/{row_id}/finalize  — move a row into the ledger
 POST   /temp-trans/{row_id}/generate-narration — compute (not save) NARRATION text
+POST   /temp-trans/generate-narration-bulk — generate AND save NARRATION for every listed row
 
 Both list endpoints are paged and searchable, and both return
 {columns, rows, total, page, limit}. They used to return every row in the table
@@ -2928,6 +2929,153 @@ async def edit_temp_row(
 _CUSTOM_FIELD_COLUMN_RE = re.compile(r"^field_(text|num|date)_\d+$")
 
 
+async def _narration_source_columns(conn) -> dict:
+    """{role: column} for the 8 inputs build_narration() needs, resolved live
+    from this company's own fieldmap -- shared by the single-row and bulk
+    generate-narration endpoints so the two can never disagree about which
+    column is which.
+
+    Only field_text_N / field_num_N / field_date_N ever comes back: the same
+    guard _editable_columns applies to its own mirrors, applied here too since
+    these names are about to be interpolated into a SELECT/UPDATE.
+    """
+    fieldmap_rows = [dict(r) for r in await conn.fetch(
+        "SELECT fieldname, displayname, mapfields FROM fieldmap WHERE is_active = true"
+    )]
+    cats = fields_by_category(fieldmap_rows)
+    editable = await _editable_columns(conn)
+
+    wanted = {
+        "description": cats.get("description"),
+        "reference_no": cats.get("reference_no"),
+        "business_unit": (editable.get("project") or {}).get("column"),
+        "head": (editable.get("head") or {}).get("column"),
+        "type_rera_idw": (editable.get("rera_head") or {}).get("column"),
+        "apt": await staging.apt_column(conn),
+        "remarks": await staging.acc_remarks_column(conn),
+    }
+    return {
+        key: col for key, col in wanted.items()
+        if col and _CUSTOM_FIELD_COLUMN_RE.match(col)
+    }
+
+
+def _row_narration(row: dict, wanted: dict, override: dict | None = None) -> str:
+    """build_narration(), fed from one temp_trans row and the column map
+    _narration_source_columns resolved.
+
+    Credit/debit comes straight off temp_trans.credit_debit -- the fixed
+    column insert_temp_rows always populates -- rather than re-derived from
+    whichever custom field happens to hold the deposit amount.
+    """
+    return narration.build_narration(
+        description=row.get(wanted.get("description")),
+        reference_no=row.get(wanted.get("reference_no")),
+        is_credit=row.get("credit_debit") == "CR",
+        business_unit=row.get(wanted.get("business_unit")),
+        head=row.get(wanted.get("head")),
+        type_rera_idw=row.get(wanted.get("type_rera_idw")),
+        apt=row.get(wanted.get("apt")),
+        remarks=row.get(wanted.get("remarks")),
+        internal_transfer_override=override,
+    )
+
+
+async def _account_type_select(conn) -> tuple[str, str]:
+    """(select expression, join clause) resolving each row's own bank account
+    type via bank_master, aliased `t`.
+
+    ("NULL::text AS _account_type", "") when this company has no account
+    number field mapped -- a narration rule simply never applies then, the
+    same graceful fallback the rest of narration generation already uses
+    rather than refusing to generate anything.
+    """
+    account_col = await staging.account_column(conn)
+    if not account_col:
+        return "NULL::text AS _account_type", ""
+    join = f"""
+        LEFT JOIN LATERAL (
+            SELECT b.account_type
+              FROM bank_master b
+             WHERE b.is_active = true
+               AND {staging.account_digits('b.account_number')} <> ''
+               AND {staging.account_digits('b.account_number')}
+                   = {staging.account_digits(f't.{account_col}')}
+             ORDER BY b.id LIMIT 1
+        ) bm ON true
+    """
+    return "bm.account_type AS _account_type", join
+
+
+async def _internal_transfer_overrides(conn, rows: list[dict], wanted: dict) -> dict[int, dict]:
+    """{row id: {from_label, to_label}} for rows an active Narration Rule
+    overrides -- see company/052_narration_rule.sql.
+
+    Only ever consulted for rows the Internal Transfer branch would otherwise
+    have to guess a "(From X to Y)" for: Head == Internal, at least 3 dashes
+    in the Description, and an account type resolved for the row (from
+    _account_type_select). Everything else is untouched -- a company with no
+    narration rules at all, or a row outside this one branch, always falls
+    back to build_narration's own extraction, exactly as before this existed.
+
+    Rules are loaded per (account_type, direction) pair actually present
+    among candidate rows -- realistically a handful of queries even across a
+    few hundred rows spanning several bank accounts, not one per row. A pair
+    whose rules can no longer run (a dropped column, an unknown operator) is
+    logged and skipped rather than failing the whole generation -- one broken
+    narration rule for one account type must not block generating narration
+    for every other row in the batch.
+    """
+    desc_col, head_col = wanted.get("description"), wanted.get("head")
+    if not desc_col or not head_col:
+        return {}
+
+    candidates = []
+    for r in rows:
+        head = (r.get(head_col) or "").strip().lower()
+        desc = r.get(desc_col) or ""
+        acct_type = (r.get("_account_type") or "").strip().upper()
+        direction = r.get("credit_debit")
+        if (head == "internal" and desc.count("-") >= 3
+                and acct_type and direction in rules.DIRECTIONS):
+            candidates.append((r["id"], acct_type, direction))
+    if not candidates:
+        return {}
+
+    live_columns = {c["name"] for c in await custom_fields.data_columns(conn)}
+    pairs = sorted({(t, d) for _id, t, d in candidates})
+    rules_by_pair: dict[tuple[str, str], list[dict]] = {}
+    for acct_type, direction in pairs:
+        try:
+            rules_by_pair[(acct_type, direction)] = await rules.load_narration_rules(
+                conn, acct_type, direction, live_columns)
+        except rules.MissingRuleHeads as e:
+            logger.warning(
+                "[narration-rule] %s/%s skipped for generation: %s",
+                acct_type, direction, e,
+            )
+            rules_by_pair[(acct_type, direction)] = []
+
+    overrides: dict[int, dict] = {}
+    for acct_type, direction in pairs:
+        rules_list = rules_by_pair[(acct_type, direction)]
+        if not rules_list:
+            continue
+        ids = [rid for rid, t, d in candidates if t == acct_type and d == direction]
+        fields = rules.subject_fields(rules_list)
+        subj_rows = await conn.fetch(
+            f"SELECT t.id {rules.subject_sql(fields)} FROM temp_trans t "
+            f"WHERE t.id = ANY($1::bigint[])",
+            ids,
+        )
+        for sr in subj_rows:
+            subjects = rules.subject_values(sr, fields)
+            hit = rules.resolve_narration_override(subjects, rules_list)
+            if hit:
+                overrides[sr["id"]] = hit
+    return overrides
+
+
 @router.post("/temp-trans/{row_id}/generate-narration")
 async def generate_narration_text(
     row_id: int,
@@ -2944,61 +3092,99 @@ async def generate_narration_text(
     """
     async with company_connection(user["schema"]) as conn:
         scope = await scoping.visible_project_ids(conn, user)
-
-        fieldmap_rows = [dict(r) for r in await conn.fetch(
-            "SELECT fieldname, displayname, mapfields FROM fieldmap WHERE is_active = true"
-        )]
-        cats = fields_by_category(fieldmap_rows)
-        editable = await _editable_columns(conn)
-
-        wanted = {
-            "description": cats.get("description"),
-            "reference_no": cats.get("reference_no"),
-            "deposits": cats.get("deposits"),
-            "business_unit": (editable.get("project") or {}).get("column"),
-            "head": (editable.get("head") or {}).get("column"),
-            "type_rera_idw": (editable.get("rera_head") or {}).get("column"),
-            "apt": await staging.apt_column(conn),
-            "remarks": await staging.acc_remarks_column(conn),
-        }
-        # Only ever field_text_N / field_num_N / field_date_N -- the same guard
-        # _editable_columns applies to its own mirrors, applied here too since
-        # these column names are about to be interpolated into a SELECT.
-        wanted = {
-            key: col for key, col in wanted.items()
-            if col and _CUSTOM_FIELD_COLUMN_RE.match(col)
-        }
+        wanted = await _narration_source_columns(conn)
         if not wanted:
             raise HTTPException(
                 400, "This company has none of the columns narration needs."
             )
 
+        acct_select, acct_join = await _account_type_select(conn)
         select_cols = sorted(set(wanted.values()))
         row = await conn.fetchrow(
-            f"SELECT id, project_id, {', '.join(select_cols)} "
-            f"FROM temp_trans WHERE id = $1",
+            f"SELECT t.id, t.project_id, t.credit_debit, {acct_select}, "
+            f"{', '.join(f't.{c}' for c in select_cols)} "
+            f"FROM temp_trans t {acct_join} WHERE t.id = $1",
             row_id,
         )
         if row is None or not scoping.can_use_project(scope, row["project_id"]):
             raise HTTPException(404, "Staged row not found.")
 
         row = dict(row)
-        deposits_col = wanted.get("deposits")
-        deposits = row.get(deposits_col) if deposits_col else None
-        is_credit = deposits is not None and float(deposits) > 0
-
-        text = narration.build_narration(
-            description=row.get(wanted.get("description")),
-            reference_no=row.get(wanted.get("reference_no")),
-            is_credit=is_credit,
-            business_unit=row.get(wanted.get("business_unit")),
-            head=row.get(wanted.get("head")),
-            type_rera_idw=row.get(wanted.get("type_rera_idw")),
-            apt=row.get(wanted.get("apt")),
-            remarks=row.get(wanted.get("remarks")),
-        )
+        overrides = await _internal_transfer_overrides(conn, [row], wanted)
+        text = _row_narration(row, wanted, overrides.get(row["id"]))
 
     return {"narration": text}
+
+
+@router.post("/temp-trans/generate-narration-bulk")
+async def generate_narration_bulk(
+    batch_id: int = None,
+    classified: bool = None,
+    date_from: str = Query(None),
+    date_to: str = Query(None),
+    account: str = Query(None),
+    company: str = Query(None),
+    search: str = Query(""),
+    rule_conflicts: str = Query(None),
+    user: dict = Depends(get_company_user),
+):
+    """Generate and SAVE NARRATION for every row the Imported Rows table is
+    currently showing -- same filters as GET /temp-trans and Lock/Unlock all,
+    via the same _temp_filters, so "every listed row" means exactly the rows
+    on screen and nothing a page of them left out.
+
+    Unlike the single-row endpoint this writes directly rather than handing
+    the text back for review first -- there is no dialog to review 478 rows
+    through, and the accountant's formula is deterministic from columns
+    already on the row, so there is nothing to look at before saving that
+    looking at the row itself would not already show.
+
+    Locked rows are skipped, not overwritten: a lock means the row is done
+    being worked on, the same reason PATCH refuses one.
+    """
+    async with company_connection(user["schema"]) as conn:
+        wanted = await _narration_source_columns(conn)
+        narration_col = await staging.narration_column(conn)
+        if not wanted or not narration_col:
+            raise HTTPException(
+                400, "This company has none of the columns narration needs."
+            )
+
+        where, params, _columns, _term, _idx = await _temp_filters(
+            conn, user, batch_id=batch_id, classified=classified,
+            date_from=date_from, date_to=date_to, account=account,
+            company=company, search=search, rule_conflicts=rule_conflicts,
+        )
+
+        acct_select, acct_join = await _account_type_select(conn)
+        select_cols = sorted(set(wanted.values()))
+        rows = [dict(r) for r in await conn.fetch(
+            f"SELECT t.id, t.is_locked, t.credit_debit, {acct_select}, "
+            f"{', '.join(f't.{c}' for c in select_cols)} "
+            f"{_TEMP_JOINS} {acct_join} WHERE {where}",
+            *params,
+        )]
+
+        overrides = await _internal_transfer_overrides(conn, rows, wanted)
+
+        matched = len(rows)
+        skipped_locked = sum(1 for r in rows if r["is_locked"])
+        records = [
+            (_row_narration(r, wanted, overrides.get(r["id"])), r["id"])
+            for r in rows if not r["is_locked"]
+        ]
+        if records:
+            await conn.executemany(
+                f"UPDATE temp_trans SET {narration_col} = $1 WHERE id = $2",
+                records,
+            )
+
+    return {
+        "status": "generated",
+        "matched": matched,
+        "changed": len(records),
+        "skipped_locked": skipped_locked,
+    }
 
 
 @router.post("/temp-trans/lock-all")

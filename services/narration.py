@@ -72,6 +72,7 @@ def build_narration(
     type_rera_idw: str | None,
     apt: str | None,
     remarks: str | None,
+    internal_transfer_override: dict | None = None,
 ) -> str:
     """The NARRATION text for one row.
 
@@ -79,6 +80,14 @@ def build_narration(
     blank ("Remarks Compulsory For Narration"). Dropped here per the user --
     a blank Remarks just flows through as an empty string wherever the
     formula would have used it, same as any other blank input field.
+
+    `internal_transfer_override` is a Narration Rule's answer for the ONE
+    thing this function otherwise has to guess -- the "(From X to Y)" leg
+    name inside the Internal Transfer branch, normally built by pulling the
+    last 4 characters out of the description. {"from_label", "to_label"} when
+    a rule matched this row (resolved by the caller, which has the database
+    connection this pure function does not), None otherwise. Nothing else in
+    the line is affected by it.
     """
     description = description or ""
     ref = "N/A" if _blank(reference_no) else str(reference_no)
@@ -90,11 +99,14 @@ def build_narration(
 
     if head.strip().lower() == "internal":
         if description.count("-") >= 3:
-            last4 = _last4_after_third_dash(description)
-            if is_credit:
-                lead = f"Internal Fund Transfer (From x{last4} to YES IDW 0490)"
+            if internal_transfer_override:
+                leg = (f'(From {internal_transfer_override["from_label"]} '
+                      f'to {internal_transfer_override["to_label"]})')
             else:
-                lead = f"Internal Fund Transfer (From YES IDW 0490 to x{last4})"
+                last4 = _last4_after_third_dash(description)
+                leg = (f"(From x{last4} to YES IDW 0490)" if is_credit
+                      else f"(From YES IDW 0490 to x{last4})")
+            lead = f"Internal Fund Transfer {leg}"
             result = f"{lead} | Ref: {ref} | Type: {type_} | BU: {bu} | Head: {head}"
         else:
             result = f"Internal Transfer | Ref: {ref} | Type: {type_} | BU: {bu} | Head: {head}"

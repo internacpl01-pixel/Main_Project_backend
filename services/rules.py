@@ -715,3 +715,94 @@ def resolve(direction: str | None, subjects: dict, conditions: list[dict],
                 ids.add(h["id"])
                 heads.append(h)
     return heads, ids, primary, extra
+
+
+# =============================================================================
+# Narration rules: override the Internal Transfer "(From X to Y)" text.
+#
+# Same shape as a condition -- account type, direction, one or more tests --
+# but the THEN is two plain strings instead of a list of heads, so there is no
+# child table of ids and no `target` (a narration rule never writes a head
+# column, so there is no master it could belong to). See
+# company/052_narration_rule.sql.
+# =============================================================================
+
+async def load_narration_rules(conn, account_type: str, direction: str,
+                               columns: set[str] | None = None) -> list[dict]:
+    """Active narration rules for one (account_type, direction), in the order
+    they decide.
+
+    Same refuse-not-skip checks load_conditions makes, for the same reason: a
+    rule whose test names a column that no longer exists must say so rather
+    than be silently treated as never matching.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT id, from_label, to_label, sort_order
+          FROM narration_rule
+         WHERE upper(btrim(account_type)) = $1 AND direction = $2
+           AND is_active = true
+         ORDER BY sort_order, id
+        """,
+        (account_type or "").strip().upper(), direction,
+    )
+    ids = [r["id"] for r in rows]
+    test_rows = await conn.fetch(
+        """
+        SELECT rule_id, sort_order, combinator, subject_field,
+               operator, value1, value2
+          FROM narration_rule_test
+         WHERE rule_id = ANY($1::bigint[])
+         ORDER BY rule_id, sort_order
+        """,
+        ids,
+    ) if ids else []
+    tests_by_rule: dict[int, list[dict]] = {}
+    for r in test_rows:
+        tests_by_rule.setdefault(r["rule_id"], []).append(dict(r))
+
+    wanted = (account_type or "").strip().upper()
+    out: list[dict] = []
+    for r in rows:
+        c = dict(r)
+        c["direction"] = direction
+        c["tests"] = tests_by_rule.get(c["id"], [])
+        if not c["tests"]:
+            raise MissingRuleHeads(
+                f"A narration rule on {wanted} has no test left. Open the "
+                f"Rules page and set one.")
+        for test in c["tests"]:
+            if test["operator"] not in OPERATORS:
+                raise MissingRuleHeads(
+                    f"A narration rule on {wanted} uses the test "
+                    f"{test['operator']!r}, which this version does not "
+                    f"know. Open the Rules page and set that rule again.")
+            if columns is not None and test["subject_field"] not in columns:
+                raise MissingRuleHeads(
+                    f"A narration rule on {wanted} tests the column "
+                    f"'{test['subject_field']}', which no longer exists on "
+                    f"the imported rows. Open the Rules page and point it "
+                    f"at a column that does, or switch the rule off.")
+        out.append(c)
+    return out
+
+
+def resolve_narration_override(subjects: dict, rules_list: list[dict]) -> dict | None:
+    """The first matching rule's {from_label, to_label}, or None.
+
+    `rules_list` is already filtered to one (account_type, direction) by
+    load_narration_rules; this only asks which one's tests pass first, the
+    same first-match-wins `match()` already implements for conditions.
+    """
+    for r in rules_list:
+        if match(r, subjects):
+            return {"from_label": r["from_label"], "to_label": r["to_label"]}
+    return None
+
+
+def describe_narration_rule(rule: dict, column_labels: dict[str, str] | None = None) -> str:
+    """One narration rule as a sentence: the IF half from `phrase`, the THEN
+    stated as the From/To text rather than a list of heads."""
+    said = phrase(rule, column_labels)
+    return (f'{said[:1].upper()}{said[1:]} shows "From {rule["from_label"]} '
+           f'to {rule["to_label"]}".')
