@@ -71,3 +71,50 @@ async def set_import_folder_id(schema: str, folder_id: str | None) -> None:
         )
 
 
+async def record_drive_folder_history(schema: str, setting: str, folder_id: str,
+                                      folder_name: str | None, changed_by: str) -> None:
+    """Log one successful save of the export or import folder.
+
+    Purely a trail for the Settings screen's "previously used" links -- see
+    055_drive_folder_history.sql. Called after the save itself succeeds, so a
+    folder that failed verification never gets a row.
+    """
+    async with company_connection(schema) as conn:
+        await conn.execute(
+            "INSERT INTO drive_folder_history "
+            "(setting, folder_id, folder_name, changed_by) VALUES ($1, $2, $3, $4)",
+            setting, folder_id, folder_name, changed_by,
+        )
+
+
+async def get_drive_folder_history(schema: str, setting: str, *,
+                                   exclude_folder_id: str | None = None,
+                                   limit: int = 3) -> list[dict]:
+    """Up to `limit` distinct folders this setting previously held, newest
+    change first -- excluding whichever folder is current, so the list reads
+    as "previously used" rather than repeating the link already shown above
+    it.
+
+    Distinct on folder_id: saving the same folder twice (e.g. clearing the
+    import folder and pasting the export folder's own link back) should not
+    push it to the top of its own history as though it were a different one.
+    """
+    async with company_connection(schema) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT ON (folder_id) folder_id, folder_name, changed_at
+              FROM drive_folder_history
+             WHERE setting = $1
+               AND ($2::text IS NULL OR folder_id <> $2)
+             ORDER BY folder_id, changed_at DESC
+            """,
+            setting, exclude_folder_id,
+        )
+    ordered = sorted(rows, key=lambda r: r["changed_at"], reverse=True)[:limit]
+    return [
+        {"folder_id": r["folder_id"], "folder_name": r["folder_name"],
+         "changed_at": r["changed_at"].isoformat()}
+        for r in ordered
+    ]
+
+

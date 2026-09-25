@@ -37,8 +37,9 @@ from services import drive, jobs
 from services.pdf_import import (PDF_BATCH_PAGES, process_pdf_import,
                                  start_pdf_job)
 from services.drive_log import list_drive_log, log_drive_result
-from services.settings import (get_drive_folder_id, get_import_folder_id,
-                               get_raw_import_folder_id, set_drive_folder_id,
+from services.settings import (get_drive_folder_history, get_drive_folder_id,
+                               get_import_folder_id, get_raw_import_folder_id,
+                               record_drive_folder_history, set_drive_folder_id,
                                set_import_folder_id)
 from services.staging import (DuplicateFileError, bulk_bank_lookup,
                               find_bank_by_hint)
@@ -537,12 +538,22 @@ async def get_drive_settings(user: dict = Depends(get_company_user)):
 
     folder_id is the export folder under its old name, kept so an older
     frontend build still reads the field it expects.
+
+    export_history/import_history are up to 3 folders each setting
+    previously held, newest first, excluding whichever is current -- the
+    Settings screen's "previously used" links (see
+    services.settings.get_drive_folder_history).
     """
     export_id = await get_drive_folder_id(user["schema"])
+    import_id = await get_raw_import_folder_id(user["schema"])
     return {
         "folder_id": export_id,
         "export_folder_id": export_id,
-        "import_folder_id": await get_raw_import_folder_id(user["schema"]),
+        "import_folder_id": import_id,
+        "export_history": await get_drive_folder_history(
+            user["schema"], "export", exclude_folder_id=export_id),
+        "import_history": await get_drive_folder_history(
+            user["schema"], "import", exclude_folder_id=import_id),
     }
 
 
@@ -576,6 +587,8 @@ async def update_import_folder(
     folder_id = _folder_id_or_400(url)
     name = await _verify_folder(folder_id)
     await set_import_folder_id(user["schema"], folder_id)
+    await record_drive_folder_history(
+        user["schema"], "import", folder_id, name, user["username"])
     return {"import_folder_id": folder_id, "folder_name": name}
 
 
@@ -612,7 +625,7 @@ async def update_drive_settings(
     every future statement is filed.
     """
     folder_id = _folder_id_or_400(url.strip() or folder_id.strip())
-    await _verify_folder(folder_id)
+    name = await _verify_folder(folder_id)
 
     if config.APPS_SCRIPT_WEB_APP_URL:
         try:
@@ -635,6 +648,8 @@ async def update_drive_settings(
                 body.get("error") or "The Apps Script rejected the update.")
 
     await set_drive_folder_id(user["schema"], folder_id)
+    await record_drive_folder_history(
+        user["schema"], "export", folder_id, name, user["username"])
     return {"folder_id": folder_id, "export_folder_id": folder_id}
 
 
