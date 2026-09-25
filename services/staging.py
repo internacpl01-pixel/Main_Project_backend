@@ -320,6 +320,100 @@ async def fill_company_from_bank(conn, *, table: str = "temp_trans",
     }
 
 
+async def fill_project_from_bank(conn, *, table: str = "temp_trans",
+                                 batch_id: int | None = None) -> dict:
+    """Set each row's Business Unit (project) from the bank that owns its
+    account number -- same shape and same matching (digits only) as
+    fill_company_from_bank, because bank_master.project is exactly as
+    authoritative about which project an account belongs to as
+    bank_master.company is about which company does.
+
+    Writes project_id AND its mirror display column together, the same
+    discipline the row editor's own dropdowns use (see
+    routers.transactions.edit_temp_row), so a row's id and what it shows can
+    never disagree. The bank's project name is matched against projects.name
+    case/space-insensitively; a name that matches no active project is left
+    alone rather than guessed at.
+
+    batch_id=None covers every row, which is what makes this a backfill: a
+    bank account added after a statement was imported still reaches it.
+    """
+    account_col = await _resolve_field(conn, _ACCOUNT_ALIASES)
+    mirror_col = await conn.fetchval(
+        "SELECT fieldname FROM fieldmap WHERE mirrors = 'project' "
+        "AND is_active = true LIMIT 1"
+    )
+
+    if not account_col or not mirror_col:
+        missing = []
+        if not account_col:
+            missing.append("an account number column")
+        if not mirror_col:
+            missing.append("a Business Unit column")
+        logger.info("[project fill] skipped on %s: fieldmap has no %s",
+                    table, " and no ".join(missing))
+        return {"updated": 0, "skipped": True,
+                "reason": f"This company's fieldmap has no {' and no '.join(missing)}."}
+
+    params: list = []
+    where_batch = ""
+    if batch_id is not None:
+        params.append(batch_id)
+        where_batch = f" AND t.batch_id = ${len(params)}"
+
+    bank_acct = account_digits("b.account_number")
+    row_acct = account_digits(f"t.{account_col}")
+
+    tag = await conn.execute(
+        f"""
+        UPDATE {table} t
+           SET project_id = p.id, {mirror_col} = p.name
+          FROM bank_master b
+          JOIN projects p
+            ON p.is_active = true
+           AND lower(btrim(p.name)) = lower(btrim(b.project))
+         WHERE b.project IS NOT NULL
+           AND b.account_number IS NOT NULL
+           AND t.{account_col} IS NOT NULL
+           AND {bank_acct} <> ''
+           AND {bank_acct} = {row_acct}
+           AND (t.project_id IS DISTINCT FROM p.id
+                OR t.{mirror_col} IS DISTINCT FROM p.name)
+           {where_batch}
+        """,
+        *params,
+    )
+    updated = int(tag.split()[-1])
+
+    # Counted so the caller can say "0 updated, and here is why": either no
+    # bank carries the account, or its Project name matches no active project.
+    unmatched = await conn.fetchval(
+        f"""
+        SELECT count(DISTINCT t.{account_col}) FROM {table} t
+         WHERE t.{account_col} IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM bank_master b
+                JOIN projects p
+                  ON p.is_active = true
+                 AND lower(btrim(p.name)) = lower(btrim(b.project))
+                WHERE b.account_number IS NOT NULL
+                  AND {bank_acct} <> ''
+                  AND {bank_acct} = {row_acct}
+           )
+        """
+    )
+
+    logger.info("[project fill] %s: %d rows set, %d account numbers match no "
+                "usable bank/project", table, updated, unmatched)
+    return {
+        "updated": updated,
+        "skipped": False,
+        "account_column": account_col,
+        "project_column": mirror_col,
+        "unmatched_accounts": unmatched,
+    }
+
+
 async def fill_account_from_bank(conn, *, bank_id: int, table: str = "temp_trans",
                                  batch_id: int | None = None) -> dict:
     """Set a row's account number from the bank picked on the import screen.
@@ -581,6 +675,15 @@ async def stage_batch(
             logger.exception("[stage] company fill failed for batch %s", batch_id)
             filled = {"updated": 0}
 
+        # Business Unit follows from the same account number, via the Bank
+        # master's own Project column -- same reasoning as Company just above,
+        # and not fatal for the same reason.
+        try:
+            project_filled = await fill_project_from_bank(conn, batch_id=batch_id)
+        except Exception:
+            logger.exception("[stage] project fill failed for batch %s", batch_id)
+            project_filled = {"updated": 0}
+
         # The financial year follows from the date the same way the company
         # follows from the account number, and is filled here for the same
         # reason: it is knowable, so nobody should have to type it. Also not
@@ -592,9 +695,10 @@ async def stage_batch(
             fy = {"updated": 0}
 
     logger.info("[stage] batch %s: %d rows, %d duplicate rows, %d account set, "
-                "%d company set, %d FY set",
+                "%d company set, %d business unit set, %d FY set",
                 batch_id, inserted, len(duplicate_rows), acct_filled.get("updated", 0),
-                filled.get("updated", 0), fy.get("updated", 0))
+                filled.get("updated", 0), project_filled.get("updated", 0),
+                fy.get("updated", 0))
     return {
         "batch_id": batch_id,
         "inserted": inserted,

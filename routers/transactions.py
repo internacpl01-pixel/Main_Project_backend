@@ -935,18 +935,21 @@ async def fill_company(user: dict = Depends(get_company_user)):
 async def fill_derived(user: dict = Depends(get_company_user)):
     """Recompute every column this app derives, on staged and posted rows.
 
-    Two of them today: Company, which follows from the account number via the
-    Bank table, and FY, which follows from the row's own date.
+    Three of them today: Company and Business Unit, which both follow from the
+    account number via the Bank table's Company and Project columns, and FY,
+    which follows from the row's own date.
 
-    The import already does both for the batch it just staged, so this is for
-    the other direction in time — rows imported before the column existed, or
-    before the bank account was added to Master Data. Safe to run repeatedly:
-    each fill only writes where the value would change.
+    The import already does all three for the batch it just staged, so this is
+    for the other direction in time — rows imported before the column existed,
+    or before the bank account was added to Master Data. Safe to run
+    repeatedly: each fill only writes where the value would change.
     """
     async with company_connection(user["schema"]) as conn:
         async with conn.transaction():
             company_staged = await staging.fill_company_from_bank(conn, table="temp_trans")
             company_posted = await staging.fill_company_from_bank(conn, table="transactions")
+            project_staged = await staging.fill_project_from_bank(conn, table="temp_trans")
+            project_posted = await staging.fill_project_from_bank(conn, table="transactions")
             fy_staged = await staging.fill_financial_year(conn, table="temp_trans")
             fy_posted = await staging.fill_financial_year(conn, table="transactions")
 
@@ -959,6 +962,13 @@ async def fill_derived(user: dict = Depends(get_company_user)):
             # Account numbers on staged rows that no bank record carries — the
             # usual reason nothing was filled, and the only one you can act on.
             "unmatched_accounts": company_staged.get("unmatched_accounts"),
+        },
+        "business_unit": {
+            "staged_updated": project_staged["updated"],
+            "posted_updated": project_posted["updated"],
+            "skipped": project_staged.get("skipped", False),
+            "reason": project_staged.get("reason"),
+            "unmatched_accounts": project_staged.get("unmatched_accounts"),
         },
         "financial_year": {
             "staged_updated": fy_staged["updated"],
