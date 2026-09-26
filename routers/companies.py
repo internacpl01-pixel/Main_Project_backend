@@ -354,10 +354,10 @@ _IN_USE_TABLES = ("transactions", "temp_trans", "import_batches")
 @router.get("/{company_id}/delete-check")
 async def check_delete(company_id: int, user: dict = Depends(require_super_admin)):
     """
-    Whether this company can be deleted, and what is standing in the way.
+    What deleting this company would take with it.
 
-    The confirm dialog asks this before offering the button, so the refusal is
-    read before the decision rather than after it.
+    Delete is unconditional — the confirm dialog just uses these counts to show
+    what is about to be destroyed before the name has to be typed back.
     """
     async with raw_connection() as conn:
         company = await conn.fetchrow(
@@ -379,30 +379,20 @@ async def check_delete(company_id: int, user: dict = Depends(require_super_admin
             ) or 0
         )
 
-        # What the company has built up that is not a ledger. None of it blocks
-        # a delete — a company can hold a carefully built field setup and still
-        # be one somebody created by mistake — but it is the part that is easy
-        # to forget is there. clone_preview already counts exactly these, so the
-        # dialog warns with the same numbers the copy screen offers.
+        # What the company has built up that is not a ledger. clone_preview
+        # already counts exactly these, so the dialog warns with the same
+        # numbers the copy screen offers.
         holds = await clone_preview(conn, company["schema_name"])
 
-    blocking = {k: v for k, v in counts.items() if v}
     return {
         "company": {"id": company["id"], "name": company["name"]},
-        "can_delete": not blocking,
-        "blocking": blocking,
+        "blocking": {k: v for k, v in counts.items() if v},
         "holds": {
             "fields": holds["fields"],
             "projects": holds["projects"],
             "masters": holds["masters"],
         },
         "users": users,
-        "reason": (
-            None if not blocking else
-            "This company holds "
-            + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in blocking.items())
-            + ". Deactivate it instead — that hides it without destroying anything."
-        ),
     }
 
 
@@ -413,17 +403,12 @@ async def delete_company(
     user: dict = Depends(require_super_admin),
 ):
     """
-    Permanently remove a company that holds no data.
+    Permanently remove a company, ledger and all.
 
     Drops the schema, its accounts and its migration records. There is no undo
-    and this app keeps no backups, so two things gate it:
-
-      * the company must hold no transactions, no staged rows and no import
-        batches. A company with a ledger is deactivated, never deleted — the
-        point of this endpoint is throwing away a mistake, not destroying a
-        tenant's books.
-      * the caller has to type the company's name back. An id in a URL is easy
-        to get wrong by one digit; a name is not.
+    and this app keeps no backups, so the only gate is that the caller has to
+    type the company's name back — an id in a URL is easy to get wrong by one
+    digit, a name is not.
 
     One transaction, so a failure part-way leaves the company intact rather than
     half-erased.
@@ -449,21 +434,6 @@ async def delete_company(
                 )
 
             schema = company["schema_name"]
-            held = {}
-            for table in _IN_USE_TABLES:
-                n = int(await conn.fetchval(f'SELECT count(*) FROM "{schema}"."{table}"') or 0)
-                if n:
-                    held[table] = n
-            if held:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=(
-                        f"'{company['name']}' holds "
-                        + ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in held.items())
-                        + " and cannot be deleted. Deactivate it instead — that hides "
-                        "it without destroying anything."
-                    ),
-                )
 
             # Schema first: project_members lives in it and references
             # admin.users, so the accounts cannot go until it is gone.
